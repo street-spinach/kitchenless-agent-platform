@@ -1,0 +1,20 @@
+# DOMAIN=localhost uses Caddy's internal CA; a real domain on the VM gets a public cert.
+{$DOMAIN:localhost} {
+	encode gzip
+
+	handle /health {
+		reverse_proxy hello:8000
+	}
+	handle /hello* {
+		reverse_proxy hello:8000
+	}
+	handle /panel* {
+		reverse_proxy mocks:8001
+	}
+	handle /auth* {
+		reverse_proxy keycloak:8080
+	}
+	handle {
+		respond "Not found" 404
+	}
+}

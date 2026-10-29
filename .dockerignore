@@ -1,0 +1,7 @@
+.git
+.venv
+.claude
+.loop-logs
+**/__pycache__
+**/.env
+evals/results
