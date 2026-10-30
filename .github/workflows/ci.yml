@@ -1,0 +1,61 @@
+name: ci
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --frozen
+      - run: make lint
+      - run: make test-unit
+      - run: make test-contract
+        env:
+          MODE: mock
+
+  guards:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --frozen
+      - run: bash scripts/ci/count_guard.sh origin/${{ github.base_ref }}
+
+  evals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - id: changed
+        run: |
+          if git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -qE '^(services/agents/|services/mcp/|services/safety/|evals/)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.changed.outputs.run == 'true'
+        uses: astral-sh/setup-uv@v5
+      - if: steps.changed.outputs.run == 'true'
+        run: |
+          cp infra/.env.example infra/.env
+          docker compose -f infra/docker-compose.yml --env-file infra/.env --profile ci up -d --wait
+          uv sync --frozen
+          make eval-fast
+        env:
+          MODE: mock
+          MUSE_API_KEY: ${{ secrets.MUSE_API_KEY }}
+      - if: steps.changed.outputs.run == 'false'
+        run: echo "No agent behavior changed. Evals skipped."

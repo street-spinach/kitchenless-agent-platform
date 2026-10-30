@@ -1,0 +1,12 @@
+id: hello-run-completes
+category: task
+tags: [fast]
+setup: {}
+conditions: {}
+run: hello
+input:
+  text: eval
+  on_behalf_of: eval-user
+expect:
+  - check: outcome_recorded
+    args: { status: ok }

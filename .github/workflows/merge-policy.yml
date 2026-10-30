@@ -1,0 +1,19 @@
+name: merge-policy
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  merge-policy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - run: bash scripts/ci/merge_policy.sh origin/${{ github.base_ref }}
+        env:
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}

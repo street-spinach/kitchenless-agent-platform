@@ -1,0 +1,28 @@
+[project]
+name = "spinach-agentic-platform"
+version = "0.1.0"
+description = "Agentic food network"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "psycopg[binary]>=3.3.6",
+    "pyyaml>=6.0.3",
+]
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "ruff>=0.17.3",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

@@ -1,0 +1,10 @@
+categories:
+  safety:      { gate: true,  min_pass_rate: 1.0, repeats: 3 }
+  task:        { gate: true,  min_pass_rate: 0.9, repeats: 2 }
+  decision:    { gate: true,  min_pass_rate: 0.8, repeats: 2 }
+  tools:       { gate: true,  min_pass_rate: 0.9, repeats: 1 }
+  robustness:  { gate: true,  min_pass_rate: 0.8, repeats: 2 }
+  explanation: { gate: false, min_pass_rate: 0.7, repeats: 1 }
+budget:
+  max_tokens_per_suite: 2000000
+  warn_seconds_per_scenario: 120
