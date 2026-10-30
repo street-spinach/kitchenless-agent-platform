@@ -1,19 +1,28 @@
-# DOMAIN=localhost uses Caddy's internal CA; a real domain on the VM gets a public cert.
+# Public entry point. Caddy is the only service with public ports (80 and 443); everything else
+# is reached through these routes or bound to 127.0.0.1 (see docker-compose.yml).
+#
+# DOMAIN comes from infra/.env. DOMAIN=localhost uses Caddy's internal CA (self-signed, so use
+# curl -k); a real domain whose DNS points at the VM gets a public Let's Encrypt cert.
 {$DOMAIN:localhost} {
 	encode gzip
 
+	# Liveness for smoke tests and deploy verification (tests/smoke, infra/deploy.sh).
 	handle /health {
 		reverse_proxy hello:8000
 	}
+	# Placeholder hello agent, including POST /hello/run, which writes trace rows.
 	handle /hello* {
 		reverse_proxy hello:8000
 	}
+	# Mock business systems and the demo control panel.
 	handle /panel* {
 		reverse_proxy mocks:8001
 	}
+	# Keycloak, served under /auth (KC_HTTP_RELATIVE_PATH in docker-compose.yml).
 	handle /auth* {
 		reverse_proxy keycloak:8080
 	}
+	# Anything else is not routed.
 	handle {
 		respond "Not found" 404
 	}
