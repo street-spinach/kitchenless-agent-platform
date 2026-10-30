@@ -49,4 +49,14 @@ else
   log "no gha-pubkey metadata yet"
 fi
 
+# Clone into /opt/app once the deploy key has been added to the repo. Never touches an existing
+# checkout: deploys move it with git checkout.
+if [ ! -d /opt/app/.git ]; then
+  if sudo -iu deploy git clone -q git@github.com:street-spinach/kitchenless-agent-platform.git /opt/app; then
+    log "cloned repo into /opt/app"
+  else
+    log "clone failed; add the deploy key to the repo, then reset the VM"
+  fi
+fi
+
 log "done"
