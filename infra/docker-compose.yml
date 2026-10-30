@@ -112,8 +112,9 @@ services:
     restart: unless-stopped
     environment:
       NEO4J_AUTH: neo4j/${NEO4J_PASSWORD}
+      # Fixed 512m heap so the stack fits the 4 GB e2-medium VM (spec range: 512 MB to 1 GB).
       NEO4J_server_memory_heap_initial__size: 512m
-      NEO4J_server_memory_heap_max__size: 1g
+      NEO4J_server_memory_heap_max__size: 512m
       NEO4J_server_memory_pagecache_size: 256m
     volumes:
       - neo4jdata:/data
