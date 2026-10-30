@@ -7,6 +7,7 @@ ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
     PYTHONUNBUFFERED=1
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-install-project
+COPY migrations ./migrations
 COPY services ./services
 COPY evals ./evals
 COPY tests ./tests

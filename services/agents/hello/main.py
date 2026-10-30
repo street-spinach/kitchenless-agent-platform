@@ -1,11 +1,30 @@
-"""Placeholder agent service so the stack has something to deploy and health-check."""
+"""Placeholder agent service so the stack has something to deploy, health-check and trace."""
 
 import json
 import os
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+
+from services.agents.common.trace import TraceWriter
+
+AGENT_ID = "hello"
+
+
+def real_writer(on_behalf_of: str | None) -> TraceWriter:
+    return TraceWriter(os.environ["DATABASE_URL"], AGENT_ID, on_behalf_of=on_behalf_of)
+
+
+def run(writer: Any, text: str) -> None:
+    """One hello run: receive a message, decide on a reply, record the outcome."""
+    writer.write("message", {"direction": "in", "text": text})
+    writer.write("decision", {"reply": f"hello, {text}"})
+    writer.write("outcome", {"status": "ok"})
 
 
 class Handler(BaseHTTPRequestHandler):
+    writer_factory: Callable[[str | None], Any] = staticmethod(real_writer)
+
     def do_GET(self) -> None:
         if self.path == "/health":
             self._send(200, {"status": "ok", "service": "hello"})
@@ -13,6 +32,27 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"message": "hello", "mode": os.environ.get("MODE", "mock")})
         else:
             self._send(404, {"error": "not found"})
+
+    def do_POST(self) -> None:
+        if self.path != "/hello/run":
+            self._send(404, {"error": "not found"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except ValueError:
+            self._send(400, {"error": "invalid JSON body"})
+            return
+        try:
+            writer = self.writer_factory(body.get("on_behalf_of"))
+            try:
+                run(writer, str(body.get("text", "world")))
+            finally:
+                writer.close()
+        except Exception as err:
+            self._send(500, {"error": f"run failed: {type(err).__name__}"})
+            return
+        self._send(200, {"run_id": str(writer.run_id)})
 
     def _send(self, status: int, body: dict) -> None:
         data = json.dumps(body).encode()
