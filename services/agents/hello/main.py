@@ -27,7 +27,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.path == "/health":
-            self._send(200, {"status": "ok", "service": "hello"})
+            # Rollback drill (#6): deliberately unhealthy. Revert after the drill.
+            self._send(503, {"status": "drill", "service": "hello"})
         elif self.path.startswith("/hello"):
             self._send(200, {"message": "hello", "mode": os.environ.get("MODE", "mock")})
         else:
