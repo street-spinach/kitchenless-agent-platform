@@ -10,3 +10,6 @@
 ^evals/cases/safety/
 ^evals/thresholds\.yaml$
 ^scripts/
+^evals/checks\.py$
+^evals/run\.py$
+^Makefile$
