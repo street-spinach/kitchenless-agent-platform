@@ -13,7 +13,7 @@ if [ -z "$critical" ]; then
 fi
 
 echo "Critical paths touched:"
-printf '  %s\n' $critical
+printf '%s\n' "$critical" | sed 's/^/  /'
 if [[ ",${LABELS:-}," == *",approved-by-human,"* ]]; then
   echo "approved-by-human label present. Auto-merge allowed."
   exit 0

@@ -1,0 +1,55 @@
+name: deploy
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VM_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "${{ secrets.VM_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Deploy and verify on VM
+        shell: bash
+        run: |
+          set -o pipefail
+          ssh "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}" \
+            "cd /opt/app && git fetch --quiet origin && git checkout --quiet --force ${{ github.sha }} && ./infra/deploy.sh ${{ github.sha }}" \
+            2>&1 | tee deploy.log
+
+      - name: Tag green deploy
+        if: success()
+        run: |
+          tag="deploy-$(date -u +%Y%m%d-%H%M%S)"
+          git tag "$tag" "${{ github.sha }}"
+          git push origin "$tag"
+
+      - name: Report success
+        if: success()
+        run: bash scripts/ci/report_deploy.sh success
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+
+      - name: Report failure
+        if: failure()
+        run: bash scripts/ci/report_deploy.sh failure
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
