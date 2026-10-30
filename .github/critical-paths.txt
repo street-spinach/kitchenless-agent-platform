@@ -1,0 +1,12 @@
+^\.github/
+^\.claude/
+^CLAUDE\.md$
+^infra/
+^migrations/
+^authz/
+^services/identity/
+^services/safety/
+^docs/designs/
+^evals/cases/safety/
+^evals/thresholds\.yaml$
+^scripts/
