@@ -19,6 +19,7 @@ x-app: &app
     NEO4J_PASSWORD: ${NEO4J_PASSWORD}
     OPENFGA_API_URL: http://openfga:8080
     KEYCLOAK_URL: http://keycloak:8080/auth
+    ORCHESTRATOR_URL: http://hello:8000
     MUSE_API_KEY: ${MUSE_API_KEY:-}
 
 x-app-health: &app-health
