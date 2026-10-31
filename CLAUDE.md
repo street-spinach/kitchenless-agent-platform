@@ -13,6 +13,7 @@ negotiate and order food on behalf of people. See docs/designs/SITEMAP.md.
 - make lint, make test-unit, make test-contract SERVICE=<name>
 - make eval-fast: run before opening a PR if you touched services/agents/
 - MODE=mock is the default. Never switch tests to real integrations.
+- MODEL_MODE=stub is the default for tests. Never switch tests to real.
 
 ## Conventions
 - Python 3.12, uv, ruff, pytest. Type hints on public functions.
@@ -23,6 +24,12 @@ negotiate and order food on behalf of people. See docs/designs/SITEMAP.md.
   services/safety/, call the adapter, and write a trace event.
 - Log agent steps through the trace writer. Evals depend on it.
 - Migrations are additive only (add tables and columns; never drop or rename).
+- Migrations are SQL only. migrations/checkpointer.py is the only exception.
+- Shared identifiers come from services/common/ids.py, never ad hoc.
+- Idempotency keys are built only from order_id, the action, the acting agent id and an
+  optional scope id, always through ids.idempotency_key.
+- Business agents use the model only through model.choose(), with an allowed set and a
+  rule default computed in code.
 
 ## Safety rules (never break these)
 - Allergies, diets, budgets and approval rules live in Postgres tables and are always
