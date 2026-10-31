@@ -2,7 +2,7 @@
 
 *   **Author:** madushankaf
 *   **Status:** Approved; amended 2026-10-31 (bounded model calls for business agents);
-    amended 2026-10-31 (agent-protocol)
+    amended 2026-10-31 (agent-protocol); amended 2026-10-31 (build step 1 ports and smoke)
 *   **Date:** 2026-10-31
 *   **Path:** `docs/designs/architecture.md`
 
@@ -25,6 +25,15 @@ a refused message fails at once without retry; an expired offer can be re-quoted
 (`authorized → quoting`); a post-booking shortfall flow and an internal A2A endpoint are
 added. Changed: §2, §3, §4, §5, §8, §9, §10, §13, and implementation items 4, 9, 10, 11,
 14, 19, 20, 24, 25, 27, 29, 30, 36, 39, 43, 55, 65, 66, 71 and the environment matrix.
+
+**Amendment 2026-10-31 (build step 1 ports and smoke).** Implementing build step 1 (issues
+#25 and #31) found three gaps:
+*   **Port 8000.** `api` and `hello` both wanted host port 8000. Until step 6, `hello`
+    publishes host port 8004, and `make eval-fast` points `ORCHESTRATOR_URL` there.
+*   **Redis smoke assertions.** Removing `redis` meant smoke assertions had to go. They are
+    removed in step 1, with health checks for `api`, `mcp` and `agents` added in their place.
+*   **`RUN_TOKEN_CEILING`.** It had no value, so `.env.example` gets a placeholder.
+Changed: implementation items 56, 59, 69 and 73.
 
 **Names.** This document uses three names for one project. Kitchenless is the product name.
 `kitchenless-agent-platform` is the GitHub repository (local folder
@@ -2262,6 +2271,9 @@ and values; none of these may be renamed or dropped.
         `127.0.0.1:8003:8003`.
     *   Each service gets the variables in the environment matrix below.
     *   Remove `redis`. Keep `hello` and `mocks` until step 6, then remove them.
+    *   Until step 6, `hello` publishes `127.0.0.1:8004:8000`, because host port 8000
+        belongs to `api`. Inside the Compose network `hello` stays at `hello:8000`, so Caddy
+        and the smoke tests are unchanged. Step 6 removes the mapping along with `hello`.
     *   `caddy`: `depends_on` `api` and `keycloak`; environment `PANEL_USER` and
         `PANEL_PASSWORD_HASH`.
     *   `mem_limit` for every service, as in §11.
@@ -2294,7 +2306,8 @@ and values; none of these may be renamed or dropped.
 *   **Type / Scope**: Environment template.
 *   **Proposed Changes**: Add every variable in the environment matrix below, as
     placeholders, plus `GHCR_READ_TOKEN`, `GCS_BACKUP_BUCKET` and `SEED_US1_PHONES`. Remove
-    `REDIS_URL`.
+    `REDIS_URL`. `RUN_TOKEN_CEILING=200000` is a placeholder until the real-model rehearsal
+    (Q2) sets it; `services/common/config.py` fails at startup on an empty value.
 
 ##### 60. `infra/vm/startup.sh` (Modify, critical)
 
@@ -2424,6 +2437,10 @@ and values; none of these may be renamed or dropped.
 
 *   **Type / Scope**: Smoke and scenario tests.
 *   **Proposed Changes**:
+    *   **Smoke (Modify, step 1):** removing `redis` removes `("redis", 6379)` from
+        `test_tcp_reachable` and deletes `test_redis_ping`. In their place,
+        `test_service_health` adds `http://api:8000/health`, `http://mcp:8002/health` and
+        `http://agents:8003/health`. These are the only smoke assertions removed.
     *   **Smoke (Modify, step 6):** health URLs move from `hello:8000` and `mocks:8001` to
         `api:8000`, `mcp:8002` and `agents:8003`; the trace test calls
         `api:8000/hello/run`. No assertion is removed or weakened.
@@ -2466,6 +2483,9 @@ and values; none of these may be renamed or dropped.
     *   `seed`: `$(COMPOSE) run --rm testrunner python -m services.seed $(SEED_ARGS)`.
     *   `seed-local`: `uv run python -m services.seed $(SEED_ARGS)`.
     *   `test-unit` passes through `DATABASE_URL` when set.
+    *   Until step 6, `eval-fast` sets `ORCHESTRATOR_URL ?= http://localhost:8004`, so local
+        and CI eval runs reach `hello` (item 56). Step 6 removes the override, and
+        `evals/run.py` keeps its default of `http://localhost:8000` (`api`).
     *   No target sets `MODEL_MODE`; Compose and `deploy.sh` do.
 
 ### Environment matrix
