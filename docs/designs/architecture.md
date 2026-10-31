@@ -1,7 +1,8 @@
 # Kitchenless platform architecture
 
 *   **Author:** madushankaf
-*   **Status:** Approved; amended 2026-10-31 (bounded model calls for business agents)
+*   **Status:** Approved; amended 2026-10-31 (bounded model calls for business agents);
+    amended 2026-10-31 (agent-protocol)
 *   **Date:** 2026-10-31
 *   **Path:** `docs/designs/architecture.md`
 
@@ -15,6 +16,15 @@ Future Improvements, the build order,
 and implementation items 10, 11, 22, 29, 30, 36, 66, 71 and the test and eval lists. It also
 fixes a bug: `agent_messages` and `orders` were missing the `created_at` column the claim
 query and an index use.
+
+**Amendment 2026-10-31 (agent-protocol).** `docs/designs/agent-protocol.md` §14 lists
+changes A1–A24 to this design, applied here. In short: the message catalog moves to that
+design; the seller's "agree" to a counter no longer sets `accepted`; quote and shortfall
+transitions commit in a step's final transaction; inbound messages pass a sender check, and
+a refused message fails at once without retry; an expired offer can be re-quoted once
+(`authorized → quoting`); a post-booking shortfall flow and an internal A2A endpoint are
+added. Changed: §2, §3, §4, §5, §8, §9, §10, §13, and implementation items 4, 9, 10, 11,
+14, 19, 20, 24, 25, 27, 29, 30, 36, 39, 43, 55, 65, 66, 71 and the environment matrix.
 
 **Names.** This document uses three names for one project. Kitchenless is the product name.
 `kitchenless-agent-platform` is the GitHub repository (local folder
@@ -375,7 +385,7 @@ from one image (`infra/Dockerfile`), plus the existing infrastructure containers
 | Service | Kind | What it does | Public route (Caddy) |
 |---|---|---|---|
 | `api` | Long-running, port 8000 | Real WhatsApp webhook and the internal simulated WhatsApp input; outbound WhatsApp sender (consumes messages for `host='api'`); `POST /runs`; DoorDash webhook; delivery status input; control panel API; `POST /hello/run`; reserved `/app/*` and `/me/*` routes | `/webhooks/whatsapp`, `/webhooks/doordash/<secret>`, `/panel/*` (basic auth), `/app/*`, `/me/*`, `/hello*`, `/health` |
-| `agents` | Long-running, port 8003 (health only) | Hosts all logical agents (§3), consumes messages for `host='agents'`, runs the sweeper | None |
+| `agents` | Long-running, port 8003 (health and the internal A2A endpoint, agent-protocol §11) | Hosts all logical agents (§3), consumes messages for `host='agents'`, runs the sweeper | None (`/a2a/*` has no Caddy route) |
 | `mcp` | Long-running, port 8002 | One ASGI app mounting five MCP servers. Each guarded tool runs the guard, then the real or mock adapter. Mock backend logic and mock courier progression. | None |
 | `migrate` | One-shot | Applies `migrations/*.sql`, then runs the checkpointer schema setup (Q3) | None |
 | `testrunner` | One-shot (`tools` profile) | Smoke, scenario and eval runs on the VM | None |
@@ -398,7 +408,7 @@ Later designs use these identifiers and must not redefine them.
 | `conversation_id` | UUID | The agent that opens an exchange, for example one household-to-store negotiation | Used only to correlate messages. Not a state key. |
 | `message_id` | UUID. A message caused by an inbound message gets `uuid5(inbound_message_id, "<ordinal>")`, where the ordinal counts the messages sent in that step (0, 1, 2…). A message with no inbound cause (a webhook or the sweeper) gets `uuid5(<source event id>, "<ordinal>")`. | Sender | `agent_messages` primary key. A replayed step produces the same ids, so inserting them again does nothing. |
 | `order_id` | UUID | The household agent, at `draft` | Checkpointed before any tool call that uses it |
-| `idempotency_key` | `<order_id>:<action>:<acting_agent_id>`, for example `…:place_order:grocery:square-us` | The acting business agent, from `order_id` (received in the `accept` message) and its own id | Never generated at call time. Vendors receive `uuid5(KEY_NAMESPACE, key)`: 36 characters, within Square's 45-character limit. DoorDash receives it as `external_delivery_id`. |
+| `idempotency_key` | `<order_id>:<action>:<acting_agent_id>`, plus `:<scope>` for actions that can repeat per order (the `quote_id` for `authorize_spend`, the `shortfall_id` for the shortfall tools; agent-protocol A16), for example `…:place_order:grocery:square-us` | The acting business agent, from `order_id` (received in the `accept` message) and its own id | Never generated at call time. Vendors receive `uuid5(KEY_NAMESPACE, key)`: 36 characters, within Square's 45-character limit. DoorDash receives it as `external_delivery_id`. |
 | `address_ref` | UUID of a `household_addresses` row | Seed or onboarding | Resolved only inside `/mcp/delivery book_delivery` |
 | `zone_id` | Opaque text, for example `us-oh-45202` | Seed or onboarding | Each household has one. Agent cards list the zones they cover. |
 | `on_behalf_of` | `user:<user_id>` for consumer agents, `household:<household_id>` for household agents, `org:<org_id>` for business agents, `null` for `system:*` | Trace writer | Written on every trace row |
@@ -450,7 +460,7 @@ household agents. The business agents are shared between environments.
         | Choice point | Step | Allowed set (code) | Rule default (code) |
         |---|---|---|---|
         | `rank_substitutes` | Grocery or restaurant `quote_request` (always, even with nothing missing, so every offer gets a rationale) | For each missing item: an ordered list of up to 3 candidates, drawn only from the catalog search (§5) filtered by the request's allergen and diet codes, stock and the owner's substitution policy. The pick is one ordered subset per missing item. | The search's own ranking: same category, then lowest price |
-        | `respond_to_counter` | Grocery or restaurant `counter_offer` | `reject` always. `accept` only if the buyer's total is at or above the floor total. `counter` only while `quotes.round` is 0, with a total between the floor total and the current offer total. | `accept` if allowed; otherwise `counter` at the floor total if allowed; otherwise `reject` |
+        | `respond_to_counter` | Grocery or restaurant `counter_offer` | `reject` always. `agree` (take the buyer's total; earlier called `accept`) only if the buyer's total is at or above the floor total. `counter` only while `quotes.round` is 0, with a total between the floor total and the current offer total. | `agree` if allowed; otherwise `counter` at the floor total if allowed; otherwise `reject` |
         | `choose_window` | Delivery `delivery_quote_request` | Windows the courier's capacity rules allow inside the requested window. The price is fixed by rules. | The earliest allowed window |
 
     *   Messages with no choice point (`order_confirm`, `delivery_booked`, `reject` sent
@@ -500,6 +510,10 @@ household agents. The business agents are shared between environments.
     once per process.
 4.  **Finish.** The step's final transaction sets the row to `processed`.
 5.  **Fail.**
+    *   Before the handler runs, `protocol.check` validates the message (agent-protocol §6).
+        A `ProtocolError` sets the row `failed` at once, with no retry and no poison rule;
+        the receiver sends `protocol_error` to the sender. An agent's own invalid outgoing
+        body raises `OutboundInvalid` and follows the rules below.
     *   If a step raises, the row returns to `pending` with `available_at = now() + 2^attempts`
         seconds.
     *   After 5 attempts it becomes `failed`, and `runs.finish(status=error,
@@ -525,7 +539,9 @@ it waits on a model or MCP call.
     *   For graphs, LangGraph writes its checkpoints after each node, each in its own short
         transaction.
 3.  End with **one short transaction** that inserts the step's outgoing messages, updates
-    timers, and sets the inbound row to `processed`.
+    timers, applies the step's conditional `quotes` and `shortfalls` updates, and sets the
+    inbound row to `processed`. If a conditional update changes no row, the transaction
+    rolls back and the step is retried (agent-protocol §7, commit rule).
 
 Each step has a 75-second cap: one `people` model step of at most 60 seconds, or one
 `business` call of at most 5 seconds (§6), plus tool calls.
@@ -542,8 +558,9 @@ outbox and marks the timer `done`.
 | Timer kind | Created | Cancelled | When due |
 |---|---|---|---|
 | `approval_expiry` | When an approval is requested | When the approval is decided | `UPDATE approvals SET status='expired' WHERE approval_id=$1 AND status='pending'`. If a row changed, set the order to `expired` and send `approval_decision(expired)` to the household agent. |
-| `run_timeout` | At run start, and again after an approval is decided (300 s each time) | When an approval is requested, and when the order reaches `courier_booked` | `runs.finish(status=timeout)`, which also sends the retry message |
+| `run_timeout` | At run start, and again after an approval is decided (300 s each time; `A2A_DEMO_TIMEOUT_SECONDS` for `a2a_demo` runs) | When an approval is requested, and when the order reaches `courier_booked` | `runs.finish(status=timeout)`, which also sends the retry message (none for `a2a_demo` runs) |
 | `quote_round` | When the household agent sends quote requests (30 s), and when a seller sends courier quote requests (10 s) | Never; firing late is harmless | Send `quote_round_closed` to the agent named in `ref.to` |
+| `shortfall_expiry` | When the household agent opens a shortfall (due at its `reply_by`) | Never; the update is conditional | Close the shortfall if still `pending` and send `shortfall_closed {reason: timeout}` (agent-protocol §10) |
 
 ### 5. MCP servers and adapters
 
@@ -569,11 +586,14 @@ here.
 |---|---|---|---|---|---|---|
 | household | `get_constraints(user_id)` | yes | `agent acts_for user` | none | no (read) | none |
 | household | `create_order(order_id, …)` | yes | `agent acts_for household` | none | key on `order_id` | none |
-| household | `authorize_spend(order_id, items, total)` | yes | `agent can_spend budget` | Allergens (items against every member's allergies, using the knowledge graph); budget (over the remaining weekly budget needs an `approved` approval for this order); currency match | key `<order_id>:authorize:<household agent>` | none |
+| household | `authorize_spend(order_id, items, total)` | yes | `agent can_spend budget` | Allergens (items against every member's allergies, using the knowledge graph); budget (over the remaining weekly budget needs an `approved` approval for this order; a re-quoted offer at or below the approved total is covered); currency match; refuses orders of `a2a_demo` runs. Its state change sets `authorized` and `orders.seller_agent_id` | key `<order_id>:authorize:<household agent>:<quote_id>` | none |
 | household | `request_approval(order_id, amount)` | yes | `agent acts_for household` | none | key `<order_id>:approval:<household agent>` | `approval` |
 | household | `decide_approval(approval_id, decision, user_id)` | `api` service token | none | `user_id` must equal `approval_rules.approver_user_id` | conditional update | `approval` |
 | household | `record_delivery(order_id)` | yes | `agent acts_for household` | none | unique `(order_id, item)` in `pantry_events` | none |
+| household | `choose_shortfall_option(shortfall_id, line, pick, user_id)` | `api` service token | none | `user_id` is a member of the order's household; `pick` is one of the line's substitutes or `drop` | conditional update (first pick per line wins) | none |
+| household | `authorize_amendment(order_id, shortfall_id, picks)` | yes | `agent acts_for household` | Each substitute against every member's allergies (fails closed); each costs at most its line; substitutes need `courier_booked`, drops a state before `delivered` | key `<order_id>:authorize_amendment:<household agent>:<shortfall_id>` | none |
 | grocery, restaurant | `place_order(order_id, quote_id, items_hash, delivery_agent_id)` | yes | `agent member_of org` | The order must be in `authorized` with this seller and the same `items_hash`; the courier must cover the household's zone | key `<order_id>:place_order:<seller>` | none |
+| grocery, restaurant | `amend_order(order_id, shortfall_id, picks)` | yes | `agent member_of org` | `picks` equal the stored `authorize_amendment` result; after `in_delivery`, substitutes become drops | key `<order_id>:amend_order:<seller>:<shortfall_id>` | none |
 | delivery | `book_delivery(order_id, address_ref, window)` | yes | `agent can_deliver_for household` (static, seeded) | `orders.delivery_agent_id` must be this agent; coverage and window | key `<order_id>:book_delivery:<courier>` | `data_share` |
 
 **Guard steps, in order** (`services/safety/guard.py`). These meet the order CLAUDE.md
@@ -815,17 +835,20 @@ household on delivered: record_delivery(order_id) ─► runs.finish(completed);
     courier_booked → in_delivery → delivered`.
 *   `cancelled` is allowed from any state before `placed`. `expired` is allowed only from
     `awaiting_approval`. `failed` is allowed from any state.
+*   `authorized → quoting` is allowed once per run, for a re-quote after an offer expired
+    (agent-protocol §7).
 *   Every change is a conditional update (`WHERE state = <expected>`).
 
 **Who changes the order state:**
 
 | Change | Done by |
 |---|---|
-| `draft` through `authorized`, and `cancelled` | Household agent, through household MCP tools |
+| `draft` through `authorized`, `authorized → quoting` (re-quote), and `cancelled` | Household agent, through household MCP tools |
 | `placed` (with `delivery_agent_id`) | Seller, through `place_order` |
 | `courier_booked` | Delivery agent, through `book_delivery` |
 | `expired` | Sweeper |
-| `in_delivery`, `delivered`, `failed` from a courier event | `api` `apply_delivery_status`, which only moves an order forward |
+| `in_delivery`, `delivered`, `failed` from a courier event | `api` `apply_delivery_status`, which only moves an order forward. On `in_delivery` it also closes a pending shortfall |
+| `failed` when a shortfall leaves no line | Seller, through `amend_order` |
 
 Once an order is `placed`, nothing cancels it automatically. Problems after that point go to
 the user and the control panel. There are no holds: an open quote simply expires at
@@ -880,6 +903,7 @@ the user and the control panel. There are no holds: an open quote simply expires
 | A service restarts or redeploys | SIGTERM; rows stuck in `processing` | Replayed | Resume from the checkpoint | Delay only |
 | Trace write fails before a guarded call | Exception | 1 | The adapter is not called; `status=error` | Retry message |
 | Seed fails during deploy | `make seed` exit code | 1 | The deploy fails and rolls back (§11) | Nothing |
+| Protocol errors, expired offers, shortfalls and A2A client errors | See agent-protocol §12 | | | |
 
 **Retry.**
 
@@ -905,13 +929,13 @@ the user and the control panel. There are no holds: an open quote simply expires
 | Kind | Required payload keys | Written by |
 |---|---|---|
 | `run_start` | `kind`, `household_id`, `modes`, `trigger` | `runs.start()` |
-| `message` | `from`, `to`, `type`, `body` | `outbox.send()` |
+| `message` | `from`, `to`, `type`, `body`, `summary`, `causation_id` (or `null`) | `outbox.send()` |
 | `tool_call` | `server`, `tool`, `args`, `idempotency_key` (or `null`) | Guard or `traced` wrapper |
 | `tool_result` | `server`, `tool`, `result`, `refused`, `reason` | Guard or `traced` wrapper |
 | `decision` | `node`, `choice`, `explanation`. For business choices, `node` is the choice point name, `explanation` is the rationale used, and the row adds `allowed` (the allowed values or ids, or the bounds of a range), `model_pick` (or `null`), `source` and `reason`. The model's inputs are never logged. Tokens and model go in the row's `tokens_in`, `tokens_out` and `model` columns. | Graph nodes, and `choose()` for business agents |
 | `approval` | `approval_id`, `status`, `amount_minor`, `currency`, `user_id` | Approval tools |
 | `data_share` | `address_ref`, `recipient`, `purpose` | `addresses.resolve()` |
-| `error` | `where`, `reason`, `attempt` | Model client, guard, adapters |
+| `error` | `where`, `reason`, `attempt`; optional `ref_message_id` | Model client, guard, adapters, consumer (protocol errors) |
 | `outcome` | `status`, `reason`, `summary` | `runs.finish()` only |
 
 `message` rows use `to` as the key that `no_profile_fields_sent_to_business` reads
@@ -1013,7 +1037,7 @@ without changing this design too.
 
 | Contract | Owner | Minimum fixed here |
 |---|---|---|
-| Message types and bodies | agent-protocol | Types `user_message`, `start_weekly_order`, `start_dinner`, `constraints_request`, `constraints`, `quote_request`, `offer`, `counter_offer`, `accept`, `reject`, `cancel`, `order_confirm`, `delivery_quote_request`, `delivery_quote`, `delivery_request`, `delivery_booked`, `order_status`, `approval_decision`, `quote_round_closed`, `whatsapp_out`. Bodies must carry `order_id` where one exists. Only `delivery_request` carries `address_ref`. |
+| Message types and bodies | agent-protocol | Owned by agent-protocol: the catalog in agent-protocol §5 lists every type, its schema and its senders. Bodies carry `order_id` where one exists; only `delivery_request` carries `address_ref`. |
 | `agent_messages` columns | agent-protocol | The columns in implementation item 10 |
 | MCP tool names and argument shapes | adapters | The tools in §5 and implementation item 43 |
 | Adapter result types | adapters | Ids, state, amounts and times only, never raw vendor bodies (§5) |
@@ -1364,8 +1388,11 @@ provisional shapes in §13 are enough to start every step in mock mode.
     *   `thread_id(agent_id: str, run_id: UUID) -> str` returns `<agent_id>:<run_id>`.
     *   `message_id(cause_id: UUID, ordinal: int) -> UUID` returns
         `uuid5(cause_id, str(ordinal))`.
-    *   `idempotency_key(order_id: UUID, action: str, acting_agent_id: str) -> str`. It
-        accepts only values passed in and never generates random parts.
+    *   `idempotency_key(order_id: UUID, action: str, acting_agent_id: str, *, scope:
+        UUID | None = None) -> str`. It appends `:<scope>` when given, accepts only values
+        passed in and never generates random parts.
+    *   The id helpers of agent-protocol P6 (`quote_id`, `shortfall_id`, the A2A ids and
+        others).
     *   `vendor_key(key: str) -> str` returns `str(uuid5(KEY_NAMESPACE, key))`.
         `KEY_NAMESPACE` is a fixed UUID constant in this file.
 
@@ -1443,11 +1470,12 @@ and values; none of these may be renamed or dropped.
     ```sql
     agent_cards(agent_id text PK,
                 class text NOT NULL CHECK (class IN
-                  ('consumer','household','grocery','restaurant','delivery','channel')),
+                  ('consumer','household','grocery','restaurant','delivery','channel',
+                   'external')),
                 owner_ref text NOT NULL,      -- user:<id> | household:<id> | org:<id> | system
                 region text NOT NULL, zone_ids text[] NOT NULL DEFAULT '{}',
                 currency char(3) NULL, host_process text NOT NULL CHECK (host_process IN
-                  ('agents','api')),
+                  ('agents','api','external')),
                 vendor text NULL, config jsonb NOT NULL DEFAULT '{}',
                 enabled boolean NOT NULL DEFAULT true)
     CREATE INDEX ON agent_cards USING gin (zone_ids)
@@ -1467,15 +1495,17 @@ and values; none of these may be renamed or dropped.
 
     ```sql
     runs(run_id uuid PK, household_id text NULL REFERENCES households,
-         kind text NOT NULL CHECK (kind IN ('weekly','dinner','chat','hello')),
+         kind text NOT NULL CHECK (kind IN ('weekly','dinner','chat','hello','a2a_demo')),
          status text NOT NULL DEFAULT 'running' CHECK (status IN
            ('running','awaiting_approval','completed','cancelled','error','timeout')),
          reason text NULL, trigger jsonb NOT NULL, modes jsonb NOT NULL,
          started_at timestamptz NOT NULL DEFAULT now(), ended_at timestamptz NULL)
-      -- trigger: {source, user_id, inbound_id, retry_of?, overrides?}
+      -- trigger: {source, user_id, inbound_id, retry_of?, overrides?}; a2a_demo runs
+      -- have no user_id
     CREATE INDEX ON runs ((trigger->>'user_id'), started_at DESC)
     agent_messages(message_id uuid PK, run_id uuid NOT NULL REFERENCES runs,
-                   conversation_id uuid NULL, from_agent text NOT NULL,
+                   conversation_id uuid NULL, causation_id uuid NULL,
+                   from_agent text NOT NULL,
                    to_agent text NOT NULL, to_host text NOT NULL,
                    type text NOT NULL, body jsonb NOT NULL,
                    status text NOT NULL DEFAULT 'pending' CHECK (status IN
@@ -1486,6 +1516,7 @@ and values; none of these may be renamed or dropped.
                    claimed_at timestamptz NULL, processed_at timestamptz NULL,
                    last_error text NULL)
     CREATE INDEX ON agent_messages (to_host, status, available_at)
+    CREATE INDEX ON agent_messages (conversation_id, created_at)
     inbound_messages(channel text NOT NULL, external_id text NOT NULL,
                      received_at timestamptz NOT NULL DEFAULT now(), run_id uuid NULL,
                      PRIMARY KEY (channel, external_id))
@@ -1526,7 +1557,9 @@ and values; none of these may be renamed or dropped.
            items jsonb NOT NULL, total_minor bigint NOT NULL, currency char(3) NOT NULL,
            round integer NOT NULL DEFAULT 0, expires_at timestamptz NOT NULL,
            status text NOT NULL DEFAULT 'open' CHECK (status IN
-             ('open','countered','accepted','rejected','expired')))
+             ('open','countered','accepted','rejected','expired')),
+           constraints jsonb NOT NULL DEFAULT '{}',
+           closed_by text NULL CHECK (closed_by IN ('buyer','seller')))
     approvals(approval_id uuid PK, run_id uuid NOT NULL REFERENCES runs,
               household_id text NOT NULL REFERENCES households,
               order_id uuid NOT NULL REFERENCES orders,
@@ -1536,7 +1569,8 @@ and values; none of these may be renamed or dropped.
               requested_at timestamptz NOT NULL DEFAULT now(),
               decided_at timestamptz NULL, decided_by uuid NULL REFERENCES users)
     timers(timer_id bigserial PK,
-           kind text NOT NULL CHECK (kind IN ('approval_expiry','run_timeout','quote_round')),
+           kind text NOT NULL CHECK (kind IN ('approval_expiry','run_timeout','quote_round',
+                                              'shortfall_expiry')),
            run_id uuid NOT NULL REFERENCES runs, due_at timestamptz NOT NULL,
            ref jsonb NOT NULL DEFAULT '{}',
            status text NOT NULL DEFAULT 'pending' CHECK (status IN
@@ -1550,6 +1584,7 @@ and values; none of these may be renamed or dropped.
     ```
 
     *   `pantry_events` is provisional (§13). The pantry design extends it.
+    *   The `shortfalls` table (agent-protocol P9) is created in this migration.
 
 ##### 12. `migrations/0006_idempotency_and_modes.sql` (Create, critical)
 
@@ -1606,7 +1641,8 @@ and values; none of these may be renamed or dropped.
                     next_state_at timestamptz NULL)
     mock_events(id bigserial PK, env text NOT NULL,
                 kind text NOT NULL CHECK (kind IN
-                  ('out_of_stock','kitchen_overloaded','courier_delayed','adapter_down')),
+                  ('out_of_stock','kitchen_overloaded','courier_delayed','adapter_down',
+                   'shortfall')),
                 target_agent_id text NOT NULL, params jsonb NOT NULL DEFAULT '{}',
                 active boolean NOT NULL DEFAULT true)
     sim_outbound(id bigserial PK, phone_e164 text NOT NULL, run_id uuid NULL,
@@ -1665,8 +1701,11 @@ and values; none of these may be renamed or dropped.
 
 *   **Type / Scope**: Python module.
 *   **Proposed Changes**:
-    *   `send(conn, *, message_id, run_id, conversation_id, from_agent, to_agent, type, body)
-        -> None`.
+    *   `send(conn, *, message_id, run_id, conversation_id, causation_id, from_agent,
+        to_agent, type, body, trace_extra=None) -> bool` (agent-protocol P11). It validates
+        the body (`OutboundInvalid`), renders the summary, sets the trace's `message_id` and
+        `conversation_id` columns, inserts rows for host `external` as `processed`, and
+        returns whether it inserted.
         *   Looks up `to_host` from the target card.
         *   Inserts the `agent_messages` row with `ON CONFLICT (message_id) DO NOTHING`.
         *   If a row was inserted, writes the `message` trace row and calls
@@ -1684,7 +1723,10 @@ and values; none of these may be renamed or dropped.
         rules in §4: the per-key `asyncio.Lock`, no transaction during the handler, the
         75 s cap, and one final transaction that applies `StepResult` and marks the row
         `processed`.
-    *   On an exception: back-off and retry, then `failed` after 5 attempts, calling
+    *   Runs `protocol.check` before each step; a `ProtocolError` takes agent-protocol
+        §6's path (row `failed`, no retry). `StepResult` also holds the conditional
+        `quotes` and `shortfalls` updates (agent-protocol §7).
+    *   On any other exception: back-off and retry, then `failed` after 5 attempts, calling
         `runs.finish(status=error, reason=poison_message)`.
     *   Every 60 s, and at startup, returns rows of this host stuck in `processing` for
         more than 120 s to `pending`.
@@ -1752,8 +1794,8 @@ and values; none of these may be renamed or dropped.
         inserts the `runs` row, writes `run_start`, and creates the `run_timeout` timer.
     *   `finish(conn, run_id, agent_id, status, reason=None, summary=None) -> bool` applies
         the outcome rule in §10. When it ends a run with `error` or `timeout`, it also sends
-        the retry prompt through the outbox (`whatsapp_out` to `channel:whatsapp`). It
-        returns whether it changed the run.
+        the retry prompt through the outbox (`whatsapp_out` to `channel:whatsapp`), except
+        for `a2a_demo` runs. It returns whether it changed the run.
     *   `is_ended(conn, run_id) -> bool`, used by guard step 0.
     *   `retry_target(conn, user_id) -> UUID | None` returns the user's latest run in the
         last 24 h if it ended `error` or `timeout`. It returns `None` if that run's order
@@ -1763,7 +1805,8 @@ and values; none of these may be renamed or dropped.
 
 *   **Type / Scope**: Python module.
 *   **Proposed Changes**:
-    *   `ALLOWED`: the transition table from §8.
+    *   `ALLOWED`: the transition table from §8, including `authorized → quoting`.
+    *   `apply_amendment(...)` (agent-protocol P15).
     *   `transition(conn, order_id, expected, new, **fields) -> bool` runs `UPDATE orders
         SET state=$new, ... WHERE order_id=$1 AND state = ANY($expected)` and refuses
         transitions not in `ALLOWED`.
@@ -1786,7 +1829,8 @@ and values; none of these may be renamed or dropped.
 *   **Proposed Changes**:
     *   Loads enabled cards with `host_process='agents'` and builds a handler per class.
     *   Starts `consume_forever("agents", dispatch)` and `sweep_forever()`.
-    *   Serves `/health` on port 8003, reporting the card count and Postgres reachability.
+    *   Serves `/health` on port 8003, reporting the card count, Postgres reachability
+        and the message backlog per host, and mounts the A2A routes (agent-protocol P18).
     *   `dispatch` routes by `to_agent`. It wraps each step so an exception after the last
         attempt calls `runs.finish(status=error)`.
 
@@ -1839,6 +1883,8 @@ and values; none of these may be renamed or dropped.
         *   `finish`: `runs.finish(completed)` and a summary `whatsapp_out`.
     *   Dinner uses the same nodes with `kind='dinner'`, restaurant cards, and no
         `record_delivery`.
+    *   Agent-protocol P21 adds the reject rule, one re-quote, the `protocol_error`
+        reaction and the shortfall nodes.
     *   `stubs.py` chooses the cheapest valid offer and writes a fixed explanation. If that
         offer is over the remaining weekly budget, the stub first sends one `counter_offer`
         at 90% of its total, so evals exercise the store's `respond_to_counter` choice.
@@ -1858,8 +1904,9 @@ and values; none of these may be renamed or dropped.
             `choose(rank_substitutes)` call. Insert a `quotes` row (`round=0`), reply
             `offer` with the rationale.
         *   `counter_offer`: one `choose(respond_to_counter)` call with the allowed set in
-            §4. Then a conditional update of the quote: `accepted`; or `countered` with the
-            new total and `round=round+1`; or `rejected`. Reply `offer` with the new total,
+            §4. Then a conditional update of the quote: `countered` with the buyer's total
+            (`agree`) or the new total (`counter`), and `round=round+1`; or `rejected`.
+            Only the buyer's `accept` sets `accepted` (agent-protocol §7). Reply `offer` with the new total,
             or `reject`, with the rationale.
         *   `accept`: send `delivery_quote_request` to each in-zone delivery card from
             `directory.find`, create a `quote_round` timer (10 s, `ref={order_id,
@@ -1870,8 +1917,8 @@ and values; none of these may be renamed or dropped.
             `delivery_quote`. The store keeps no state of its own; the `quotes` rows are the
             record.
         *   `quote_round_closed` (delivery round): the rule picks the cheapest open courier
-            quote for the order that covers the window. If there is none, send `reject` to
-            the household agent.
+            quote for the order that covers the window. If there is none, set the quote
+            `rejected` and send `reject {reason: no_courier}` to the household agent.
         *   After the pick: call `place_order(order_id, quote_id, items_hash,
             delivery_agent_id)` with key `idempotency_key(order_id, "place_order", self)`.
             Its state change sets `placed` and `delivery_agent_id` together. Then send
@@ -1956,7 +2003,7 @@ and values; none of these may be renamed or dropped.
         *   `weekly_grocery_order` and `busy_night_dinner` call `ingest` with a simulated
             message from the household's first member. `overrides` (allowed keys:
             `APPROVAL_TTL_SECONDS`, `STUB_FAIL_NODE`, `STUB_OUT_OF_BOUNDS`,
-            `STUB_DUPLICATE_MESSAGE`) are stored
+            `STUB_DUPLICATE_MESSAGE`, plus the keys in agent-protocol P32) are stored
             in `runs.trigger.overrides`. Code that reads these settings checks the run's
             overrides before the environment.
         *   `weekly_grocery_order_pair` takes `household_ids: [a, b]`, starts both runs
@@ -1975,7 +2022,8 @@ and values; none of these may be renamed or dropped.
         *   maps the status with `orders.COURIER_STATUS_MAP`;
         *   applies a forward-only `orders.transition`;
         *   sends `order_status` to the household agent and the seller;
-        *   on `failed`, calls `runs.finish(status=error, reason=delivery_failed)`.
+        *   on `failed`, calls `runs.finish(status=error, reason=delivery_failed)`;
+        *   on `in_delivery`, closes a pending shortfall (agent-protocol P30).
 
 ##### 38. `services/api/routes/reserved.py` (Create)
 
@@ -1995,7 +2043,9 @@ and values; none of these may be renamed or dropped.
         *   `PUT /panel/modes/{vendor}` writes `adapter_modes`.
         *   `POST /panel/approvals/{id}/expire` sets that approval's timer due now.
         *   `GET /panel/runs/live` reads recent traces for the "watch the agents talk"
-            view.
+            view, with the fields in agent-protocol §8.
+        *   `GET /panel/messages/{message_id}` and the `shortfall` event (agent-protocol
+            P31).
     *   **Sender:** `dispatch(msg)` handles `whatsapp_out` messages. It looks up the
         phone's `channel_mode`:
         *   `real`: call the Graph API. Use a template outside the 24-hour window (Q5).
@@ -2033,7 +2083,8 @@ and values; none of these may be renamed or dropped.
     (§13); the adapters design owns the final schemas. Tools marked *guarded* use
     `services.safety.guard.run_guarded`; the rest use `@traced`.
     *   **grocery and restaurant:** `search_items(query, filters)`, `quote(items)`,
-        `place_order(order_id, quote_id, items_hash, delivery_agent_id)` *guarded*.
+        `place_order(order_id, quote_id, items_hash, delivery_agent_id)` *guarded*,
+        `amend_order(order_id, shortfall_id, picks)` *guarded*.
     *   **delivery:** `quote_delivery(order_id, zone_id, window)`,
         `book_delivery(order_id, address_ref, window)` *guarded*,
         `get_delivery_status(order_id)`.
@@ -2043,7 +2094,10 @@ and values; none of these may be renamed or dropped.
         `authorize_spend(order_id, quote_id, items, total)` *guarded*,
         `request_approval(order_id, amount)` *guarded*,
         `decide_approval(approval_id, decision, user_id)` *guarded*,
-        `record_delivery(order_id)` *guarded*.
+        `record_delivery(order_id)` *guarded*,
+        `choose_shortfall_option(shortfall_id, line, pick, user_id)` *guarded*,
+        `authorize_amendment(order_id, shortfall_id, picks)` *guarded*,
+        `open_shortfall(...)`, `get_shortfall(shortfall_id)`.
     *   **knowledge:** `check_allergens(skus, allergen_codes)`,
         `find_substitutes(sku, constraints)`, `explain_path(sku, allergen_code)`.
     *   Each tool picks its adapter with `modes.adapter_for(vendor, ctx.modes)`.
@@ -2189,6 +2243,9 @@ and values; none of these may be renamed or dropped.
         the same zone.
     *   The Kroger catalog sync into `catalog_items`, only when `MODE_KROGER_CATALOG=real`.
     *   Mock stock for both `env` values.
+    *   Agent-protocol P34: the `external:a2a-demo` card, the `a2a-demo` eval household,
+        `config.description` and `config.card_version` on business cards, and the shortfall
+        fixture SKUs.
     *   Exits non-zero on any failure, so the deploy rolls back (§9).
 
 #### Infrastructure (critical)
@@ -2302,12 +2359,15 @@ and values; none of these may be renamed or dropped.
         `/internal/sim/whatsapp`.
     *   Results JSON adds `reason_counts`.
     *   `hello` and `wait_for_outcome` are unchanged.
+    *   The `inject`, `shortfall` and `a2a_demo` features and the read-only `db` snapshot
+        of agent-protocol P38.
 
 ##### 66. `evals/checks.py` (Modify, critical)
 
 *   **Type / Scope**: Eval checks.
 *   **Proposed Changes**: Add checks only; existing checks are unchanged. Each reads the
-    run's trace rows (payload keys in §10).
+    run's trace rows (payload keys in §10); checks that need table rows may also take a
+    read-only `db` argument (agent-protocol P37).
     *   `single_outcome`: exactly one `outcome` row.
     *   `run_status(status, reason=None)`: the `outcome` row's `status` and `reason`.
     *   `no_cross_household_data(other_household)`: no member id, phone, constraint value,
@@ -2387,7 +2447,8 @@ and values; none of these may be renamed or dropped.
     *   Shared identifiers come from `services/common/ids.py`, never ad hoc.
     *   Business agents use the model only through `model.choose()`, with an allowed set and
         a rule default computed in code.
-    *   Idempotency keys are built only from `order_id`, the action and the acting agent id.
+    *   Idempotency keys are built only from `order_id`, the action, the acting agent id
+        and an optional scope id, always through `ids.idempotency_key`.
     *   `MODEL_MODE=stub` is the default for tests. Never switch tests to `real`.
     *   `migrations/checkpointer.py` is the only exception to SQL-only migrations.
 
@@ -2428,6 +2489,10 @@ and values; none of these may be renamed or dropped.
 | `SQUARE_RETAIL_TOKEN`, `SQUARE_RESTAURANT_TOKEN`, `SQUARE_ENV` | `mcp` | |
 | `KROGER_CLIENT_ID`, `KROGER_CLIENT_SECRET`, `KROGER_LOCATION_ID` | `mcp`, `testrunner` | |
 | `MOCK_COURIER_STEP_SECONDS` (20) | `mcp` | |
+| `OFFER_TTL_SECONDS` (600), `COURIER_QUOTE_TTL_SECONDS` (120), `A2A_DEMO_TIMEOUT_SECONDS` (900), `A2A_SEND_WAIT_SECONDS` (10), `A2A_MAX_REQUEST_BYTES` (32768), `A2A_RATE_PER_SECOND` (10) | `agents` | Agent-protocol §13 |
+| `SHORTFALL_REPLY_SECONDS` (900), `SHORTFALL_MAX_LINES` (3) | `agents`, `api`, `mcp` | Agent-protocol §13 |
+| `A2A_DEMO_TOKEN` (`change-me-local`) | `agents`, `testrunner` | Static bearer token for the internal A2A endpoint |
+| `AGENTS_URL` (`http://agents:8003`) | `testrunner` | The eval runner's A2A client target |
 | `SEED_US1_PHONES` | `testrunner` | No real numbers in the repository |
 | `PANEL_USER`, `PANEL_PASSWORD_HASH` | `caddy` | |
 | `APP_IMAGE`, `APP_TAG`, `GHCR_READ_TOKEN`, `GCS_BACKUP_BUCKET` | `deploy.sh`, `backup.sh` | Not passed to containers |
