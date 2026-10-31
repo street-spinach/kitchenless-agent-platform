@@ -170,16 +170,45 @@ This is the only list of non-goals; §15 and "Out of scope (implementation)" poi
 
 *   **Q1 (resolved 2026-10-31).** The A2A methods are hand-rolled with pydantic, not built
     on the A2A Python SDK (Alternative T).
-*   **Q2. JSON-RPC error code numbers.** The spec's error table (A2A-specific codes -32001 to
-    -32009, such as `TaskNotFoundError` -32001 and `UnsupportedOperationError` -32004) was
-    read only from a summary, not verbatim. Confirm the numbers against the normative
-    `spec/a2a.proto` before the endpoint is built, and pin them in one constants module.
-*   **Q3. Value of the `A2A-Version` header.** The spec's examples use `A2A-Version: 0.3`,
-    while `protocolVersion` examples use `1.0`. The endpoint pins `protocolVersion` to
-    `1.0`; which header values it accepts must be confirmed against the spec text.
-*   **Q4. Bearer scheme field names in the card.** The spec is inconsistent between
-    `securityRequirements` and `security`, and the HTTP auth scheme key was not seen
-    verbatim. Confirm against the proto before writing `to_a2a_card`.
+Q2–Q4 were answered on 2026-10-31 from the A2A v1.0.1 release (tag `v1.0.1`, 2026-05-28):
+`specification/a2a.proto`, which spec §1.4 makes the single normative definition of the data
+objects, and `docs/specification.md` for the bindings. The JSON-RPC codes are the same in
+v1.0.0; v1.0.1 changed only gRPC and HTTP status mappings, which this design does not use.
+
+*   **Q2 (resolved). JSON-RPC error codes** (spec §5.4 and §9.5):
+
+    | Error | Code | `ErrorInfo.reason` |
+    |---|---|---|
+    | `TaskNotFoundError` | -32001 | `TASK_NOT_FOUND` |
+    | `TaskNotCancelableError` | -32002 | `TASK_NOT_CANCELABLE` |
+    | `UnsupportedOperationError` | -32004 | `UNSUPPORTED_OPERATION` |
+    | `VersionNotSupportedError` | -32009 | `VERSION_NOT_SUPPORTED` |
+    | `JSONParseError` | -32700 | none (standard JSON-RPC) |
+    | `InvalidRequestError` | -32600 | none |
+    | `MethodNotFoundError` | -32601 | none |
+    | `InvalidParamsError` | -32602 | none |
+    | `InternalError` | -32603 | none |
+
+    `error.data` is an **array** of objects, each with an `@type` key (ProtoJSON `Any`). A2A
+    errors carry `{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": <above>,
+    "domain": "a2a-protocol.org"}`; spec §11.6 makes this a MUST for HTTP and §9.5 a SHOULD
+    for JSON-RPC, and this endpoint always sends it. Spec §3.1.5 confirms that cancelling a
+    terminal task returns `TaskNotCancelableError`.
+*   **Q3 (resolved). `A2A-Version`** (spec §3.6, §14.2.1): the value is `Major.Minor`. A
+    client may send it as a header or as a request parameter. The endpoint accepts only
+    `1.0`. An empty or missing value MUST be read as `0.3` (§3.6.2), so it gets
+    `VersionNotSupportedError`, like any other value. The eval runner's client always sends
+    `A2A-Version: 1.0`.
+*   **Q4 (resolved). Card security fields** (proto `AgentCard` fields 8 and 9). JSON uses
+    camelCase (spec §5.5):
+
+    ```json
+    "securitySchemes": {"bearer": {"httpAuthSecurityScheme": {"scheme": "Bearer"}}},
+    "securityRequirements": [{"schemes": {"bearer": {"list": []}}}]
+    ```
+
+    The spelling `"security"` in the sample card (spec §8.5) is the older form; the proto wins.
+    The proto also makes `provider.url` required, so the card sets it (§2).
 
 Already confirmed (2026-10-31, `a2a-protocol.org/latest/specification`): the card path
 `/.well-known/agent-card.json`; the method names `SendMessage`, `GetTask` and `CancelTask`;
@@ -279,7 +308,7 @@ architecture journey.
         the task moves from `TASK_STATE_SUBMITTED` to `TASK_STATE_INPUT_REQUIRED` with the
         offer as an artifact.
     *   Every message appears in the live view like internal traffic.
-    *   The `accept` gets JSON-RPC `UnsupportedOperationError` (code per Q2). No row is
+    *   The `accept` gets JSON-RPC `UnsupportedOperationError` (-32004). No row is
         inserted, an `error` trace with `reason=accept_not_allowed` appears in the lane, the
         task stays `TASK_STATE_INPUT_REQUIRED`, and no order is placed.
     *   The same request through Caddy from the internet returns 404.
@@ -360,11 +389,12 @@ each other's A2A cards. `to_a2a_card(card)` builds the A2A form on request:
 | `description` | `config.description` (seeded) |
 | `supportedInterfaces` | One entry: `url = http://agents:8003/a2a/<agent_id>`, `protocolBinding = "JSONRPC"`, `protocolVersion = "1.0"` |
 | `version` | `config.card_version` (seeded, default `"1.0.0"`), §4 |
-| `provider.organization` | The owner org's display name, from `owner_ref` |
+| `provider` | `organization`: the owner org's display name, from `owner_ref`; `url`: the agent's `supportedInterfaces` URL (required by the proto, Q4) |
 | `capabilities` | `streaming: false`, `pushNotifications: false`, one extension `urn:kitchenless:on-behalf-of:v1` whose `params.on_behalf_of` is the card's `owner_ref` (`org:<id>`) |
 | `defaultInputModes` / `defaultOutputModes` | `["application/json"]` / `["application/json", "text/plain"]` |
 | `skills` | One skill per class: `grocery_quote` or `dinner_quote`, listing the message types the card accepts from an outside caller (§11) |
-| `securitySchemes` | One HTTP bearer scheme (field names confirmed in Q4) |
+| `securitySchemes` | `{"bearer": {"httpAuthSecurityScheme": {"scheme": "Bearer"}}}` (Q4) |
+| `securityRequirements` | `[{"schemes": {"bearer": {"list": []}}}]` (Q4) |
 
 *   The card is served at `GET /a2a/<agent_id>/.well-known/agent-card.json`, only for
     enabled grocery and restaurant cards. Any other `agent_id` returns 404.
@@ -402,7 +432,7 @@ Every message is one `agent_messages` row. The envelope is its columns:
 
 | Axis | Carried in | Current value | Who bumps it | Compatibility rule | Unknown value |
 |---|---|---|---|---|---|
-| A2A `protocolVersion` | Card interface; `A2A-Version` header | `1.0` | A code change, by hand | Pinned. Accepted header values are fixed in Q3 | JSON-RPC `VersionNotSupportedError` |
+| A2A `protocolVersion` | Card interface; `A2A-Version` header | `1.0` | A code change, by hand | Pinned. The endpoint accepts only `A2A-Version: 1.0`; an empty value means `0.3` (Q3) | JSON-RPC `VersionNotSupportedError` (-32009) |
 | Card `version` | `agent_cards.config.card_version` | `1.0.0` | The seed, when a card's skills or accepted types change | Informational only | Not checked |
 | Payload `schema_version` | Every `body` | `1` for every type | The protocol module, only for a breaking change to a type | Fields are only added, each with a default, without a bump. Receivers ignore unknown fields. A breaking change gets a new version, and the receiver must know it | Rejected by schema validation (C2) with `protocol_error {code: unsupported_version}`, never a retry |
 | LangGraph `state_version` | Graph state | Architecture §4 | Architecture §4 | Architecture §4 | Architecture §4 |
@@ -825,6 +855,13 @@ seller: amend_order ─► order_confirm (new lines and total) ─► household 
 *   **Limits.** Request at most 32 KB (HTTP 413); at most 10 requests per second per
     process (HTTP 429).
 *   **Implementation.** Hand-rolled with pydantic (Q1, Alternative T).
+*   **Version.** Every request must carry `A2A-Version: 1.0` (header or request parameter).
+    Anything else, including no value, gets `VersionNotSupportedError` before any other
+    method handling (Q3).
+*   **Error shape.** Every JSON-RPC error has `error.data` as an array. A2A errors carry the
+    `ErrorInfo` object of Q2. An `InvalidParams` from a protocol check carries
+    `{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": <protocol code in
+    upper case, for example "WRONG_PARTY">, "domain": "kitchenless"}`.
 *   **Building the row.** For `SendMessage`, in this order and in one transaction:
     1.  `message_id = uuid5(NS_A2A, "external:a2a-demo|" + messageId)`. If a row with that
         id exists and the SHA-256 of the client's data part equals the `request_hash`
@@ -832,7 +869,7 @@ seller: amend_order ─► order_confirm (new lines and total) ─► household 
         has no second effect. If the hash differs, return JSON-RPC `InvalidParams`.
     2.  The data part's `type` must be `quote_request`, `counter_offer` or `reject`.
         `accept` is refused here, before any other check, with JSON-RPC
-        `UnsupportedOperationError` (code per Q2): no row is inserted, an `error` trace
+        `UnsupportedOperationError` (-32004): no row is inserted, an `error` trace
         (`where=a2a`, `reason=accept_not_allowed`) appears in the conversation's lane, and
         the task keeps its state. `cancel` gets `InvalidParams` with "use CancelTask".
     3.  For a `quote_request` with no `contextId`, `a2a_demo.start_context()` inserts the
@@ -847,8 +884,9 @@ seller: amend_order ─► order_confirm (new lines and total) ─► household 
     5.  For `counter_offer` and `reject`, `run_id`, `order_id`, `quote_id` and
         `conversation_id` come from the quote row named by `taskId`; the quote's buyer must
         be `external:a2a-demo` and its `conversation_id` must equal `contextId`.
-    6.  C1–C3 run (§6). A failure returns JSON-RPC `InvalidParams` with the protocol code in
-        `error.data`, and the transaction rolls back, so no run or order is left behind.
+    6.  C1–C3 run (§6). A failure returns JSON-RPC `InvalidParams` (-32602) with the protocol
+        code in `error.data` (see "Error shape"), and the transaction rolls back, so no run
+        or order is left behind.
     7.  `outbox.send()` inserts the row.
 *   **Methods.**
     *   `SendMessage(message, configuration)`. The message needs `role = ROLE_USER` and
@@ -1118,8 +1156,8 @@ Rows use architecture §9's columns. Architecture §9 points here for these rows
 *   **Pros**: Maintained types and method handling that follow the spec.
 *   **Cons**: Extra memory in the `agents` container on a 4 GB machine, and one more pinned
     dependency, for three methods (`SendMessage`, `GetTask`, `CancelTask`).
-*   **Reason for Rejection**: The three methods are hand-rolled with pydantic (§11). Q2–Q4
-    are checked against `spec/a2a.proto` before P19 is built.
+*   **Reason for Rejection**: The three methods are hand-rolled with pydantic (§11). The
+    spec facts they depend on (Q2–Q4) were read from the v1.0.1 proto and spec text.
 
 --------------------------------------------------------------------------------
 
@@ -1127,7 +1165,7 @@ Rows use architecture §9's columns. Architecture §9 points here for these rows
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| Our reading of the A2A spec is wrong on error codes, `TaskNotCancelableError` or the wait rule (Q2–Q4) | Medium | Low: the demo client sees a non-standard reply | Check each against `spec/a2a.proto` before P19 is built; the A2A smoke test runs a standard client against the endpoint |
+| Our reading of the A2A spec is wrong on error codes, the version header or the card fields | Low: Q2–Q4 were read from the v1.0.1 proto and spec text | Low: the demo client sees a non-standard reply | The values are pinned in one constants module and asserted by `test_a2a_server.py`; the A2A smoke test runs a client against the endpoint |
 | Store-supplied text (product names, rationale) carries something unwanted into the panel | Medium | Low: shown only in the internal panel | Summaries use no free text (§8); rationale shows only as quoted text in the expanded view of S1–S7 rows; business agents never see profiles |
 | The static `A2A_DEMO_TOKEN` leaks | Low | Low: the endpoint is bound to `127.0.0.1` and can only negotiate | No Caddy route, a negative smoke test, `accept` refused, `authorize_spend` refuses `a2a_demo` orders |
 | One `agents` process holds every agent; a crash stops all of them | Medium | Medium: the run stalls until restart | Compose restarts it; the outbox keeps every message, and steps replay with the same ids (P-CUJ 3) |
@@ -1155,7 +1193,8 @@ Rows use architecture §9's columns. Architecture §9 points here for these rows
 ## Additional Resources
 
 *   `docs/designs/architecture.md` (approved, amended 2026-10-31).
-*   A2A protocol v1.0.0: `https://a2a-protocol.org/latest/specification/`.
+*   A2A protocol v1.0.1 (tag `v1.0.1` of `github.com/a2aproject/A2A`): `specification/a2a.proto`
+    and `docs/specification.md`; published at `https://a2a-protocol.org/latest/specification/`.
 *   `PROJECT_BRIEF.md` (repo root) and `ENGINEERING_PROCESS.md`.
 *   History only, not committed: the agent-protocol concepts brief (2026-10-31) and its
     Goldfish review. Their decisions are recorded in this document.
@@ -1194,7 +1233,7 @@ it does not add new steps.
 | 3. MCP and mocks | P15, P25–P28 (new tools and limits), P33, P34 | Step 2 |
 | 4. Agents with the stub model | P21–P24 (handler and graph rules, without shortfall) | Step 3 |
 | 5. Safety paths | P21–P24 shortfall parts, P29, P30, P32, P37–P39 safety cases | Step 4 |
-| 6. Channels | P18–P20 (A2A endpoint), P31 (panel routes), P35, P36, P40, P44 | Step 5, and Q2–Q4 for P19 |
+| 6. Channels | P18–P20 (A2A endpoint), P31 (panel routes), P35, P36, P40, P44 | Step 5 |
 | Same PR as this design | P41–P43 (docs) | Nothing |
 
 Critical files go in their own small PRs where possible: migrations (P7–P10), safety
@@ -1304,8 +1343,9 @@ Makefile (P44).
     *   `task_state(quote: QuoteRow | None, request_status: str, now: datetime) -> str`:
         the §7 table, as one function with no database access. It reads `quote.status`,
         `quote.closed_by` and `quote.expires_at`.
-    *   `JSONRPC_ERRORS`: name → code, filled from `spec/a2a.proto` (Q2), and
-        `A2A_PROTOCOL_VERSION = "1.0"`, with accepted `A2A-Version` header values (Q3).
+    *   `JSONRPC_ERRORS`: name → `(code, reason)`, exactly the Q2 table;
+        `A2A_PROTOCOL_VERSION = "1.0"`, the only accepted `A2A-Version` value (Q3);
+        `error_data(reason, domain) -> list[dict]` builds the `ErrorInfo` array.
 
 #### Shared runtime (`services/common/`)
 
@@ -1843,7 +1883,9 @@ Makefile (P44).
     `test_cancel_via_send_message_invalid_params`, `test_text_only_message_invalid_params`,
     `test_counter_needs_known_task`, `test_get_task_of_other_buyer_not_found`,
     `test_cancel_task_inserts_buyer_cancelled`, `test_cancel_terminal_task_not_cancelable`,
-    `test_return_immediately_gives_submitted`, `test_card_only_for_grocery_and_restaurant`.
+    `test_return_immediately_gives_submitted`, `test_card_only_for_grocery_and_restaurant`,
+    `test_missing_version_header_not_supported`, `test_wrong_version_not_supported`,
+    `test_errors_carry_error_info_array`.
 *   `test_checks_protocol.py`: one test per new check in P37, each with a passing and a
     failing trace fixture.
 *   `test_eval_runner.py` (extend): `test_inject_writes_row_and_trace`,
@@ -1894,9 +1936,8 @@ change `evals/thresholds.yaml`.
 *   **End to end**: `make up && make seed && make smoke && make scenario` locally with
     `MODEL_MODE=stub`; `make eval-fast` in CI (it includes every `fast` case above);
     `make eval-full` nightly.
-*   **Spec conformance (Q2–Q4)**: before P19 merges, the PR records the error codes,
-    header values and card field names read from `spec/a2a.proto`, and
-    `test_a2a_server.py` asserts them.
+*   **Spec conformance (Q2–Q4)**: `test_a2a.py` and `test_a2a_server.py` assert the codes,
+    reasons, version rule and card fields recorded in Open Questions.
 *   **Coverage**: no percentage target (architecture). The tests per file are listed
     above.
 
