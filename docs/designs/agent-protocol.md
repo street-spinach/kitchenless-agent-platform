@@ -1,7 +1,8 @@
 # Kitchenless agent-to-agent protocol
 
 *   **Author:** madushankaf
-*   **Status:** Approved
+*   **Status:** Approved; amended 2026-11-01 (identity-authz I-P1: per-message tokens
+    closed)
 *   **Date:** 2026-10-31
 *   **Path:** `docs/designs/agent-protocol.md`
 *   **Builds on:** `docs/designs/architecture.md` (approved; amended 2026-10-31, commit
@@ -982,7 +983,7 @@ Rows use architecture §9's columns. Architecture §9 points here for these rows
 |---|---|
 | experience | Shortfall message wording, button labels, and sending outside WhatsApp's 24-hour window (templates) |
 | adapters | Real shortfall detection (Square, Kroger) and a real `amend_order` contract; mock only here |
-| identity-authz | Tokens for the new guarded tools and their OpenFGA relations; per-message tokens as a possible later extension |
+| identity-authz | Tokens for the new guarded tools and their OpenFGA relations. Per-message tokens: closed as not needed (I-P1, 2026-11-01) |
 | knowledge graph (architecture §5) | The substitute allergen check used by `authorize_amendment`, the same check `authorize_spend` uses |
 | agents (new SITEMAP row) | Counter strategy, comparing partial offers, the shortfall prompts for consumer agents and the seller's `rank_substitutes` prompt |
 | evals | Fixture data for the eval cases in the Verification Plan |
@@ -1030,8 +1031,8 @@ Rows use architecture §9's columns. Architecture §9 points here for these rows
 *   **Pros**: The receiver could verify the delegation chain itself.
 *   **Cons**: A household token held by a store could be replayed to act for the family.
 *   **Reason for Rejection**: Each agent calls guarded tools with its own access, and
-    receivers run the sender check (§6). Per-message tokens are listed for identity-authz
-    as a possible later extension.
+    receivers run the sender check (§6). identity-authz closed per-message tokens as not
+    needed (I-P1, 2026-11-01).
 
 ### Alternative F: Notify-only shortfall
 
@@ -1204,7 +1205,6 @@ Rows use architecture §9's columns. Architecture §9 points here for these rows
 *   **Redis Streams** if message volume outgrows the Postgres outbox.
 *   **External business agents** over a public, authenticated A2A endpoint, after
     identity-authz.
-*   **Per-message tokens** (identity-authz).
 *   **Streaming and push** (`SendStreamingMessage`, `SubscribeToTask`) for the demo client.
 *   **Real-vendor shortfalls** (adapters).
 *   **Whole-order cancel after placement**, with the courier cancel it needs.
@@ -1946,7 +1946,8 @@ change `evals/thresholds.yaml`.
 Everything in Non-Goals, plus these items that belong to other designs:
 
 *   Negotiation strategy, comparison of partial offers, and every prompt (agents design).
-*   The OpenFGA model, real tokens and per-message tokens (identity-authz).
+*   The OpenFGA model and real tokens (identity-authz). Per-message tokens were closed as not
+    needed (identity-authz I-P1).
 *   Real-vendor shortfall detection and real `amend_order` contracts (adapters).
 *   Shortfall wording, button labels and the 24-hour window templates (experience).
 *   Fixture data beyond the cases above (evals).

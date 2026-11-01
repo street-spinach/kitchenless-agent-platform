@@ -1145,7 +1145,7 @@ build steps never contradict an approved design.
 | I-A3 | architecture item 54 (`fga.py`) | "A timeout counts as a refusal" becomes "a timeout raises `AuthzUnavailable`"; `check` also returns the model id |
 | I-A4 | architecture item 53 (`tokens.py`) | `MockIssuer` (HMAC) is replaced by `TokenSource`; `validate()` as in §8 |
 | I-A5 | architecture §5 `place_order` limits | Also require an active household-agent grant for the order's household (I-D22) |
-| I-A6 | architecture §10 `runs.finish` | With reason `grant_revoked`, sets the run's orders that are before `placed` to `failed` |
+| I-A6 | architecture item 24 (`runs.finish`) | With reason `grant_revoked`, sets the run's orders that are before `placed` to `failed` |
 | I-A7 | architecture item 20 (`consumer.py`) and §4 poison rule | When the last attempt fails with `identity_unavailable` or `authz_unavailable`, the run's reason is that code, not `poison_message` |
 | I-A8 | architecture §9 failure matrix | The rows in §12 |
 | I-A9 | architecture §10 trace payloads | The `tool_call` and `tool_result` additions in §14 |
@@ -1155,10 +1155,11 @@ build steps never contradict an approved design.
 | I-A13 | architecture item 55 (seed) | The seed writes `agent_clients`, `users.keycloak_sub` from the import file's ids, and mock grants; it runs `fga.reconcile` |
 | I-A14 | architecture item 38 (`reserved.py`) | `/me/*` and `/app/*` are no longer reserved; `me.py` and `app.py` serve them |
 | I-A15 | architecture Q4 and §13 row "Token source and OpenFGA relations" | Resolved by this design |
-| I-A16 | architecture §10 `runs.start` | Refuses a run for a household with no active household grant; `kind IN ('hello','a2a_demo')` and runs with no household are exempt (I-D25) |
+| I-A16 | architecture item 24 (`runs.start`) | Refuses a run for a household with no active household grant; `kind IN ('hello','a2a_demo')` and runs with no household are exempt (I-D25) |
 | I-A17 | architecture item 53 and §13 eval runs | Runs for eval households use the mock source on the live stack; `mcp` accepts mock tokens only for those runs (I-D24) |
-| I-A18 | architecture item 8 (`approvals`) | Additive `approvals.limits text[]`, the limits hit, for the prompt text (§9) |
+| I-A18 | architecture item 11 (`approvals`) | Additive `approvals.limits text[]`, the limits hit, for the prompt text (§9) |
 | I-A19 | architecture §4 seeded floors | Seeded floors stay at 95 % of list price. The owner rule's seeded `max_discount_pct` is chosen so it binds (4 %, a 96 % floor), instead of re-seeding floors at 75 % |
+| I-A20 | architecture items 23 and 41 (MCP client contract, amendment 2026-11-01) | Kept as written. Adds `call_tool_as` (token by `agent_clients.kind`, one refresh on a token refusal, the identity error mapping) and maps `DependencyUnavailable` in `tool_errors()` to a retryable `unavailable` result (I6) |
 | I-P1 | agent-protocol, Future Improvements "per-message tokens" | Closed: not needed |
 
 ## Alternatives Considered
@@ -1618,29 +1619,36 @@ read "(Create or Modify; critical if so; architecture item N if any)".
 *   **Tests** (`tests/unit/test_config.py`, extended): `test_mcp_starts_live_without_grant_key`,
     `test_api_refuses_live_without_grant_key`, `test_mock_key_required`.
 
-##### I6. `services/mcp/meta.py` and `services/common/mcp_client.py` (Modify; architecture items 41, 23)
+##### I6. `services/mcp/meta.py` and `services/common/mcp_client.py` (Modify; architecture items 23, 41)
+
+Architecture's MCP client contract (amendment 2026-11-01, items 23, 23a and 41) is kept
+as written: `call_tool(server, tool, args, *, ctx: RunContext, token: str)`, the bearer
+header, the `isError` result shape and the client's two attempts. This item adds to it.
 
 *   **Proposed Changes**:
-    *   **Client.** `mcp_client` is the single owner of token acquisition: it asks
-        `TokenSource` for a people or service token according to the caller's
-        `agent_clients.kind`. Callers never fetch tokens themselves. One MCP client session
-        per `(run_id, agent_id)`, created with the `Authorization: Bearer <token>` header
-        and recreated when `TokenSource` returns a new token.
-    *   **Server.** `CallContext.from_meta(meta)` reads the `Authorization` header of the
-        current HTTP request from the MCP SDK's request context (or the server runs in
-        stateless HTTP mode, so each call is its own request), never from `_meta`. A header
-        cached from a session's first request is never reused.
-    *   `CallContext` gains `claims: Claims | None` and `authz_form: str | None`, set by
-        the guard.
-    *   **Refusals.** The guard returns the architecture's `ToolRefused(reason)` result;
-        transport errors stay transport errors. `mcp_client` maps them:
-        *   `token_*`, `act_*`: obtain one new token, retry once, then raise `TokenRefused`;
-        *   `grant_*`: raise the matching `GrantError`;
-        *   `identity_unavailable`, `authz_unavailable`: raise the matching
-            `DependencyUnavailable`;
-        *   any other reason: `ToolRefused` as today.
+    *   **Client.** A new `call_tool_as(server, tool, args, *, ctx: RunContext) -> dict` in
+        `mcp_client` is the one place that obtains tokens. It asks `TokenSource` for a
+        people or a service token according to `agent_clients.kind` of `ctx.agent_id`, then
+        calls `call_tool` with it. Agent code and `api` call `call_tool_as`; nothing else
+        fetches tokens. Each call sends the current token, so a new token is used from the
+        next call on.
+    *   **Server.** `CallContext.from_meta(meta)` takes the token from
+        `meta.current_token()`, which the item 40 middleware sets per HTTP request, so a
+        second request on the same MCP session carries its own token. `CallContext` gains
+        `claims: Claims | None` and `authz_form: str | None`, set by the guard.
+    *   **Errors on the wire.** `meta.tool_errors()` also maps `DependencyUnavailable` to
+        `tool_error("unavailable", reason, retryable=True)`. The guard's identity refusals
+        (`token_*`, `act_*`, `grant_*`, `scope_missing`) are ordinary `refused` results.
+    *   **Mapping in `call_tool_as`:**
+        *   `ToolRefused` with `token_*` or `act_*`: obtain one new token and call once
+            more (same idempotency key), then raise `TokenRefused`;
+        *   `ToolRefused` with `grant_*`: raise the matching `GrantError`;
+        *   `AdapterUnavailable` with `identity_unavailable` or `authz_unavailable` (after
+            `call_tool`'s own retry): raise the matching `DependencyUnavailable`;
+        *   anything else is re-raised unchanged.
 *   **Tests** (`tests/unit/test_mcp_identity.py`): `test_token_not_in_meta`,
-    `test_refusal_reason_maps_to_exception`, `test_session_recreated_on_new_token`,
+    `test_call_tool_as_picks_token_by_client_kind`, `test_refusal_reason_maps_to_exception`,
+    `test_token_refusal_refreshes_once`, `test_dependency_unavailable_is_retryable_result`,
     `test_second_token_on_same_session_is_used`.
 
 #### Audit and OpenFGA (`authz/`, `services/identity/`)
@@ -2164,7 +2172,7 @@ ALTER TABLE approvals ADD COLUMN limits text[] NOT NULL DEFAULT '{}'   -- 'band'
 |---|---|---|
 | `services/common/runs.py` | `start` refuses with `grant_missing` or `grant_revoked` when the household has no active household grant, except for `kind IN ('hello','a2a_demo')` and runs with no household (I-D25), and records the run's token source (`mock` for eval households); `finish(reason='grant_revoked')` sets pre-`placed` orders `failed` (I-A6); `modes.token_source` | 5 |
 | `tests/conftest.py` | A mock signing key fixture, a grant fixture and a fake OpenFGA client | 4 |
-| `services/api/ingest.py` | Moves off `MockIssuer`: `decide_approval` and `choose_shortfall_option` use the `system:api` service token through `mcp_client` | 5 |
+| `services/api/ingest.py` | Moves off `MockIssuer`: `decide_approval` and `choose_shortfall_option` go through `call_tool_as` with a `RunContext` whose `agent_id` is `system:api`, so they use its service token | 5 |
 | `services/api/routes/reserved.py` | Remove `/me/*` and `/app/*` (I-A14) | 8 |
 | `services/api/main.py` | Mount `me` | 8 |
 | `services/api/main.py` | Mount `app` | 13 |
