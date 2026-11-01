@@ -3,7 +3,7 @@
 *   **Author:** madushankaf
 *   **Status:** Approved; amended 2026-10-31 (bounded model calls for business agents);
     amended 2026-10-31 (agent-protocol); amended 2026-10-31 (build step 1 ports and smoke);
-    amended 2026-11-01 (MCP client contract)
+    amended 2026-11-01 (MCP client contract); amended 2026-11-01 (identity-authz)
 *   **Date:** 2026-10-31
 *   **Path:** `docs/designs/architecture.md`
 
@@ -51,6 +51,20 @@ left the client/server contract open. This amendment fixes it:
 *   **Directory.** `AgentCard` is defined, and `card()` raises `UnknownAgent` for a
     missing id.
 Changed: implementation items 21, 22, 23, 40, 41, 43, 49 and the unit test list.
+
+**Amendment 2026-11-01 (identity-authz).** `docs/designs/identity-authz.md` §16 lists
+changes I-A1 to I-A20 to this design, applied here. In short: tokens are real (Keycloak
+delegation behind one `TokenSource`, with per-agent 30-day grants in `agent_grants`) and
+resolve Q4; guard step 1 also checks the grant, a scope table and the calling agent; step 2
+refuses a mismatched `household_id` argument, and OpenFGA timeouts become
+`authz_unavailable` instead of refusals; approval is needed above the admin's per-order
+band or the remaining budget; `place_order` requires the household agent's grant; a revoke
+fails the run's unplaced orders; the owner's `max_discount_pct` raises the floors; eval
+households keep mock tokens on the live stack; and Keycloak becomes a pinned 26.8 custom
+image with its own tag. Changed: Q4, §4, §5, §9, §10, §13, implementation items 8, 11, 20,
+23, 24, 38, 41, 43, 49, 51, 53, 54, 55, 56, 57, 59, 62 and the environment matrix. Where
+an item below and identity-authz's Detailed Implementation Plan differ, identity-authz
+wins.
 
 **Names.** This document uses three names for one project. Kitchenless is the product name.
 `kitchenless-agent-platform` is the GitHub repository (local folder
@@ -232,6 +246,10 @@ Each goal has a test, an eval or a measurement in the Verification Plan.
     *   These runs have no Keycloak session, and delegated tokens have no refresh token.
     *   The identity-authz design must say where tokens come from.
     *   Until then, all runs use the mock token issuer (item 53).
+    *   **Resolved 2026-11-01 by identity-authz (I-A15).** A person consents once through a
+        magic link; each agent's encrypted 30-day offline token in `agent_grants` yields a
+        fresh delegated token per run, with nobody present. Eval households keep the mock
+        issuer (I-A17).
 *   **Q5. WhatsApp templates and group eligibility.**
     *   Approval messages sent outside the 24-hour customer service window need an approved
         template.
@@ -480,7 +498,8 @@ household agents. The business agents are shared between environments.
         failure and any timeout gives the rule default and a template rationale.
     *   **Floor total**: the sum, over the quoted lines, of quantity × the item's floor unit
         price from the card's `business_rules` kind `floors`. An item with no floor uses its
-        list price.
+        list price. *Amended (identity-authz I-A11):* an item's floor is the higher of its
+        seeded floor and `list price × (1 − max_discount_pct / 100)` from the owner's rule.
     *   The choice points. Each business step has at most one:
 
         | Choice point | Step | Allowed set (code) | Rule default (code) |
@@ -628,9 +647,20 @@ call.
 
 0.  Refuse the call if the run has already ended.
 1.  Validate the caller's token (`sub`, `act`). In mock mode and CI, a mock issuer signs
-    tokens (Q4).
-2.  Check the OpenFGA relation.
-3.  Check the limits.
+    tokens (Q4). *Amended (identity-authz I-A2, I-A17):* also require an active
+    `agent_grants` row for delegated tokens, check the tool's caller and scope (the
+    identity-authz §8 step 1b table), and accept mock-issued tokens only under
+    `TOKEN_SOURCE=mock` or for eval households.
+2.  Check the OpenFGA relation. *Amended (identity-authz I-A1, I-A2):* first refuse a
+    `household_id` argument that differs from the run's household (`authz_denied`);
+    `get_constraints` has a household-agent form that returns every member's allergies
+    and diets; an OpenFGA timeout raises `AuthzUnavailable` (`authz_unavailable`), not a
+    refusal.
+3.  Check the limits. *Amended (identity-authz I-A5, I-A10):* `authorize_spend` needs
+    approval above the household's `approval_rules.per_order_minor` band or the remaining
+    weekly budget (one approval, two triggers; the guard, not the agent, sets the approver
+    and amount); `place_order` also requires an active household-agent grant for the
+    order's household (`grant_revoked`).
 4.  Claim the idempotency key with an atomic `INSERT … ON CONFLICT DO NOTHING RETURNING`:
     *   **New key:** continue.
     *   **Same key and request hash, `done`:** return the stored result without calling the
@@ -940,6 +970,13 @@ the user and the control panel. There are no holds: an open quote simply expires
 *   If the old order did reach `placed`, the user gets "Your order was already placed;
     we've flagged it for help," and the control panel shows the run.
 
+**Amended 2026-11-01 (identity-authz I-A7, I-A8).** identity-authz §12 adds four rows to
+this matrix: Keycloak unreachable (`identity_unavailable`), OpenFGA unreachable
+(`authz_unavailable`), refresh or exchange refused (`invalid_grant`, which marks the grant
+and is not retried) and a token refused by the guard (one fresh token, then the run ends).
+When the poison rule's last attempt fails with `identity_unavailable` or
+`authz_unavailable`, the run's reason is that code, not `poison_message`.
+
 ### 10. Trace model
 
 `agent_traces` (`migrations/0001_agent_traces.sql`) gets additive changes:
@@ -982,6 +1019,10 @@ the user and the control panel. There are no holds: an open quote simply expires
 
 The eval runner waits for the `outcome` row. Logs go to stdout as JSON lines carrying
 `run_id` and `agent_id`.
+
+**Amended 2026-11-01 (identity-authz I-A9).** `tool_call` and `tool_result` payloads gain
+`sub_user_id`, `act_agent_id`, `grant_id` (null for service tokens), `token_source` and
+`authz: {relation, object, allowed, model_id}`. `on_behalf_of` is written as today.
 
 ### 11. Deployment and memory budget (4 GB e2-medium)
 
@@ -1068,7 +1109,7 @@ without changing this design too.
 | MCP tool names and argument shapes | adapters | The tools in §5 and implementation item 43 |
 | Adapter result types | adapters | Ids, state, amounts and times only, never raw vendor bodies (§5) |
 | `pantry_events` | pantry | `household_id`, `item`, `delta`, `unit`, `source`, `order_id`, `ts`, unique `(order_id, item)` |
-| Token source and OpenFGA relations | identity-authz | The relations named in §5. Until then, a mock issuer, and relations seeded as static tuples |
+| Token source and OpenFGA relations | identity-authz | Resolved 2026-11-01 (identity-authz I-A15): `TokenSource`, per-agent grants and the OpenFGA model in identity-authz §6–§8 |
 | `/app/*` and `/me/*` behavior | experience, identity-authz | The routes are reserved and return 501 |
 
 ## Risks & Mitigations
@@ -1487,6 +1528,7 @@ and values; none of these may be renamed or dropped.
     channel_identities(phone_e164 text PK, user_id uuid NOT NULL REFERENCES users,
                        channel_mode text NOT NULL CHECK (channel_mode IN ('real','sim')))
     ```
+*   **Amended 2026-11-01 (identity-authz I-A10).** `approval_rules` gains additive `per_order_minor bigint NULL CHECK (per_order_minor >= 0)`, the admin's per-order band (identity-authz I12).
 
 ##### 9. `migrations/0003_agent_directory.sql` (Create, critical)
 
@@ -1611,6 +1653,7 @@ and values; none of these may be renamed or dropped.
 
     *   `pantry_events` is provisional (§13). The pantry design extends it.
     *   The `shortfalls` table (agent-protocol P9) is created in this migration.
+*   **Amended 2026-11-01 (identity-authz I-A18).** `approvals` gains additive `limits text[] NOT NULL DEFAULT '{}'` (`'band'`, `'budget'`), the limits hit, for the prompt text (identity-authz I12).
 
 ##### 12. `migrations/0006_idempotency_and_modes.sql` (Create, critical)
 
@@ -1757,6 +1800,7 @@ and values; none of these may be renamed or dropped.
     *   Every 60 s, and at startup, returns rows of this host stuck in `processing` for
         more than 120 s to `pending`.
     *   On SIGTERM: stops claiming and waits up to 25 s.
+*   **Amended 2026-11-01 (identity-authz I-A7).** A `DependencyUnavailable` is an ordinary step failure; when the last attempt fails, `runs.finish` uses its reason instead of `poison_message` (identity-authz I28).
 
 ##### 21. `services/common/directory.py` (Create)
 
@@ -1834,6 +1878,7 @@ and values; none of these may be renamed or dropped.
     *   `ToolRefused` and `AdapterUnavailable` are defined here. Both carry `reason: str`.
     *   `agents` and `api` (for `decide_approval`) both use it. `api` builds a `RunContext`
         from the approval's run.
+*   **Amended 2026-11-01 (identity-authz I-A20).** The contract above is kept. `call_tool_as(server, tool, args, *, ctx)` is added as the one place that obtains tokens (by `agent_clients.kind`), refreshes once on a token refusal and maps identity errors (identity-authz I6).
 
 ##### 23a. `services/common/run_context.py` (Create)
 
@@ -1861,6 +1906,7 @@ and values; none of these may be renamed or dropped.
     *   `retry_target(conn, user_id) -> UUID | None` returns the user's latest run in the
         last 24 h if it ended `error` or `timeout`. It returns `None` if that run's order
         reached `placed`, and the caller then sends the "already placed" reply.
+*   **Amended 2026-11-01 (identity-authz I-A6, I-A16).** `start` refuses a household with no active household grant, except `kind IN ('hello','a2a_demo')` and runs with no household, and records the run's token source (`mock` for eval households). `finish(reason='grant_revoked')` sets the run's orders that are before `placed` to `failed` (identity-authz I39).
 
 ##### 25. `services/common/orders.py` (Create)
 
@@ -2091,6 +2137,7 @@ and values; none of these may be renamed or dropped.
 *   **Type / Scope**: Route module.
 *   **Proposed Changes**: `/app/*` and `/me/*` return 501 with `{"owner": "experience
     design"}`. They reserve the paths in Caddy and nothing else.
+*   **Amended 2026-11-01 (identity-authz I-A14).** `/me/*` and `/app/*` are no longer reserved; identity-authz's `routes/me.py` and `routes/app.py` serve them.
 
 ##### 39. `services/api/routes/panel.py` and `services/api/whatsapp/{sender,signature}.py` (Create)
 
@@ -2143,6 +2190,7 @@ and values; none of these may be renamed or dropped.
         `tool_error("refused", reason)`. It turns `AdapterFailure` into
         `tool_error("unavailable", reason, retryable)` after writing the §9 `error` trace
         row (`where=<server>.<tool>`, `reason`, `attempt`). Any other exception propagates.
+*   **Amended 2026-11-01 (identity-authz I-A20).** `tool_errors()` also maps `DependencyUnavailable` to `tool_error("unavailable", reason, retryable=True)`. `CallContext` gains `claims` and `authz_form`, set by the guard (identity-authz I6).
 
 ##### 42. `services/mcp/traced.py` (Create)
 
@@ -2179,6 +2227,7 @@ and values; none of these may be renamed or dropped.
     *   **knowledge:** `check_allergens(skus, allergen_codes)`,
         `find_substitutes(sku, constraints)`, `explain_path(sku, allergen_code)`.
     *   Each tool picks its adapter with `modes.adapter_for(vendor, ctx.modes)`.
+*   **Amended 2026-11-01 (identity-authz I-A1, I-A5, I-A10).** `request_approval` no longer trusts an agent-supplied approver or amount: the guard computes both (identity-authz §9). `get_constraints` has the household-agent form. `place_order` limits call `check_household_grant` (identity-authz I30, I39).
 
 ##### 44. `services/mcp/<area>/adapters/*.py` (Create)
 
@@ -2243,6 +2292,7 @@ and values; none of these may be renamed or dropped.
     `GuardRefused(reason)` after writing a `tool_result` row with `refused=true`.
     `meta.tool_errors()` (item 41) turns that into the wire result, so `GuardRefused`
     never crosses MCP as an exception.
+*   **Amended 2026-11-01 (identity-authz I-A2).** Step 1 calls `tokens.validate` and the step 1b scope table; step 2 refuses a mismatched `household_id`; the trace rows carry the identity fields (identity-authz I20).
 
 ##### 50. `services/safety/idempotency.py` (Create, critical)
 
@@ -2266,6 +2316,7 @@ and values; none of these may be renamed or dropped.
         `KnowledgeUnavailable` (fails closed).
     *   `check_approver(conn, household_id, user_id) -> None` raises `WrongApprover`.
     *   `check_coverage(card, zone_id)` and `check_window(card, window)`.
+*   **Amended 2026-11-01 (identity-authz I-A5, I-A10).** `check_approval_needed` replaces the budget part of `check_budget` (band or budget, one approval); `check_household_grant` is added for `place_order` (identity-authz I20).
 
 ##### 52. `services/safety/addresses.py` (Create, critical)
 
@@ -2285,12 +2336,14 @@ and values; none of these may be renamed or dropped.
     *   `MockIssuer.issue(sub, act, scopes) -> str` signs with `MOCK_TOKEN_SECRET`. Every run
         uses it until the identity-authz design replaces the token source (Q4).
     *   This file defines the interface. Real Keycloak validation belongs to identity-authz.
+*   **Amended 2026-11-01 (identity-authz I-A4, I-A17).** `MockIssuer` (HMAC) is replaced by `TokenSource` and `validate()` per identity-authz §8 and I2–I3. Mock tokens are RS256 with the fixed test-only `MOCK_SIGNING_KEY` and issuer `https://${DOMAIN}/mock`, accepted only under `TOKEN_SOURCE=mock` or for eval households.
 
 ##### 54. `services/identity/fga.py` (Create, critical)
 
 *   **Type / Scope**: Python module.
 *   **Proposed Changes**: `check(user: str, relation: str, object: str) -> bool` through
     `openfga-sdk`, with a 2 s timeout. A timeout counts as a refusal.
+*   **Amended 2026-11-01 (identity-authz I-A3).** "A timeout counts as a refusal" becomes "a timeout raises `AuthzUnavailable`". `check` also returns the model id. The model and its tuples are identity-authz §7 (I7–I9).
 
 #### Seed (`services/seed/`)
 
@@ -2327,6 +2380,7 @@ and values; none of these may be renamed or dropped.
         `config.description` and `config.card_version` on business cards, and the shortfall
         fixture SKUs.
     *   Exits non-zero on any failure, so the deploy rolls back (§9).
+*   **Amended 2026-11-01 (identity-authz I-A13, I-A19).** The seed writes `agent_clients` and `users.keycloak_sub` from each member's `keycloak_user_id` in the seed YAML, mock grants for eval households, and runs `fga.reconcile`. Floors stay at 95 %; the restaurant's seeded owner rule is `max_discount_pct = 4`, so it binds (identity-authz I27).
 
 #### Infrastructure (critical)
 
@@ -2354,6 +2408,7 @@ and values; none of these may be renamed or dropped.
     *   Neo4j: heap 512 MB, page cache `192m`.
     *   `testrunner` keeps the `tools` profile and gets `mem_limit: 256m`. The `ci` profile
         stays as documented in the file.
+*   **Amended 2026-11-01 (identity-authz I-A12).** Keycloak becomes a pinned 26.8.N custom image with its own `KEYCLOAK_IMAGE` tag, `start --optimized --import-realm`, `KC_HOSTNAME`, a 640 MB limit; OpenFGA uses preshared-key authentication; the shared environment block is split per service (identity-authz I16a–I16c).
 
 ##### 57. `infra/Caddyfile` (Modify, critical)
 
@@ -2366,6 +2421,7 @@ and values; none of these may be renamed or dropped.
 
     `/auth*` still goes to Keycloak. `/internal/*`, `/runs*` and `/mcp*` have no route and
     return 404. Until step 6, `/hello*` still goes to the `hello` container.
+*   **Amended 2026-11-01 (identity-authz I-A12).** Only `/auth/realms/kitchenless/*` and `/auth/resources/*` reach Keycloak; every other `/auth/*` path returns 404 (identity-authz I17).
 
 ##### 58. `infra/deploy.sh` (Modify, critical)
 
@@ -2379,6 +2435,7 @@ and values; none of these may be renamed or dropped.
     placeholders, plus `GHCR_READ_TOKEN`, `GCS_BACKUP_BUCKET` and `SEED_US1_PHONES`. Remove
     `REDIS_URL`. `RUN_TOKEN_CEILING=200000` is a placeholder until the real-model rehearsal
     (Q2) sets it; `services/common/config.py` fails at startup on an empty value.
+*   **Amended 2026-11-01 (identity-authz I-A12).** The identity variables of identity-authz §13 are added; `MOCK_TOKEN_SECRET` and `OPENFGA_STORE_ID` are retired (identity-authz I18).
 
 ##### 60. `infra/vm/startup.sh` (Modify, critical)
 
@@ -2405,6 +2462,7 @@ and values; none of these may be renamed or dropped.
     *   Add a `build` job that pushes `ghcr.io/street-spinach/kitchenless-app:${{
         github.sha }}`, with `packages: write`.
     *   The `deploy` job needs `build`.
+*   **Amended 2026-11-01 (identity-authz I-A12).** A path-filtered job builds `ghcr.io/street-spinach/kitchenless-keycloak:26.8.N-<sha8>`. Rollback by `APP_TAG` never changes the Keycloak image (identity-authz I42).
 
 ##### 63. `.github/workflows/ci.yml` (Modify, critical)
 
@@ -2570,9 +2628,9 @@ and values; none of these may be renamed or dropped.
 | `MODE`, `MODE_FORCE_MOCK`, `MODE_<VENDOR>` | `api`, `testrunner` | Resolved once at run start |
 | `MODEL_MODE`, `MODEL_BASE_URL`, `MODEL_NAME`, `MODEL_API_KEY`, `MODEL_FALLBACK_BASE_URL`, `MODEL_FALLBACK_NAME`, `MODEL_FALLBACK_API_KEY`, `RUN_TOKEN_CEILING` | `agents`, `testrunner` | `deploy.sh` exports `MODEL_MODE=stub` |
 | `MODEL_BUSINESS_NAME` (Muse Glimmer), `MODEL_BUSINESS_TIMEOUT_SECONDS` (5) | `agents`, `testrunner` | Same base URL and key as `MODEL_*` |
-| `MOCK_TOKEN_SECRET` | All app | Q4 |
+| `MOCK_TOKEN_SECRET` | All app | Q4. Retired by identity-authz (I-A12); its §13 variable table replaces this row and adds the identity variables |
 | `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD` | `mcp`, `testrunner` | |
-| `OPENFGA_API_URL`, `OPENFGA_STORE_ID` | `mcp`, `testrunner` | |
+| `OPENFGA_API_URL`, `OPENFGA_STORE_ID` | `mcp`, `testrunner` | `OPENFGA_STORE_ID` retired by identity-authz (I-A12); the store id is read from `fga_models` |
 | `KEYCLOAK_URL` | `api`, `mcp` | |
 | `WHATSAPP_TOKEN`, `WHATSAPP_APP_SECRET`, `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_VERIFY_TOKEN` | `api` | |
 | `DOORDASH_DEVELOPER_ID`, `DOORDASH_KEY_ID`, `DOORDASH_SIGNING_SECRET` | `mcp` | |
