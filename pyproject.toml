@@ -5,6 +5,8 @@ description = "Agentic food network"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "httpx>=0.28.1",
+    "langgraph==1.2.19",
+    "langgraph-checkpoint-postgres==3.2.0",
     "mcp>=2.3.0",
     "neo4j>=6.4.1",
     "openfga-sdk>=0.10.5",

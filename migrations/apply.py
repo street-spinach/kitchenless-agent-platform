@@ -33,8 +33,11 @@ def apply(dsn: str, migrations_dir: Path = MIGRATIONS_DIR) -> list[str]:
 
 
 def main() -> None:
+    from migrations import checkpointer  # imported here: checkpointer imports LOCK_ID from us
+
     done = apply(os.environ["DATABASE_URL"])
     print(f"Applied {len(done)} migration(s): {', '.join(done) or 'none pending'}")
+    checkpointer.main()
 
 
 if __name__ == "__main__":
