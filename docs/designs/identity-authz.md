@@ -1,7 +1,7 @@
 # Kitchenless identity, delegation and authorization
 
 *   **Author:** madushankaf
-*   **Status:** Approved (2026-11-01, #100)
+*   **Status:** Approved (2026-11-01, #100); amended 2026-11-01 (spike results, #111)
 *   **Date:** 2026-11-01
 *   **Path:** `docs/designs/identity-authz.md`
 *   **Builds on:** [architecture.md](architecture.md) (approved) and
@@ -39,9 +39,10 @@ It also answers **architecture Q4**: where tokens come from for runs that start 
 WhatsApp or a timer, when the person is not present. And it fills the architecture §13
 contract **"Token source and OpenFGA relations"**.
 
-Identity uses **Keycloak**, pinned to a 26.8.N release, with its *token exchange
-delegation* preview feature. A half-day spike is build step 1, before any code depends on
-it. If delegation fails, the fallbacks in §12a apply. Every caller gets tokens through one
+Identity uses **Keycloak**, pinned to 26.8.1, with its *token exchange delegation*
+preview feature. The half-day spike (build step 1, #111) confirmed delegation works with
+stored offline tokens, so live uses `TOKEN_SOURCE=keycloak` (§12a). The fallbacks in §12a
+stay documented. Every caller gets tokens through one
 `TokenSource` interface, so the choice changes one module and one setting.
 
 **Decisions this design takes over or replaces:**
@@ -67,7 +68,7 @@ D-series. I-D1 to I-D13 were decided on 2026-10-31 during brainstorming; the res
 
 | Id | Decision |
 |---|---|
-| I-D1 | Sign-in uses an open-source Keycloak magic-link extension (custom image). The bot sends a single-use link that works for 10 minutes; the page then shows Keycloak's own consent screen. The link token is never logged or traced. |
+| I-D1 | Sign-in uses a Keycloak magic-link extension (custom image; phasetwo `keycloak-magic-link`, source-available under the Elastic License 2.0, which allows this use). The bot sends a single-use link that works for 10 minutes; the page then shows Keycloak's own consent screen. The link token is never logged or traced. |
 | I-D2 | A half-day spike on a pinned 26.8.N decides whether delegation gives `sub` = person and `act.sub` = agent. If not, a fallback behind `TokenSource` (§12a). |
 | I-D3 | The 26.0 → 26.8 upgrade is a manual, roll-forward-only step the owner runs: deploy freeze, dump of the `keycloak` database, bump, verify. Recovery is a restore from the dump. |
 | I-D4 | Household-agent tokens carry `sub` = the admin who consented. The member who started the run goes in a separate trace field. Any member can start a run; over-budget spending still goes to the approver. |
@@ -134,7 +135,7 @@ D-series. I-D1 to I-D13 were decided on 2026-10-31 during brainstorming; the res
 *   **I-G1. Every guarded call proves who is calling and for whom.**
     *   The guard validates the token's issuer, audience, expiry and signature, and fails
         closed.
-    *   It checks that the token's agent (`act.sub` for delegated tokens, `azp` for service
+    *   It checks that the token's agent (`act.client_id` for delegated tokens, `azp` for service
         tokens and under `keycloak_azp`) equals the calling agent.
     *   Checked by:
         `test_validate_rejects_{token_expired,token_invalid_iss,token_invalid_aud,act_missing,act_mismatch,unknown_agent}`.
@@ -238,7 +239,12 @@ D-series. I-D1 to I-D13 were decided on 2026-10-31 during brainstorming; the res
 
 ## Open Questions
 
-Q1–Q4 are answered by the spike (build step 1). §12a says what each answer changes.
+Q1–Q4 were answered by the spike on 2026-11-01 (#111;
+[`docs/spikes/keycloak-26.8.md`](../spikes/keycloak-26.8.md)). All four pass: 26.8.1 is
+pinned, the magic link and same-session consent work, a refreshed offline token keeps
+`may_act` and the delegation exchange gives `sub` = person and `act.client_id` = agent, and
+the peak memory was 554 of 640 MiB. §12a's "Q2 passes" row applies. The questions are kept
+below as asked.
 
 *   **Q1. Does the magic-link extension sign a user in to one confidential client on
     Keycloak 26.8?**
@@ -287,7 +293,7 @@ Q1–Q4 are answered by the spike (build step 1). §12a says what each answer ch
     *   One `agent_grants` row is created per agent. Each is active, expires in 30 days, and
         holds the encrypted offline token.
     *   One `audit_events` row (`consent_granted`) is written per grant.
-    *   The page then shows a decoded sample token, with `sub` = Asha and `act.sub` = the
+    *   The page then shows a decoded sample token, with `sub` = Asha and `act.client_id` = the
         agent (demo moment 1).
     *   If the link is used a second time, or after 10 minutes, the page shows "This link
         has expired" and nothing is granted. A link preview or scanner that only fetches
@@ -300,7 +306,7 @@ Q1–Q4 are answered by the spike (build step 1). §12a says what each answer ch
     `get_constraints` and then `create_order`.
 *   **Then**:
     *   `TokenSource` decrypts the household grant, refreshes the offline token, and
-        exchanges it for a delegated token that lasts 300 s: `sub` = Asha, `act.sub` = the
+        exchanges it for a delegated token that lasts 300 s: `sub` = Asha, `act.client_id` = the
         household agent, `aud` = `kitchenless-mcp`.
     *   The token is cached in memory for this run and agent, and exchanged again when
         less than 60 s remain.
@@ -442,7 +448,7 @@ One word per thing. Later sections use only these words.
 | **Agent client** | The Keycloak client for one logical agent, for example `household.us-1`. `client_id` is its name; `kc_client_uuid` is Keycloak's internal id. | Keycloak, plus `agent_clients` | n/a | Life of the agent | Disabled with the agent |
 | **Grant** | One person's consent for one agent: a Keycloak offline token issued to that agent's client | `agent_grants`, encrypted | `agents` (to use it) and `api` (to store it) | 30 days from consent | Revoke, expiry, replacement, or a refused refresh |
 | **Grant holder** | The person whose `sub` a grant's tokens carry. For a household agent, the admin who consented; for a child's agent, the child. | `agent_grants.user_id` | n/a | n/a | n/a |
-| **Delegated token** | A short-lived token obtained from a grant: `sub` = the grant holder, `act.sub` = the agent | Memory only | `agents` | 300 s | Expiry |
+| **Delegated token** | A short-lived token obtained from a grant: `sub` = the grant holder, `act.client_id` = the agent | Memory only | `agents` | 300 s | Expiry |
 | **Service token** | A `client_credentials` token for a business agent or the `api` service | Memory only | `agents`, `api` | 300 s | Expiry |
 | **Link** | A single-use URL sent in WhatsApp that starts one sign-in. The extension's internal sign-in URL (§6) is not a Link. | `consent_links` (hash only) | The person's chat | 600 s | First use or expiry |
 | **Band** | The admin's per-order amount above which an order needs approval | `approval_rules.per_order_minor` | n/a | Until changed | Changed by an admin |
@@ -488,19 +494,19 @@ No new containers. Everything is a module in an existing service.
 | `services/safety/scope.py` | `mcp`, `api` | `scoped(conn, scope)`, the household query helper |
 | `services/api/routes/me.py`, `routes/app.py` | `api` | The `/me` and `/app` backends |
 | `services/identity/realm/kitchenless.json` | Keycloak | The realm import file (§4) |
-| `infra/keycloak/Dockerfile` | Keycloak | The pinned 26.8.N image, the magic-link extension, the preview features |
+| `infra/keycloak/Dockerfile` | Keycloak | The pinned 26.8.1 image, the magic-link extension, the preview features |
 
 ### 3. Identities
 
 | Who | Keycloak representation | Created by | Token they cause |
 |---|---|---|---|
 | Consumer or admin | A user. Username = phone in E.164, for example `+15135550101`. No password. | The import file (seeded cast) or `onboarding.py` (new people) | Delegated tokens, through grants |
-| Child | A user, username `child:<household_id>:<n>`. No phone, no password. | The same paths, when an admin adds the child | Delegated tokens, through a guardian-started grant |
+| Child | A user, username `child.<household_id>.<n>` (Keycloak refuses `:` in usernames). No phone, no password. | The same paths, when an admin adds the child | Delegated tokens, through a guardian-started grant |
 | Business owner | A user with an email and a password. Seeded owners only. | The import file | An Expo session (OIDC + PKCE) |
 | Consumer or household agent | A confidential client, `client_id` = `agent_id` with `:` replaced by `.` (for example `household.us-1`). Standard flow, `offline_access`, consent required, `private_key_jwt` client authentication. | The import file (seeded) or `onboarding.py` (new) | Delegated tokens |
 | Grocery, restaurant or delivery agent | One confidential client per agent card, with a service account only (`client_credentials`) and `private_key_jwt`. `client_id` is the card's `agent_id` with the first `:` replaced by `.` (for example `grocery.square-us`), so each store has its own login (I-D23). | The import file | Service tokens |
 | `api` | Client `svc.api`, service account. In `agent_clients` it maps to the non-agent id `system:api` (architecture §3), and `api` sends `_meta.agent_id = 'system:api'`. | The import file | Service tokens for `decide_approval` and `choose_shortfall_option` |
-| Onboarding | Client `svc.onboarding`, service account with the `realm-management` client roles `manage-users` and `manage-clients` in the `kitchenless` realm only, plus the magic-link role | The import file | Admin API calls only. It never calls MCP. |
+| Onboarding | Client `svc.onboarding`, service account with the `realm-management` client roles `manage-users` and `manage-clients` in the `kitchenless` realm only (`manage-users` is also what the magic-link endpoint requires) | The import file | Admin API calls only. It never calls MCP. |
 | `/me` pages | Client `me-pages`, confidential, `private_key_jwt` with the same certificate, redirect URI `https://${DOMAIN}/me/callback` (Keycloak gets `DOMAIN` for this placeholder). `api` redeems the code and checks that the ID token's `sub` equals the link's target person. | The import file | A browser session cookie in `api`, and the Keycloak session used for consent |
 | Expo owner app | Client `owner-app`, public, PKCE S256, redirects per Q6, with an audience mapper adding `owner-app` | The import file | An owner access token for `/app/*` |
 | MCP audience | Client `kitchenless-mcp`, with no login; it only names the audience | The import file | n/a |
@@ -508,7 +514,7 @@ No new containers. Everything is a module in an existing service.
 **Client authentication without one secret per agent.**
 *   Every agent client, `svc.api` and `me-pages` use `private_key_jwt`. The public certificate is
     stored on each client (attribute `jwt.credential.certificate`): set from
-    `${env.AGENT_SIGNING_CERT}` in the import file, and by `create_agent_client` for new
+    `${AGENT_SIGNING_CERT}` in the import file, and by `create_agent_client` for new
     clients. Keycloak never calls back to `api` to fetch a key.
 *   The assertion carries no `kid` (Keycloak matches it against the client's stored
     certificate), `aud` is the realm issuer URL, and the certificate is stored as base64
@@ -537,7 +543,14 @@ first start against an empty `keycloak` database (I-D16).
     *   realm `kitchenless`;
     *   token settings: access token 300 s, offline session idle 30 d, offline session max
         30 d (limited), refresh-token revocation off so refreshes don't race;
-    *   the magic-link browser flow for `me-pages`;
+    *   no custom browser flow: the magic-link REST call issues an action token that signs
+        the person in directly;
+    *   `VERIFY_PROFILE` disabled, so a person with no email is not stopped on a profile
+        page;
+    *   FGAP v2 on (`adminPermissionsEnabled`), a client policy `agents-may-delegate`
+        listing every people-agent client, and a scope permission on resource type `Users`
+        with scope `delegate` and that policy (without it Keycloak silently drops the
+        delegation scope);
     *   the clients in §3, and the disabled template clients `template.consumer` and
         `template.household`;
     *   the client scopes in §6;
@@ -545,23 +558,30 @@ first start against an empty `keycloak` database (I-D16).
         owner app's tokens;
     *   user and admin events on, kept 30 d;
     *   the seeded users with fixed ids: the US-1 and US-2 families, their eval copies and
-        the seeded owners (architecture §3).
+        the seeded owners (architecture §3), each with `realmRoles:
+        ["default-roles-kitchenless"]` (users created by the import get no default roles,
+        and without `offline_access` consent fails).
 *   **Usernames of seeded users.** US-1's real phones come from the environment
-    (`${env.SEED_US1_PHONE_1}` to `_3`). They mirror architecture's `SEED_US1_PHONES`,
+    (`${SEED_US1_PHONE_1}` to `_3`). They mirror architecture's `SEED_US1_PHONES`,
     because a placeholder can't split a comma-separated list. US-2's
     simulated users and the eval copies use fixed non-phone usernames such as
-    `sim:us-2:1`. The seed matches realm users on their fixed Keycloak user id, never on
+    `sim.us-2.1`. The seed matches realm users on their fixed Keycloak user id, never on
     username.
-*   **Secrets** appear only as `${env.VAR}` placeholders (`KC_ONBOARDING_SECRET`,
-    `OWNER_DEMO_PASSWORD`, `AGENT_SIGNING_CERT`). The spike confirms Keycloak 26.8 replaces
-    them, including in usernames.
+*   **Secrets** appear only as `${VAR}` placeholders (`KC_ONBOARDING_SECRET`,
+    `OWNER_DEMO_PASSWORD`, `AGENT_SIGNING_CERT`). The spike confirmed that `${VAR}` is
+    replaced in usernames, secrets, certificate attributes and redirect URIs, and that
+    `${env.VAR}` is left as literal text (a literal one in a redirect URI stops Keycloak
+    from starting).
 *   **Changes after the first start are not applied automatically** (I-D16). Applying a
     changed file is a manual, owner-run step, documented in
     `services/identity/realm/README.md`:
     1.  set `DEPLOY_FREEZE` (architecture §11);
     2.  dump the `keycloak` database;
-    3.  run `kc.sh import --file … --override true` in the container;
-    4.  restart Keycloak;
+    3.  stop Keycloak and run `kc.sh import --file … --override true` in a one-off
+        container (`docker compose run --rm keycloak import …`), never inside the running
+        one: a second JVM there shares the 640 MB limit and can get Keycloak OOM-killed
+        (spike, Q4);
+    4.  start Keycloak;
     5.  run smoke;
     6.  remove the freeze.
 
@@ -627,11 +647,13 @@ child's household (OpenFGA). This is the only guardianship check.
 tap link ─► GET /me/l/<t>: confirm page (no side effects)
         ─► POST /me/l/<t>: use the link (single use, not expired)
         ─► api asks the magic-link extension for one sign-in URL
-             (user = target person, client = me-pages, redirect = /me/callback)
+             (username = target person, client = me-pages, redirect = /me/callback,
+              single use, 120 s, api's signed state, scope openid)
         ─► Keycloak signs the person in ─► /me/callback: api sets its session cookie
 for each agent in a consent link, in order:
         ─► 302 to Keycloak's authorization endpoint with the agent's client,
-             prompt=consent, scope = openid offline_access + the class scopes
+             prompt=consent, scope = openid offline_access
+             delegation:client:<agent client_id> + the class scopes
              (the Keycloak session from the sign-in means no new login)
         ─► person sees Keycloak's consent screen for that agent ─► Approve
         ─► /me/callback?code&state ─► api redeems the code with the agent client
@@ -748,7 +770,8 @@ with one of the reason codes in §12, and writes `refused=true`.
     of skew.
 4.  Find the agent. The kind of token comes from `agent_clients.kind` for the token's
     `azp`:
-    *   **delegated tokens** (`kind='people'`): `act.sub`; under `keycloak_azp`, `azp`
+    *   **delegated tokens** (`kind='people'`): `act.client_id` (`act.sub` is the agent's
+        service-account user id); under `keycloak_azp`, `azp`
         (I-D18). A delegated token with no `act` is refused with `act_missing` in every
         other mode;
     *   **service tokens** (`kind='service'`): `azp`.
@@ -936,7 +959,7 @@ when it can be sent).
 | Implementation | Delegated tokens | Service tokens | Use |
 |---|---|---|---|
 | `mock` | Signed RS256 with `MOCK_SIGNING_KEY`, `iss = https://${DOMAIN}/mock`, using the same claims as `keycloak` | Same | CI, `eval-fast`, nightly evals, local work, and runs for eval households on the live stack (I-D24). Never for a live household. |
-| `keycloak` | Refresh the grant's offline token with the agent client, then delegation-exchange (requester = agent client, audience `kitchenless-mcp`) → `act.sub` = agent | `client_credentials` | Live, if the spike passes |
+| `keycloak` | Refresh the grant's offline token with the agent client, then delegation-exchange (the agent client sends the refreshed access token as `subject_token` and its own `client_credentials` token as `actor_token`; `aud` = `kitchenless-mcp` from the agent client's audience mapper) → `act.client_id` = agent | `client_credentials` | Live, if the spike passes |
 | `keycloak_azp` | Refresh only. The access token has `azp` = agent client and audience `kitchenless-mcp`. No `act` (I-D18). | Same | Spike outcome 2 |
 | `token_service` | Refresh the offline token (which proves the grant is live in Keycloak), then `POST /internal/token` on `api`, which signs RS256 with `TOKEN_SERVICE_KEY`, `iss = https://${DOMAIN}/tokens`, the same claims as `keycloak` | Same | Spike outcome 3 |
 
@@ -961,11 +984,11 @@ shows `azp` instead of `act`.
 
 ### 12a. Spike outcomes
 
-The spike (build step 1) answers Q1–Q4. Its result is applied by a design-amendment PR
-that fills every value marked "from the spike" (in I3, I15, I19 and I22). Build steps 6–10
-wait for that amendment PR; their issues are created only after it merges. Steps 2–5 don't
-depend on the spike. Until then I3's Keycloak path, I15,
-I19, I22, I24 and I25 are provisional.
+The spike (build step 1, #111) ran on 2026-11-01: Q1–Q4 pass, so the **"Q2 passes"** row
+applies and live uses `TOKEN_SOURCE=keycloak`. This amendment filled every value marked
+"from the spike" (in I3, I15, I19 and I22), so none of them is provisional any more, and
+the issues for build steps 6–10 can be created once it merges. Steps 2–5 never depended
+on the spike. I25 is not built.
 
 | Spike result | `TOKEN_SOURCE` for live | Plan changes |
 |---|---|---|
@@ -1029,11 +1052,11 @@ round trip through Caddy:
 | `token_service` | `https://${DOMAIN}/tokens` | `http://api:8000/internal/token-jwks` |
 
 **Trust boundary.**
-*   `api` is fully trusted for consent. It holds the magic-link role, `manage-users`,
+*   `api` is fully trusted for consent. It holds `manage-users` (which the magic-link endpoint requires),
     `AGENT_SIGNING_KEY` and `GRANT_ENCRYPTION_KEY`, so a compromised `api` could create a
     consent with no person present. Audit rows are evidence of what happened, not proof
     against `api`.
-*   To narrow this, the magic-link role is called only from the `routes/me.py` POST
+*   To narrow this, the magic-link endpoint is called only from the `routes/me.py` POST
     handler, after `links.use` has accepted the link, and every call writes `link_used`.
 *   Backups are as sensitive as the VM (Risks).
 
@@ -1119,7 +1142,7 @@ covers only the steps with rollout risk.
     on the VM:
     1.  `touch /opt/app/DEPLOY_FREEZE`;
     2.  `pg_dump -Fc` of the `keycloak` database;
-    3.  set `KEYCLOAK_IMAGE` to the new tag (`26.8.N-<sha8>`; the image runs
+    3.  set `KEYCLOAK_IMAGE` to the new tag (`26.8.1-<sha8>`; the image runs
         `start --optimized` with a 384 MB heap and a 640 MB container limit);
     4.  `docker compose pull keycloak && docker compose up -d --no-build keycloak`; the
         realm is imported on first start;
@@ -1130,7 +1153,7 @@ covers only the steps with rollout risk.
     Recovery is a restore from the dump, never a downgrade. The Keycloak image has its own
     tag, separate from the app's `APP_TAG`, so the deploy's rollback by app tag never
     changes the Keycloak image.
-*   **The live token source** (build step 10) is the owner setting `TOKEN_SOURCE` in the
+*   **The live token source** (build step 10) is the owner setting `TOKEN_SOURCE=keycloak` in the
     VM's `infra/.env`. No code change. Going back to the previous value is the same edit.
 
 ### 16. Changes to the approved designs
@@ -1345,7 +1368,7 @@ build steps never contradict an approved design.
 *   **Pros**: A sign-in that is Keycloak-native and phone-based.
 *   **Cons**: New Java code to write and maintain, against an SPI that changes between
     Keycloak releases.
-*   **Reason for Rejection**: The open-source magic-link extension does the same job with
+*   **Reason for Rejection**: The magic-link extension does the same job with
     no new Java code (I-D1).
 
 ### Alternative S: Two approval kinds (re-confirm, then budget)
@@ -1379,9 +1402,9 @@ build steps never contradict an approved design.
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| 26.8 delegation doesn't accept a refreshed offline token, or `act` differs | Medium | Medium | The spike is build step 1. §12a maps each result to a token source; under `keycloak_azp` the claims lack `act` (I-D18). |
-| The magic-link extension doesn't support 26.8 or the `me-pages` client | Medium | Medium | Checked in the spike (Q1). Fallback: Alternative Q (§12a). |
-| Keycloak 26.8 with preview features exceeds 640 MB | Low | High | Measured in the spike and by G6. Fallback: the architecture §11 VM resize. |
+| 26.8 delegation doesn't accept a refreshed offline token, or `act` differs | Low (spike passed) | Medium | Spike 2026-11-01: a refreshed offline token keeps `may_act`; the agent is in `act.client_id`. The spike is build step 1. §12a maps each result to a token source; under `keycloak_azp` the claims lack `act` (I-D18). |
+| The magic-link extension doesn't support 26.8 or the `me-pages` client | Low (spike passed) | Medium | Spike: 0.94 is built for 26.8.0 and works with `me-pages` (Q1). Fallback: Alternative Q (§12a). |
+| Keycloak 26.8 with preview features exceeds 640 MB | Medium | High | Spike: peak 554 of 640 MiB (aarch64). G6 re-measures on the x86_64 VM. Fallback: the architecture §11 VM resize. |
 | The Keycloak upgrade breaks and can't roll back by image tag | Low | High | A manual, frozen, dumped upgrade (§15). Recovery is a restore. The Keycloak image tag is separate from the app tag. |
 | A query skips the scoping helper and leaks another household's rows | Medium | High | A static test over all of `services/` fails the build. An eval forges `household_id`. |
 | A realm file change silently never applies | Medium | Low | The PR says so, and the owner runs the documented re-apply. |
@@ -1519,6 +1542,8 @@ read "(Create or Modify; critical if so; architecture item N if any)".
         The JWKS URL is built from `KEYCLOAK_URL`, never hard-coded.
     *   A mock-issued token is accepted only under `TOKEN_SOURCE=mock` or when the run's
         household has `env = 'eval'` (I-D24).
+    *   The agent of a delegated token is `act.client_id`. `aud` may be a string or a list
+        (Keycloak's delegated token has the string `"kitchenless-mcp"`).
     *   `TOOL_SCOPES`: the hand-written dict of the §8 step 1b table.
     *   The JWKS cache lasts 10 minutes and refetches once on an unknown `kid`. Skew is
         30 s. Algorithms are restricted to `RS256`.
@@ -1552,13 +1577,17 @@ read "(Create or Modify; critical if so; architecture item N if any)".
             `grants.load_active(conn, agent_id, user_id)` for a consumer agent;
         2.  refresh at the token endpoint with the agent client and a `private_key_jwt`
             assertion (I4);
-        3.  if `delegate`, exchange with
-            `grant_type=urn:ietf:params:oauth:grant-type:token-exchange`, the refreshed
-            access token as `subject_token`, and `audience=kitchenless-mcp`;
-        4.  return the token.
+        3.  if `delegate`, get the agent's own `client_credentials` token (the actor token,
+            cached like any service token), then exchange, authenticating as the agent
+            client: `grant_type=urn:ietf:params:oauth:grant-type:token-exchange`,
+            `subject_token` = the refreshed access token, `subject_token_type` and
+            `actor_token_type` = `urn:ietf:params:oauth:token-type:access_token`,
+            `actor_token` = the actor token. No `audience` parameter;
+        4.  return the token. It has no refresh token; its lifetime is the agent client's
+            access-token lifespan (default 300 s).
 
-        The exact delegation parameters and the feature name are from the spike
-        (provisional until the §12a amendment PR).
+        These parameters were confirmed by the spike (#111). `TokenServiceSource` is not
+        built (§12a).
     *   Errors: connection errors and 5xx raise `IdentityUnavailable`. A 400
         `invalid_grant` calls `grants.mark_refused()` and raises the matching `GrantError`.
     *   `MockSource` signs the same claims (`iss`, `aud`, `sub`, `act`, `azp`, `scope`,
@@ -1778,27 +1807,31 @@ ALTER TABLE approvals ADD COLUMN limits text[] NOT NULL DEFAULT '{}'   -- 'band'
 ##### I14. `docs/spikes/keycloak-26.8.md` and `docs/spikes/keycloak/compose.yml` (Create)
 
 *   **Proposed Changes**: A scratch Compose project, not part of the deployed stack and not
-    under `infra/`. It runs Keycloak 26.8.N plus the magic-link extension with the preview
+    under `infra/`. It runs Keycloak 26.8.1 plus the magic-link extension with the preview
     flags, and records:
     *   the exact image digest, feature names and the extension's Maven version and
         SHA-256;
     *   the exchange request and response for Q2's four exit tests;
     *   the magic-link REST call for the `me-pages` client, then a `prompt=consent`
         authorization request for a second client on the same session (Q1);
-    *   `${env.*}` placeholder support in the import, including in usernames;
+    *   placeholder support in the import, including in usernames;
     *   `docker stats` peak memory with a 384 MB heap (Q4).
 
-    It ends with the §12a outcome. Time box: half a day.
+    It ends with the §12a outcome. Time box: half a day. **Done 2026-11-01 (#111)**, with a
+    rerunnable `setup.sh` and `flow.py`.
 
 ##### I15. `infra/keycloak/Dockerfile` (Create; critical)
 
 *   **Proposed Changes**:
-    *   `FROM quay.io/keycloak/keycloak:26.8.N@sha256:<digest from the spike>`.
-    *   `ADD --checksum=sha256:<from the spike>` the magic-link JAR from Maven Central
-        (`io.phasetwo.keycloak:keycloak-magic-link:<version from the spike>`) into
-        `/opt/keycloak/providers/`.
+    *   `FROM quay.io/keycloak/keycloak:26.8.1@sha256:3f3c5f8e03c614774b4bd9173b88391fefa4153bfc010d8012d59ad825377332`.
+    *   `ADD --chown=keycloak:keycloak
+        --checksum=sha256:e9e7c3df0c0b36fd72ed5dfbcd305d281b4a18ffd88cdff7685103194e9072e1`
+        the magic-link JAR from Maven Central
+        (`io.phasetwo.keycloak:keycloak-magic-link:0.94`, built for Keycloak 26.8.0, no
+        runtime dependencies) into `/opt/keycloak/providers/`.
     *   `RUN kc.sh build --db=postgres --health-enabled=true --http-relative-path=/auth
-        --features=<preview features from the spike>`.
+        --features=token-exchange-delegation,parameterized-scopes` (never `--features=preview`,
+        which also enables legacy token exchange).
     *   `COPY services/identity/realm/kitchenless.json /opt/keycloak/data/import/`. The
         build context is the repository root.
 
@@ -1872,17 +1905,21 @@ ALTER TABLE approvals ADD COLUMN limits text[] NOT NULL DEFAULT '{}'   -- 'band'
 
 *   **Proposed Changes**:
     *   **The JSON** holds §4's contents: the clients in §3 (with
-        `jwt.credential.certificate = ${env.AGENT_SIGNING_CERT}` on agent clients,
+        `jwt.credential.certificate = ${AGENT_SIGNING_CERT}` (base64 DER) on agent clients,
         `svc.api` and `me-pages`; one service-account client per business agent card,
         I-D23), the template clients (disabled), the scopes in §6, both audience
-        mappers, the magic-link browser flow (shape provisional until the spike), events on,
-        and the seeded users with the fixed ids from the seed YAML's `keycloak_user_id`
-        and the usernames of §4.
+        mappers, `VERIFY_PROFILE` off, the FGAP v2 delegate policy and permission (§4), events on,
+        and the seeded users with the fixed ids from the seed YAML's `keycloak_user_id`,
+        the usernames of §4 and `default-roles-kitchenless`. People-agent clients and
+        their templates carry `consentRequired`, a service account,
+        `standard.token.exchange.enabled` and the `kitchenless-mcp` audience mapper.
+        Placeholders use `${VAR}`.
     *   **The README** holds the re-apply runbook (§4), the upgrade runbook (§15), the
         signing-certificate rotation, and the live-cast re-consent line ("re-consent the
         live cast the day before a demo").
 *   **Tests** (`tests/unit/test_realm_file.py`): `test_realm_file_shape` (every §3 client
-    present; no literal secrets; seeded user ids match the seed's).
+    present; no literal secrets; no `${env.` placeholders; no `:` in usernames; every
+    seeded user has the default roles; seeded user ids match the seed's).
 
 #### Safety (`services/safety/`)
 
@@ -1952,14 +1989,19 @@ ALTER TABLE approvals ADD COLUMN limits text[] NOT NULL DEFAULT '{}'   -- 'band'
     *   `create_user(username, display_name, attributes) -> keycloak_user_id`. A 409 means
         the user exists; it fetches the id.
     *   `create_agent_client(agent_id, template) -> kc_client_uuid` copies the template's
-        representation and sets `clientId`, `enabled=true` and the signing certificate.
-    *   `magic_link(keycloak_user_id, redirect_uri, expiration_s=120) -> str` asks the
-        extension for a sign-in URL to `me-pages` (call shape provisional until the
-        spike).
+        representation and sets `clientId`, `enabled=true` and the signing certificate,
+        then adds the new client to the `agents-may-delegate` FGAP v2 policy (otherwise
+        its delegation scope is silently dropped).
+    *   `magic_link(username, redirect_uri, state, expiration_s=120) -> str` calls `POST
+        /auth/realms/kitchenless/magic-link` with `{username, client_id: "me-pages",
+        redirect_uri, expiration_seconds, reusable: false, state, scope: "openid"}` and
+        returns `link` (spike #111). `reusable` defaults to true, so `false` is always
+        sent.
     *   `revoke_consent(keycloak_user_id, client_id)` uses the Admin API's per-client
         consent revoke.
 *   **Tests** (`tests/unit/test_keycloak_admin.py`, HTTP mocked):
-    `test_create_user_409_returns_existing_id`, `test_create_agent_client_sets_certificate`.
+    `test_create_user_409_returns_existing_id`, `test_create_agent_client_sets_certificate`,
+    `test_create_agent_client_joins_delegate_policy`, `test_magic_link_single_use_body`.
 
 ##### I23. `services/identity/onboarding.py` (Create; critical)
 
@@ -2001,7 +2043,8 @@ ALTER TABLE approvals ADD COLUMN limits text[] NOT NULL DEFAULT '{}'   -- 'band'
 
 ##### I25. `services/api/routes/internal.py` (Modify; architecture item 35)
 
-*   **Proposed Changes**: Built only if §12a selects `token_service`:
+*   **Proposed Changes**: Built only if §12a selects `token_service`. The spike selected
+    `keycloak`, so this item is not built:
     `GET /internal/token-jwks` and `POST /internal/token {agent_id, user_id, grant_id}`,
     which checks the grant row and signs per §12. No Caddy route (architecture item 57).
 *   **Tests** (`tests/unit/test_token_service.py`, *(db)*, if built):
@@ -2161,7 +2204,7 @@ ALTER TABLE approvals ADD COLUMN limits text[] NOT NULL DEFAULT '{}'   -- 'band'
 ##### I42. `.github/workflows/deploy.yml` (Modify; critical; architecture item 62; step 7)
 
 *   **Proposed Changes**: In the GHCR build job, a path-filtered job builds
-    `ghcr.io/street-spinach/kitchenless-keycloak:26.8.N-<sha8>` from I15 when
+    `ghcr.io/street-spinach/kitchenless-keycloak:26.8.1-<sha8>` from I15 when
     `infra/keycloak/` or the realm file changes. The VM uses it by setting
     `KEYCLOAK_IMAGE` (§15); `deploy.sh` pulls and runs `up --no-build`. Rollback by
     `APP_TAG` never changes it.
