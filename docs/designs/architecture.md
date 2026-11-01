@@ -2,7 +2,8 @@
 
 *   **Author:** madushankaf
 *   **Status:** Approved; amended 2026-10-31 (bounded model calls for business agents);
-    amended 2026-10-31 (agent-protocol); amended 2026-10-31 (build step 1 ports and smoke)
+    amended 2026-10-31 (agent-protocol); amended 2026-10-31 (build step 1 ports and smoke);
+    amended 2026-11-01 (MCP client contract)
 *   **Date:** 2026-10-31
 *   **Path:** `docs/designs/architecture.md`
 
@@ -34,6 +35,22 @@ added. Changed: §2, §3, §4, §5, §8, §9, §10, §13, and implementation ite
     removed in step 1, with health checks for `api`, `mcp` and `agents` added in their place.
 *   **`RUN_TOKEN_CEILING`.** It had no value, so `.env.example` gets a placeholder.
 Changed: implementation items 56, 59, 69 and 73.
+
+**Amendment 2026-11-01 (MCP client contract).** Issue #41 (build step 3) found that item 23
+left the client/server contract open. This amendment fixes it:
+*   **Run context.** `RunContext(run_id, agent_id, conversation_id)` in
+    `services/common/run_context.py` is the `ctx` that `call_tool` and `ModelClient` take.
+    The server-side `CallContext` stays separate.
+*   **Token.** The token travels in the `Authorization: Bearer` header, never in `_meta`.
+*   **Errors on the wire.** A guard refusal or adapter failure comes back as an MCP result
+    with `isError=true` and `structuredContent={kind, reason, retryable}`. The client maps
+    `kind` to `ToolRefused` or `AdapterUnavailable`.
+*   **Retries.** The client owns §9's two adapter attempts. It retries once on a transport
+    timeout, an HTTP 5xx or a retryable `unavailable` result. The server does not retry
+    adapters.
+*   **Directory.** `AgentCard` is defined, and `card()` raises `UnknownAgent` for a
+    missing id.
+Changed: implementation items 21, 22, 23, 40, 41, 43, 49 and the unit test list.
 
 **Names.** This document uses three names for one project. Kitchenless is the product name.
 `kitchenless-agent-platform` is the GitHub repository (local folder
@@ -1745,15 +1762,24 @@ and values; none of these may be renamed or dropped.
 
 *   **Type / Scope**: Python module.
 *   **Proposed Changes**:
+    *   `AgentCard` is a frozen dataclass with one field per `agent_cards` column (item 9
+        and agent-protocol P7), including `host_process`, which `outbox.send` needs. It is
+        separate from `protocol.a2a.AgentCardRow`, which holds only what `to_a2a_card`
+        renders.
     *   `find(conn, cls, region, zone_id, currency) -> list[AgentCard]` returns enabled
-        cards only. It refuses `cls='channel'`.
-    *   `card(conn, agent_id) -> AgentCard`.
+        cards only. It refuses `cls='channel'` and never returns `external` cards
+        (agent-protocol §2).
+    *   `card(conn, agent_id) -> AgentCard` returns the card whether or not it is enabled.
+        It raises `UnknownAgent(LookupError)` when no row has that `agent_id`.
 
 ##### 22. `services/agents/common/model.py` (Create)
 
 *   **Type / Scope**: Python module.
-*   **Proposed Changes**: `ModelClient.complete(ctx, messages, tools, node, *,
+*   **Proposed Changes**: `ModelClient.complete(ctx: RunContext, messages, tools, node, *,
     profile="people") -> ModelResult`, with the modes and profiles in §6.
+    *   `ctx` is the `RunContext` (item 23a). The client loads the run's overrides
+        (`STUB_FAIL_NODE`, `STUB_OUT_OF_BOUNDS`) and token total by `ctx.run_id`. `ctx`
+        does not carry them.
     *   `real`: an OpenAI-compatible client. Each attempt has a 20 s timeout. It makes
         2 attempts on the primary model, then 1 on the fallback, within a 60 s total.
     *   `stub`: calls `services/agents/<class>/stubs.py` by `node`, and raises
@@ -1763,7 +1789,7 @@ and values; none of these may be renamed or dropped.
         `error` row for each failed attempt.
     *   It raises `ModelUnavailable`, `TokenBudgetExceeded` and `InvalidOutput` for the
         `people` profile.
-    *   `choose(ctx, point, allowed, default, inputs) -> Choice` implements the bounded
+    *   `choose(ctx: RunContext, point, allowed, default, inputs) -> Choice` implements the bounded
         choices in §6 with the `business` profile: one attempt, `MODEL_BUSINESS_TIMEOUT_SECONDS`,
         `max_tokens=300`, a JSON-schema check of the answer, then the allowed-set check and
         the rationale check. It never raises. In `stub` mode it calls
@@ -1786,14 +1812,40 @@ and values; none of these may be renamed or dropped.
 ##### 23. `services/common/mcp_client.py` (Create)
 
 *   **Type / Scope**: Python module.
-*   **Proposed Changes**: `call_tool(server, tool, args, *, ctx, token) -> dict`.
+*   **Proposed Changes**: `call_tool(server, tool, args, *, ctx: RunContext, token: str)
+    -> dict`.
     *   Uses the MCP streamable-HTTP client against `http://mcp:8002/mcp/<server>`, with a
-        15 s timeout.
-    *   Makes 2 attempts in total on a timeout or 5xx. The idempotency key is in `args`, so
-        both attempts send the same key.
-    *   Puts `run_id`, `agent_id` and `conversation_id` in `_meta`.
-    *   Raises `AdapterUnavailable`, or `ToolRefused(reason)` for guard refusals.
-    *   `agents` and `api` (for `decide_approval`) both use it.
+        15 s timeout per attempt.
+    *   Sends `token` as the `Authorization: Bearer <token>` header, never in `_meta`.
+    *   Puts `run_id`, `agent_id`, `conversation_id` and `attempt` (1 or 2) in `_meta`.
+    *   Reads each result as follows:
+        *   **Success** (`isError` false): returns `structuredContent`.
+        *   **Refused** (`isError=true`, `kind="refused"`): raises `ToolRefused(reason)`
+            and does not retry.
+        *   **Unavailable** (`isError=true`, `kind="unavailable"`): retries once if
+            `retryable` is true, otherwise raises `AdapterUnavailable(reason)`.
+        *   **Transport failure** (timeout, connection error or HTTP 5xx): retries once.
+        *   **Malformed** (`isError=true` without a valid `structuredContent`): raises
+            `AdapterUnavailable("malformed_error")` without retrying.
+    *   This is §9's "2 in total": at most 2 attempts per call, both sending the same
+        idempotency key (it is in `args`). If the second attempt also fails, the call
+        raises `AdapterUnavailable` with the last reason (`transport` for a transport
+        failure).
+    *   `ToolRefused` and `AdapterUnavailable` are defined here. Both carry `reason: str`.
+    *   `agents` and `api` (for `decide_approval`) both use it. `api` builds a `RunContext`
+        from the approval's run.
+
+##### 23a. `services/common/run_context.py` (Create)
+
+*   **Type / Scope**: Python module.
+*   **Proposed Changes**: `@dataclass(frozen=True) class RunContext: run_id: UUID;
+    agent_id: str; conversation_id: UUID | None`.
+    *   It is the caller-side context for `call_tool` (item 23), `ModelClient.complete` and
+        `choose` (item 22).
+    *   The agent host builds it from the inbound message's `run_id`, `to_agent` and
+        `conversation_id`.
+    *   It holds ids only. Tokens, modes and overrides are loaded where they are used. The
+        server-side `CallContext` (item 41) is a different type.
 
 ##### 24. `services/common/runs.py` (Create)
 
@@ -2070,13 +2122,27 @@ and values; none of these may be renamed or dropped.
 *   **Type / Scope**: Starlette app, `python -m services.mcp.app`, port 8002.
 *   **Proposed Changes**: Mounts the five MCP servers at `/mcp/<area>` over streamable HTTP,
     plus `/health`. Starts the mock courier loop.
+    *   A Starlette middleware stores the request's `Authorization` bearer token in a
+        context variable for the request (`meta.current_token()`).
 
 ##### 41. `services/mcp/meta.py` (Create)
 
 *   **Type / Scope**: Python module.
-*   **Proposed Changes**: `CallContext.from_meta(meta, token) -> CallContext(run_id,
-    agent_id, conversation_id, token, env, modes)`. It loads `env` and `modes` from the run.
-    A call without `run_id` or `agent_id` is refused.
+*   **Proposed Changes**: `CallContext.from_meta(meta) -> CallContext(run_id,
+    agent_id, conversation_id, attempt, token, env, modes)`. It takes `token` from
+    `current_token()` (item 40), never from `_meta`. It loads `env` and `modes` from the
+    run. A call without `run_id` or `agent_id` is refused.
+    *   `AdapterFailure(reason, retryable)` is what adapters raise. A timeout or 5xx is
+        `retryable=True` (`adapter_timeout`, `adapter_5xx`). A 4xx is `retryable=False`
+        (`adapter_4xx`).
+    *   `tool_error(kind, reason, retryable=False) -> CallToolResult` builds the error
+        result: `isError=true`, `structuredContent={"kind": kind, "reason": reason,
+        "retryable": retryable}`, and a text block with the same JSON. `kind` is
+        `refused` or `unavailable`.
+    *   `tool_errors()` is a context manager. It turns `GuardRefused(reason)` into
+        `tool_error("refused", reason)`. It turns `AdapterFailure` into
+        `tool_error("unavailable", reason, retryable)` after writing the §9 `error` trace
+        row (`where=<server>.<tool>`, `reason`, `attempt`). Any other exception propagates.
 
 ##### 42. `services/mcp/traced.py` (Create)
 
@@ -2090,7 +2156,10 @@ and values; none of these may be renamed or dropped.
 *   **Type / Scope**: Five MCP server modules.
 *   **Proposed Changes**: Each module defines its tools. Names and arguments are provisional
     (§13); the adapters design owns the final schemas. Tools marked *guarded* use
-    `services.safety.guard.run_guarded`; the rest use `@traced`.
+    `services.safety.guard.run_guarded`; the rest use `@traced`. Every tool body runs
+    inside `meta.tool_errors()` (item 41), so refusals and adapter failures reach the
+    client in the item 41 shape. The server never retries an adapter; the client does
+    (item 23).
     *   **grocery and restaurant:** `search_items(query, filters)`, `quote(items)`,
         `place_order(order_id, quote_id, items_hash, delivery_agent_id)` *guarded*,
         `amend_order(order_id, shortfall_id, picks)` *guarded*.
@@ -2172,6 +2241,8 @@ and values; none of these may be renamed or dropped.
     call, apply) -> dict` performs the steps in §5, in order (0–7). `apply(conn, result)`
     is the tool's order-state change, run in the step 7 transaction. Refusals raise
     `GuardRefused(reason)` after writing a `tool_result` row with `refused=true`.
+    `meta.tool_errors()` (item 41) turns that into the wire result, so `GuardRefused`
+    never crosses MCP as an exception.
 
 ##### 50. `services/safety/idempotency.py` (Create, critical)
 
@@ -2618,6 +2689,20 @@ and values; none of these may be renamed or dropped.
     *   `test_find_filters_zone_region_currency`
     *   `test_disabled_cards_excluded`
     *   `test_channel_cards_never_returned`
+    *   `test_external_cards_never_returned`
+    *   `test_card_unknown_agent_raises`
+*   `test_mcp_client.py` (fake MCP server):
+    *   `test_token_sent_as_bearer_header_not_meta`
+    *   `test_meta_carries_run_agent_conversation_attempt`
+    *   `test_refused_raises_tool_refused_with_reason_no_retry`
+    *   `test_retryable_unavailable_retried_once_same_idempotency_key`
+    *   `test_non_retryable_unavailable_raises_without_retry`
+    *   `test_transport_timeout_retried_then_adapter_unavailable`
+    *   `test_malformed_error_result_raises_adapter_unavailable`
+*   `test_mcp_meta.py`:
+    *   `test_from_meta_reads_token_from_header_context`
+    *   `test_from_meta_refuses_missing_run_or_agent`
+    *   `test_tool_errors_maps_guard_refused_and_adapter_failure`
 *   `test_search.py` (*db*): `test_filters_applied_before_ranking`.
 *   `test_handlers.py`:
     *   `test_counter_respects_margin_floor`
