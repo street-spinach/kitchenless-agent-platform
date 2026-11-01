@@ -3,7 +3,8 @@
 *   **Author:** madushankaf
 *   **Status:** Approved; amended 2026-10-31 (bounded model calls for business agents);
     amended 2026-10-31 (agent-protocol); amended 2026-10-31 (build step 1 ports and smoke);
-    amended 2026-11-01 (MCP client contract); amended 2026-11-01 (identity-authz)
+    amended 2026-11-01 (MCP client contract); amended 2026-11-01 (identity-authz);
+    amended 2026-11-01 (tool_errors signature)
 *   **Date:** 2026-10-31
 *   **Path:** `docs/designs/architecture.md`
 
@@ -65,6 +66,15 @@ image with its own tag. Changed: Q4, §4, §5, §9, §10, §13, implementation i
 23, 24, 38, 41, 43, 49, 51, 53, 54, 55, 56, 57, 59, 62 and the environment matrix. Where
 an item below and identity-authz's Detailed Implementation Plan differ, identity-authz
 wins.
+
+**Amendment 2026-11-01 (tool_errors signature).** Item 41's `tool_errors()` must write an
+`error` trace row, but it took no arguments and `CallContext` had no `on_behalf_of`, which
+`TraceStore.write` requires. Now:
+*   `tool_errors(ctx, server, tool)` yields a holder whose `result` is the error result.
+*   `CallContext.on_behalf_of` comes from the caller card's `owner_ref`, and is `None` for
+    `system`.
+*   MCP-side trace rows (guard, `@traced`, `tool_errors`) use it.
+Changed: implementation item 41 and the unit test list.
 
 **Names.** This document uses three names for one project. Kitchenless is the product name.
 `kitchenless-agent-platform` is the GitHub repository (local folder
@@ -2186,11 +2196,32 @@ and values; none of these may be renamed or dropped.
         result: `isError=true`, `structuredContent={"kind": kind, "reason": reason,
         "retryable": retryable}`, and a text block with the same JSON. `kind` is
         `refused` or `unavailable`.
-    *   `tool_errors()` is a context manager. It turns `GuardRefused(reason)` into
-        `tool_error("refused", reason)`. It turns `AdapterFailure` into
-        `tool_error("unavailable", reason, retryable)` after writing the §9 `error` trace
-        row (`where=<server>.<tool>`, `reason`, `attempt`). Any other exception propagates.
+    *   `tool_errors(ctx: CallContext, server: str, tool: str)` is a context manager that
+        yields a holder `err` with `err.result: CallToolResult | None = None`.
+        *   It turns `GuardRefused(reason)` into `tool_error("refused", reason)`.
+        *   It turns `AdapterFailure` into `tool_error("unavailable", reason, retryable)`
+            after writing the §9 `error` trace row.
+        *   In both cases it sets `err.result` and suppresses the exception. Any other
+            exception propagates.
+        *   Every `unavailable` result, including identity-authz's
+            `DependencyUnavailable` below, writes the `error` row first.
+        *   The `error` row has payload `where=f"{server}.{tool}"`, `reason` and
+            `attempt=ctx.attempt`. It is written with `run_id=ctx.run_id`,
+            `agent_id=ctx.agent_id`, `on_behalf_of=ctx.on_behalf_of` and
+            `conversation_id=ctx.conversation_id`.
+        *   Use:
+            ```python
+            with tool_errors(ctx, "household", "authorize_spend") as err:
+                return await run_guarded(ctx, ...)
+            return err.result
+            ```
 *   **Amended 2026-11-01 (identity-authz I-A20).** `tool_errors()` also maps `DependencyUnavailable` to `tool_error("unavailable", reason, retryable=True)`. `CallContext` gains `claims` and `authz_form`, set by the guard (identity-authz I6).
+*   **Amended 2026-11-01 (tool_errors signature, #45).** `CallContext` gains
+    `on_behalf_of: str | None`. `from_meta` loads it from the caller's card:
+    `directory.card(conn, agent_id).owner_ref`, or `None` when that is `system` (§3
+    identifiers table). Every trace row the MCP side writes (guard, `@traced`,
+    `tool_errors`) uses `ctx.on_behalf_of`. An `agent_id` with no card is refused like a
+    missing `agent_id`.
 
 ##### 42. `services/mcp/traced.py` (Create)
 
@@ -2761,6 +2792,8 @@ and values; none of these may be renamed or dropped.
     *   `test_from_meta_reads_token_from_header_context`
     *   `test_from_meta_refuses_missing_run_or_agent`
     *   `test_tool_errors_maps_guard_refused_and_adapter_failure`
+    *   `test_tool_errors_error_row_has_where_attempt_and_on_behalf_of`
+    *   `test_from_meta_sets_on_behalf_of_from_card_owner_ref`
 *   `test_search.py` (*db*): `test_filters_applied_before_ranking`.
 *   `test_handlers.py`:
     *   `test_counter_respects_margin_floor`
