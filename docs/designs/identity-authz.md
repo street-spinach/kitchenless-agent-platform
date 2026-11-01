@@ -1,7 +1,7 @@
 # Kitchenless identity, delegation and authorization
 
 *   **Author:** madushankaf
-*   **Status:** Draft
+*   **Status:** Approved (2026-11-01, #100)
 *   **Date:** 2026-11-01
 *   **Path:** `docs/designs/identity-authz.md`
 *   **Builds on:** [architecture.md](architecture.md) (approved) and
