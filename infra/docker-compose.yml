@@ -9,18 +9,70 @@ x-app: &app
     dockerfile: infra/Dockerfile
   image: spinach-app:local
   restart: unless-stopped
-  environment: &app-env
-    MODE: ${MODE:-mock}
-    DOMAIN: ${DOMAIN:-localhost}
-    DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
-    REDIS_URL: redis://redis:6379/0
-    NEO4J_URI: bolt://neo4j:7687
-    NEO4J_USER: neo4j
-    NEO4J_PASSWORD: ${NEO4J_PASSWORD}
-    OPENFGA_API_URL: http://openfga:8080
-    KEYCLOAK_URL: http://keycloak:8080/auth
-    ORCHESTRATOR_URL: http://hello:8000
-    MUSE_API_KEY: ${MUSE_API_KEY:-}
+
+# Environment for the Phase 0 hello and mocks containers (retired in build step 6).
+x-legacy-env: &legacy-env
+  MODE: ${MODE:-mock}
+  DOMAIN: ${DOMAIN:-localhost}
+  DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+  NEO4J_URI: bolt://neo4j:7687
+  NEO4J_USER: neo4j
+  NEO4J_PASSWORD: ${NEO4J_PASSWORD}
+  OPENFGA_API_URL: http://openfga:8080
+  KEYCLOAK_URL: http://keycloak:8080/auth
+  ORCHESTRATOR_URL: http://hello:8000
+  MUSE_API_KEY: ${MUSE_API_KEY:-}
+
+# Environment matrix (docs/designs/architecture.md, "Environment matrix"). One block per
+# row group; each service merges the blocks the matrix names for it. SERVICE_NAME is set
+# per service.
+x-env-base: &env-base # all app and migrate
+  DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+x-env-app: &env-app # all app
+  APPROVAL_TTL_SECONDS: ${APPROVAL_TTL_SECONDS:-14400}
+  RUN_TIMEOUT_SECONDS: ${RUN_TIMEOUT_SECONDS:-300}
+  QUOTE_ROUND_SECONDS: ${QUOTE_ROUND_SECONDS:-30}
+  MOCK_TOKEN_SECRET: ${MOCK_TOKEN_SECRET}
+
+x-env-modes: &env-modes # api, testrunner
+  MODE: ${MODE:-mock}
+  MODE_FORCE_MOCK: ${MODE_FORCE_MOCK:-}
+  MODE_KROGER_CATALOG: ${MODE_KROGER_CATALOG:-}
+  MODE_KROGER_ORDERING: ${MODE_KROGER_ORDERING:-}
+  MODE_SQUARE_RETAIL: ${MODE_SQUARE_RETAIL:-}
+  MODE_SQUARE_RESTAURANT: ${MODE_SQUARE_RESTAURANT:-}
+  MODE_DOORDASH: ${MODE_DOORDASH:-}
+
+x-env-model: &env-model # agents, testrunner
+  MODEL_MODE: ${MODEL_MODE:-stub}
+  MODEL_BASE_URL: ${MODEL_BASE_URL:-}
+  MODEL_NAME: ${MODEL_NAME:-}
+  MODEL_API_KEY: ${MODEL_API_KEY:-}
+  MODEL_FALLBACK_BASE_URL: ${MODEL_FALLBACK_BASE_URL:-}
+  MODEL_FALLBACK_NAME: ${MODEL_FALLBACK_NAME:-}
+  MODEL_FALLBACK_API_KEY: ${MODEL_FALLBACK_API_KEY:-}
+  RUN_TOKEN_CEILING: ${RUN_TOKEN_CEILING}
+  MODEL_BUSINESS_NAME: ${MODEL_BUSINESS_NAME:-Muse Glimmer}
+  MODEL_BUSINESS_TIMEOUT_SECONDS: ${MODEL_BUSINESS_TIMEOUT_SECONDS:-5}
+
+x-env-graph: &env-graph # mcp, testrunner
+  NEO4J_URI: ${NEO4J_URI:-bolt://neo4j:7687}
+  NEO4J_USER: ${NEO4J_USER:-neo4j}
+  NEO4J_PASSWORD: ${NEO4J_PASSWORD}
+  OPENFGA_API_URL: ${OPENFGA_API_URL:-http://openfga:8080}
+  OPENFGA_STORE_ID: ${OPENFGA_STORE_ID:-}
+  KROGER_CLIENT_ID: ${KROGER_CLIENT_ID:-}
+  KROGER_CLIENT_SECRET: ${KROGER_CLIENT_SECRET:-}
+  KROGER_LOCATION_ID: ${KROGER_LOCATION_ID:-}
+
+x-env-keycloak: &env-keycloak # api, mcp
+  KEYCLOAK_URL: ${KEYCLOAK_URL:-http://keycloak:8080/auth}
+
+x-env-shortfall: &env-shortfall # agents, api, mcp (agent-protocol §13)
+  SHORTFALL_REPLY_SECONDS: ${SHORTFALL_REPLY_SECONDS:-900}
+  SHORTFALL_MAX_LINES: ${SHORTFALL_MAX_LINES:-3}
 
 x-app-health: &app-health
   test: ["CMD", "python", "-c", "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ['PORT'] + '/health', timeout=3)"]
@@ -128,48 +180,107 @@ services:
       retries: 30
       start_period: 20s
 
-  redis:
-    image: redis:7-alpine
-    restart: unless-stopped
-    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
-    ports:
-      - "127.0.0.1:6379:6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
-
   # Applies migrations/*.sql once per `up`, before any app service starts.
   migrate:
     <<: *app
     restart: "no"
     command: ["python", "-m", "migrations.apply"]
+    environment:
+      <<: *env-base
+      SERVICE_NAME: migrate
     depends_on:
       postgres: { condition: service_healthy }
 
+  # api, mcp and agents (architecture item 56). The app ports are bound to 127.0.0.1 only;
+  # Caddy reaches api over the Compose network. agents (8003, including the internal A2A
+  # endpoint) has no Caddy route.
+  api:
+    <<: *app
+    command: ["python", "-m", "services.api.main"]
+    stop_grace_period: 30s
+    environment:
+      <<: [*env-base, *env-app, *env-modes, *env-keycloak, *env-shortfall]
+      SERVICE_NAME: api
+      PORT: "8000"
+      WHATSAPP_TOKEN: ${WHATSAPP_TOKEN:-}
+      WHATSAPP_APP_SECRET: ${WHATSAPP_APP_SECRET:-}
+      WHATSAPP_PHONE_NUMBER_ID: ${WHATSAPP_PHONE_NUMBER_ID:-}
+      WHATSAPP_VERIFY_TOKEN: ${WHATSAPP_VERIFY_TOKEN:-}
+      DOORDASH_WEBHOOK_PATH_SECRET: ${DOORDASH_WEBHOOK_PATH_SECRET:-}
+    depends_on:
+      postgres: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck: *app-health
+
+  mcp:
+    <<: *app
+    command: ["python", "-m", "services.mcp.app"]
+    stop_grace_period: 30s
+    environment:
+      <<: [*env-base, *env-app, *env-graph, *env-keycloak, *env-shortfall]
+      SERVICE_NAME: mcp
+      PORT: "8002"
+      DOORDASH_DEVELOPER_ID: ${DOORDASH_DEVELOPER_ID:-}
+      DOORDASH_KEY_ID: ${DOORDASH_KEY_ID:-}
+      DOORDASH_SIGNING_SECRET: ${DOORDASH_SIGNING_SECRET:-}
+      SQUARE_RETAIL_TOKEN: ${SQUARE_RETAIL_TOKEN:-}
+      SQUARE_RESTAURANT_TOKEN: ${SQUARE_RESTAURANT_TOKEN:-}
+      SQUARE_ENV: ${SQUARE_ENV:-sandbox}
+      MOCK_COURIER_STEP_SECONDS: ${MOCK_COURIER_STEP_SECONDS:-20}
+    depends_on:
+      postgres: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    ports:
+      - "127.0.0.1:8002:8002"
+    healthcheck: *app-health
+
+  agents:
+    <<: *app
+    command: ["python", "-m", "services.agents.host"]
+    stop_grace_period: 30s
+    environment:
+      <<: [*env-base, *env-app, *env-model, *env-shortfall]
+      SERVICE_NAME: agents
+      PORT: "8003"
+      OFFER_TTL_SECONDS: ${OFFER_TTL_SECONDS:-600}
+      COURIER_QUOTE_TTL_SECONDS: ${COURIER_QUOTE_TTL_SECONDS:-120}
+      A2A_DEMO_TIMEOUT_SECONDS: ${A2A_DEMO_TIMEOUT_SECONDS:-900}
+      A2A_SEND_WAIT_SECONDS: ${A2A_SEND_WAIT_SECONDS:-10}
+      A2A_MAX_REQUEST_BYTES: ${A2A_MAX_REQUEST_BYTES:-32768}
+      A2A_RATE_PER_SECOND: ${A2A_RATE_PER_SECOND:-10}
+      A2A_DEMO_TOKEN: ${A2A_DEMO_TOKEN}
+    depends_on:
+      postgres: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    ports:
+      - "127.0.0.1:8003:8003"
+    healthcheck: *app-health
+
+  # Phase 0 containers, kept until build step 6.
   hello:
     <<: *app
     command: ["python", "-m", "services.agents.hello.main"]
     environment:
-      <<: *app-env
+      <<: *legacy-env
       PORT: "8000"
     depends_on:
       migrate: { condition: service_completed_successfully }
-      redis: { condition: service_healthy }
+    # Host port 8000 belongs to api; until step 6 hello is reached from the host on 8004
+    # (`make eval-fast`). Inside the network it stays at hello:8000.
     ports:
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:8004:8000"
     healthcheck: *app-health
 
   mocks:
     <<: *app
     command: ["python", "-m", "services.mocks.panel"]
     environment:
-      <<: *app-env
+      <<: *legacy-env
       PORT: "8001"
     depends_on:
       migrate: { condition: service_completed_successfully }
-      redis: { condition: service_healthy }
     ports:
       - "127.0.0.1:8001:8001"
     healthcheck: *app-health
@@ -179,6 +290,8 @@ services:
     restart: unless-stopped
     environment:
       DOMAIN: ${DOMAIN:-localhost}
+      PANEL_USER: ${PANEL_USER:-}
+      PANEL_PASSWORD_HASH: ${PANEL_PASSWORD_HASH:-}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddydata:/data
@@ -187,6 +300,7 @@ services:
       - "80:80"
       - "443:443"
     depends_on:
+      api: { condition: service_healthy }
       hello: { condition: service_healthy }
       mocks: { condition: service_healthy }
       keycloak: { condition: service_healthy }
@@ -203,6 +317,15 @@ services:
     restart: "no"
     profiles: ["tools"]
     command: ["python", "-c", "print('testrunner: pass a command')"]
+    environment:
+      <<: [*env-base, *env-app, *env-modes, *env-model, *env-graph]
+      SERVICE_NAME: testrunner
+      A2A_DEMO_TOKEN: ${A2A_DEMO_TOKEN}
+      AGENTS_URL: ${AGENTS_URL:-http://agents:8003}
+      SEED_US1_PHONES: ${SEED_US1_PHONES:-}
+      # Used by the smoke tests (Caddy SNI) and the eval runner until step 6.
+      DOMAIN: ${DOMAIN:-localhost}
+      ORCHESTRATOR_URL: http://hello:8000
 
   # The ci profile is reserved for CI-only helpers (for example a stub token issuer).
   # Today `--profile ci` starts the same services as `make up`.

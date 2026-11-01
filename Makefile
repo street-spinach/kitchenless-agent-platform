@@ -31,8 +31,11 @@ smoke:
 scenario:
 	$(COMPOSE) run --rm testrunner pytest tests/scenario -q; $(call allow_empty,scenario)
 
+# Until build step 6, /hello/run lives in the hello container, published on host port 8004
+# because api owns 8000 (architecture items 56 and 73). Step 6 removes this override.
+eval-fast: ORCHESTRATOR_URL ?= http://localhost:8004
 eval-fast:
-	uv run python -m evals.run --tag fast
+	ORCHESTRATOR_URL=$(ORCHESTRATOR_URL) uv run python -m evals.run --tag fast
 
 eval-full:
 	$(COMPOSE) run --rm testrunner python -m evals.run --all
