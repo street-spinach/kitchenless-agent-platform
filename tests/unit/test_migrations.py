@@ -1,4 +1,4 @@
-"""Migrations 0001-0005 apply in order to an empty database (issues #25, #26)."""
+"""Migrations 0001-0009 apply in order to an empty database (issues #25, #26, #27)."""
 
 import uuid
 
@@ -32,6 +32,15 @@ TABLES = {
     "timers",
     "pantry_events",
     "shortfalls",
+    "idempotency_keys",
+    "adapter_modes",
+    "catalog_items",
+    "menu_items",
+    "mock_stock",
+    "mock_orders",
+    "mock_deliveries",
+    "mock_events",
+    "sim_outbound",
 }
 # Tables whose own time column records creation (architecture, Migrations preamble).
 OWN_TIME_COLUMN = {"agent_traces", "runs", "inbound_messages", "approvals", "pantry_events"}
@@ -48,12 +57,16 @@ def _card(conn: psycopg.Connection, agent_id: str, cls: str, host: str) -> None:
 def test_applies_in_order_on_empty_database(empty_schema_dsn: str) -> None:
     done = apply(empty_schema_dsn)
 
-    assert done[:5] == [
+    assert done[:9] == [
         "0001_agent_traces.sql",
         "0002_core_entities.sql",
         "0003_agent_directory.sql",
         "0004_runs_and_messages.sql",
         "0005_orders_quotes_approvals_timers.sql",
+        "0006_idempotency_and_modes.sql",
+        "0007_catalog.sql",
+        "0008_mock_backends.sql",
+        "0009_trace_additions.sql",
     ]
     assert apply(empty_schema_dsn) == []
     with psycopg.connect(empty_schema_dsn) as conn:
@@ -250,3 +263,156 @@ def test_shortfalls_status(pg: str, status: str, ok: bool) -> None:
         else:
             with pytest.raises(psycopg.errors.CheckViolation):
                 conn.execute(SHORTFALL_INSERT, args)
+
+
+@pytest.mark.parametrize(("status", "ok"), [("in_progress", True), ("done", True), ("x", False)])
+def test_idempotency_keys_status(pg: str, status: str, ok: bool) -> None:
+    with psycopg.connect(pg) as conn:
+        run_id = _run(conn)
+        insert = (
+            "INSERT INTO idempotency_keys (key, run_id, request_hash, status)"
+            " VALUES ('k', %s, 'h', %s)"
+        )
+        if ok:
+            conn.execute(insert, (run_id, status))
+            assert conn.execute("SELECT result FROM idempotency_keys").fetchone() == (None,)
+        else:
+            with pytest.raises(psycopg.errors.CheckViolation):
+                conn.execute(insert, (run_id, status))
+
+
+@pytest.mark.parametrize(("mode", "ok"), [("real", True), ("mock", True), ("replay", False)])
+def test_adapter_modes_mode(pg: str, mode: str, ok: bool) -> None:
+    with psycopg.connect(pg) as conn:
+        insert = "INSERT INTO adapter_modes (vendor, mode, set_by) VALUES ('instacart', %s, 'ops')"
+        if ok:
+            conn.execute(insert, (mode,))
+        else:
+            with pytest.raises(psycopg.errors.CheckViolation):
+                conn.execute(insert, (mode,))
+
+
+@pytest.mark.parametrize("table", ["catalog_items", "menu_items"])
+def test_catalog_search_is_generated_and_indexed(pg: str, table: str) -> None:
+    with psycopg.connect(pg) as conn:
+        _card(conn, "grocery:1", "grocery", "agents")
+        conn.execute(
+            f"INSERT INTO {table} (agent_id, sku, name, brand, ingredients, price_minor,"  # noqa: S608
+            " currency) VALUES ('grocery:1', 's1', 'Peanut Butter', NULL, 'peanuts salt', 399,"
+            " 'USD')"
+        )
+        row = conn.execute(
+            f"SELECT allergens, diets, nutrition, in_stock FROM {table}"  # noqa: S608
+            " WHERE search @@ to_tsquery('simple', 'peanuts')"
+        ).fetchone()
+        indexes = conn.execute(
+            "SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema()"
+            " AND tablename = %s",
+            (table,),
+        ).fetchall()
+    assert row == ([], [], {}, True)
+    assert sum("USING gin" in r[0] for r in indexes) == 2
+
+
+def test_catalog_has_no_vector_columns(pg: str) -> None:
+    with psycopg.connect(pg) as conn:
+        row = conn.execute(
+            "SELECT table_name FROM information_schema.columns"
+            " WHERE table_schema = current_schema() AND udt_name = 'vector'"
+        ).fetchone()
+    assert row is None
+
+
+@pytest.mark.parametrize(
+    ("kind", "ok"),
+    [
+        ("shortfall", True),
+        ("out_of_stock", True),
+        ("kitchen_overloaded", True),
+        ("courier_delayed", True),
+        ("adapter_down", True),
+        ("flood", False),
+    ],
+)
+def test_mock_events_kind(pg: str, kind: str, ok: bool) -> None:
+    with psycopg.connect(pg) as conn:
+        insert = (
+            "INSERT INTO mock_events (env, kind, target_agent_id) VALUES ('eval', %s, 'grocery:1')"
+        )
+        if ok:
+            conn.execute(insert, (kind,))
+            assert conn.execute("SELECT params, active FROM mock_events").fetchone() == ({}, True)
+        else:
+            with pytest.raises(psycopg.errors.CheckViolation):
+                conn.execute(insert, (kind,))
+
+
+def test_mock_stock_env(pg: str) -> None:
+    with psycopg.connect(pg) as conn, pytest.raises(psycopg.errors.CheckViolation):
+        conn.execute(
+            "INSERT INTO mock_stock (env, agent_id, sku, qty) VALUES ('prod', 'grocery:1', 's', 1)"
+        )
+
+
+@pytest.mark.parametrize(("state", "ok"), [("booked", True), ("delivered", True), ("lost", False)])
+def test_mock_deliveries_state_and_unique_key(pg: str, state: str, ok: bool) -> None:
+    insert = (
+        "INSERT INTO mock_deliveries (external_delivery_id, env, agent_id, idempotency_key,"
+        " zone_id, \"window\", state) VALUES (%s, 'eval', 'delivery:1', 'k', 'z1',"
+        " tstzrange(now(), now() + interval '1 hour'), %s)"
+    )
+    with psycopg.connect(pg) as conn:
+        if not ok:
+            with pytest.raises(psycopg.errors.CheckViolation):
+                conn.execute(insert, ("d1", state))
+            return
+        conn.execute(insert, ("d1", state))
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            conn.execute(insert, ("d2", state))
+
+
+def test_mock_orders_idempotency_key_unique(pg: str) -> None:
+    insert = (
+        "INSERT INTO mock_orders (external_order_id, env, agent_id, idempotency_key, body, state)"
+        " VALUES (%s, 'eval', 'grocery:1', 'k', '{}', 'placed')"
+    )
+    with psycopg.connect(pg) as conn:
+        conn.execute(insert, ("o1",))
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            conn.execute(insert, ("o2",))
+
+
+def test_sim_outbound_index(pg: str) -> None:
+    with psycopg.connect(pg) as conn:
+        indexes = conn.execute(
+            "SELECT indexdef FROM pg_indexes"
+            " WHERE schemaname = current_schema() AND tablename = 'sim_outbound'"
+        ).fetchall()
+    assert any("(phone_e164, id)" in r[0] for r in indexes)
+
+
+def test_agent_traces_additions(pg: str) -> None:
+    with psycopg.connect(pg) as conn:
+        cols = conn.execute(
+            "SELECT column_name, data_type, is_nullable FROM information_schema.columns"
+            " WHERE table_schema = current_schema() AND table_name = 'agent_traces'"
+        ).fetchall()
+        indexes = conn.execute(
+            "SELECT indexdef FROM pg_indexes"
+            " WHERE schemaname = current_schema() AND tablename = 'agent_traces'"
+        ).fetchall()
+        comment = conn.execute(
+            "SELECT col_description('agent_traces'::regclass, ordinal_position::int)"
+            " FROM information_schema.columns WHERE table_schema = current_schema()"
+            " AND table_name = 'agent_traces' AND column_name = 'kind'"
+        ).fetchone()
+    assert {
+        ("conversation_id", "uuid", "YES"),
+        ("message_id", "uuid", "YES"),
+        ("model", "text", "YES"),
+        ("latency_ms", "integer", "YES"),
+    } <= set(cols)
+    defs = [r[0] for r in indexes]
+    assert any(d.endswith("(ts)") for d in defs)
+    assert any(d.endswith("(agent_id, ts)") for d in defs)
+    assert all(k in comment[0] for k in ("run_start", "error", "data_share"))
