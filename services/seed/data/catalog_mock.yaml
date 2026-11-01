@@ -1,0 +1,54 @@
+# Grocery catalogs for the mock-backed stores (architecture item 55). Prices in USD minor
+# units. Allergen and diet values use the fixed code lists (migration 0002). Every SKU here
+# has a product in off_subset.json with the same allergens; the seed checks this.
+
+# Agent-protocol P34 shortfall fixture in grocery:mock-us: the weekly item MOCK-MILK-WHOLE
+# with one safe substitute and one tree-nut substitute, both priced at or below it.
+shortfall_fixture:
+  agent_id: grocery:mock-us
+  sku: MOCK-MILK-WHOLE
+  safe_substitute: MOCK-MILK-2PCT
+  unsafe_substitute: MOCK-MILK-ALMOND
+
+catalogs:
+  grocery:mock-us:
+    - {sku: MOCK-MILK-WHOLE, name: Whole milk 1 gal, brand: Farm Fresh,
+       ingredients: whole milk, allergens: [milk], diets: [vegetarian], price_minor: 429}
+    - {sku: MOCK-MILK-2PCT, name: Reduced fat 2% milk 1 gal, brand: Farm Fresh,
+       ingredients: reduced fat milk, allergens: [milk], diets: [vegetarian], price_minor: 399}
+    - {sku: MOCK-MILK-ALMOND, name: Almond milk 64 oz, brand: Grove,
+       ingredients: almond milk (water almonds), allergens: [tree_nuts],
+       diets: [vegetarian, vegan], price_minor: 379}
+    - {sku: MOCK-EGGS-12, name: Large eggs 12 ct, brand: Farm Fresh, ingredients: eggs,
+       allergens: [eggs], diets: [vegetarian], price_minor: 349}
+    - {sku: MOCK-BREAD-WHEAT, name: Whole wheat bread, brand: Baker's Best,
+       ingredients: whole wheat flour water yeast salt, allergens: [gluten],
+       diets: [vegetarian, vegan], price_minor: 299}
+    - {sku: MOCK-BANANAS-2LB, name: Bananas 2 lb, ingredients: bananas, allergens: [],
+       diets: [vegetarian, vegan], price_minor: 129}
+    - {sku: MOCK-APPLES-3LB, name: Gala apples 3 lb, ingredients: apples, allergens: [],
+       diets: [vegetarian, vegan], price_minor: 449}
+    - {sku: MOCK-CHICKEN-BREAST, name: Chicken breast 1.5 lb, brand: Farm Fresh,
+       ingredients: chicken, allergens: [], diets: [high_protein], price_minor: 899}
+    - {sku: MOCK-RICE-2LB, name: Long grain white rice 2 lb, brand: Pantry,
+       ingredients: rice, allergens: [], diets: [vegetarian, vegan], price_minor: 249}
+    - {sku: MOCK-GRANOLA-NUT, name: Maple pecan granola, brand: Grove,
+       ingredients: oats pecans maple syrup, allergens: [tree_nuts],
+       diets: [vegetarian], price_minor: 549}
+
+  grocery:square-us:
+    - {sku: SQ-MILK-WHOLE, name: Whole milk 1 gal, brand: Valley,
+       ingredients: whole milk, allergens: [milk], diets: [vegetarian], price_minor: 439}
+    - {sku: SQ-EGGS-12, name: Large eggs 12 ct, brand: Valley, ingredients: eggs,
+       allergens: [eggs], diets: [vegetarian], price_minor: 359}
+    - {sku: SQ-BREAD-WHITE, name: White sandwich bread, brand: Valley,
+       ingredients: wheat flour water yeast salt, allergens: [gluten],
+       diets: [vegetarian, vegan], price_minor: 279}
+    - {sku: SQ-BANANAS-2LB, name: Bananas 2 lb, ingredients: bananas, allergens: [],
+       diets: [vegetarian, vegan], price_minor: 139}
+    - {sku: SQ-PASTA-1LB, name: Penne pasta 1 lb, brand: Valley,
+       ingredients: durum wheat semolina, allergens: [gluten], diets: [vegetarian, vegan],
+       price_minor: 189}
+    - {sku: SQ-ALMONDS-1LB, name: Roasted almonds 1 lb, brand: Valley,
+       ingredients: almonds salt, allergens: [tree_nuts], diets: [vegetarian, vegan],
+       price_minor: 799}

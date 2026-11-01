@@ -102,3 +102,18 @@ def a2a_run_id(message_id: UUID) -> UUID:
 def a2a_order_id(message_id: UUID) -> UUID:
     """Draft order created for an inbound A2A message."""
     return uuid5(message_id, "order")
+
+
+# Seeded rows (architecture item 55). Seeding twice must give the same rows, so the UUID
+# keys of seeded users and addresses are derived from their seed names.
+NS_SEED = UUID("3a1f7c52-9a0e-4d1b-8f6e-2c4b5d7e9a10")
+
+
+def seed_user_id(member_id: str) -> UUID:
+    """`users.user_id` of a seeded member, for example `us-1-a`."""
+    return uuid5(NS_SEED, f"user|{_require('member_id', member_id)}")
+
+
+def seed_address_ref(household_id: str) -> UUID:
+    """`address_ref` of a seeded household's one address."""
+    return uuid5(NS_SEED, f"address|{_require('household_id', household_id)}")
