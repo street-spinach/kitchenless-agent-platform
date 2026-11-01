@@ -4,8 +4,14 @@ version = "0.1.0"
 description = "Agentic food network"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "psycopg[binary]>=3.3.6",
+    "httpx>=0.28.1",
+    "openfga-sdk>=0.10.5",
+    "psycopg[binary,pool]>=3.3.6",
+    "pydantic>=2.14.2",
+    "pyjwt>=2.15.1",
     "pyyaml>=6.0.3",
+    "starlette>=1.10.0",
+    "uvicorn>=0.54.0",
 ]
 
 [tool.uv]
@@ -26,3 +32,4 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+markers = ["db: needs a Postgres DATABASE_URL; skipped without it"]

@@ -8,9 +8,10 @@
 
 	# Liveness for smoke tests and deploy verification (tests/smoke, infra/deploy.sh).
 	handle /health {
-		reverse_proxy hello:8000
+		reverse_proxy api:8000
 	}
 	# Placeholder hello agent, including POST /hello/run, which writes trace rows.
+	# Moves into api in build step 6.
 	handle /hello* {
 		reverse_proxy hello:8000
 	}
@@ -22,7 +23,8 @@
 	handle /auth* {
 		reverse_proxy keycloak:8080
 	}
-	# Anything else is not routed.
+	# Anything else is not routed. In particular /internal/*, /runs*, /mcp* and the agents
+	# service's /a2a endpoint stay private (tests/smoke test_internal_routes_not_public).
 	handle {
 		respond "Not found" 404
 	}
