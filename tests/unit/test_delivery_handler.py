@@ -200,6 +200,21 @@ def test_out_of_bounds_window_falls_back_to_the_rule_default() -> None:
     assert row["model_pick"]["end"] == (START + timedelta(hours=4)).isoformat()
 
 
+def test_choose_window_guidance_reaches_choose() -> None:
+    w = World()
+    recorder = mf.RecordingChooser(w.handler.model)
+    w.handler.model = recorder
+    w.courier.windows = [_slot(1), _slot(0)]
+
+    msg = w.quote_request().messages[0]
+
+    assert recorder.calls == [("choose_window", "Prefer the earliest window.")]
+    # The allowed set and the rule default (the earliest window) are unchanged.
+    [row] = w.traces.of("decision")
+    assert row["allowed"] == {"one_of": [_slot(0), _slot(1)]}
+    assert msg.body["window"] == _slot(0)
+
+
 def test_adapter_windows_outside_the_request_are_not_allowed() -> None:
     requested = Window.model_validate(REQUESTED)
     late = _slot(2)  # 16:00-17:00, after the requested 14:00-16:00

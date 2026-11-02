@@ -105,10 +105,11 @@ class World:
             clock=lambda: NOW,
             offer_ttl_seconds=600,
         )
+        self.card = sf.CARD
 
     def step(self, type: str, body: dict[str, Any], **kw: Any) -> StepResult:
         kw.setdefault("conversation_id", uuid.uuid4())
-        result = asyncio.run(self.handler(sf.inbound(self.run_id, type, body, **kw), sf.CARD))
+        result = asyncio.run(self.handler(sf.inbound(self.run_id, type, body, **kw), self.card))
         self.store.apply(result)
         return result
 
@@ -293,6 +294,77 @@ def test_one_choose_call_per_step() -> None:
     assert len(w.stubs.seen) == 2
     points = [r for r in w.traces.of("decision") if r["node"] in sf.seller_stubs.STUBS]
     assert [r["node"] for r in points] == ["rank_substitutes", "respond_to_counter"]
+
+
+# Choice-point guidance (agents §12 prompts 7 and 8, AG12, AG-A11) ------------------------
+
+RANK_GROCERY = (
+    "For each missing item, rank the substitute candidates by closeness in kind and size, "
+    "then by price. The shopper's constraints are in the inputs."
+)
+COUNTER_GUIDANCE = (
+    "A buyer has countered your offer. Prefer agreeing or countering within your business "
+    "rules over rejecting, when the rules allow it."
+)
+
+
+def _quote_and_counter(w: World) -> None:
+    w.seller.stock[MILK] = 0
+    w.step("quote_request", sf.request_body(w.order_id, [("milk", 1)]))
+    q = w.quote()
+    w.counter(q, q.total_minor * 90 // 100)
+
+
+def test_grocery_guidance_reaches_choose() -> None:
+    w = World()
+    recorder = mf.RecordingChooser(w.handler.model)
+    w.handler.model = recorder
+    _quote_and_counter(w)
+
+    assert recorder.calls == [
+        ("rank_substitutes", RANK_GROCERY),
+        ("respond_to_counter", COUNTER_GUIDANCE),
+    ]
+    # Guidance changes neither the allowed sets nor the rule defaults the handler computes.
+    baseline = World()
+    _quote_and_counter(baseline)
+    for node in ("rank_substitutes", "respond_to_counter"):
+        [got] = _decisions(w, node)
+        [want] = _decisions(baseline, node)
+        assert (got["allowed"], got["choice"], got["source"]) == (
+            want["allowed"],
+            want["choice"],
+            want["source"],
+        )
+    [counter] = _decisions(w, "respond_to_counter")
+    assert counter["choice"] == {"action": "counter", "arg": _floor(w.quote())}
+
+
+def test_restaurant_guidance_reaches_choose_with_dish() -> None:
+    w = World()
+    recorder = mf.RecordingChooser(w.handler.model)
+
+    async def call_tool(server: str, tool: str, args: dict, *, ctx: Any, token: str) -> dict:
+        assert server == "restaurant"
+        return await w.seller("grocery", tool, args, ctx=ctx, token=token)
+
+    w.handler = SellerHandler(
+        "restaurant",
+        model=recorder,
+        traces=w.traces,
+        store=w.store,
+        call_tool=call_tool,
+        issue_token=lambda sub, act, scopes: f"token:{sub}:{act}",
+        clock=lambda: NOW,
+        offer_ttl_seconds=600,
+    )
+    w.card = replace(sf.CARD, agent_class="restaurant")
+    _quote_and_counter(w)
+
+    assert recorder.calls == [
+        ("rank_substitutes", RANK_GROCERY.replace("missing item", "missing dish")),
+        ("respond_to_counter", COUNTER_GUIDANCE),
+    ]
 
 
 def test_seller_courier_round_uses_timer_not_wait() -> None:

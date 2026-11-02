@@ -123,3 +123,23 @@ def client(
         clock=clock,
         sleep=clock.sleep,
     )
+
+
+class RecordingChooser:
+    """Wraps a `Chooser`, recording `(point, guidance)` for each `choose` call."""
+
+    def __init__(self, inner: Any) -> None:
+        self.inner = inner
+        self.calls: list[tuple[str, str | None]] = []
+
+    async def choose(
+        self,
+        ctx: RunContext,
+        point: str,
+        allowed: Any,
+        default: Any,
+        inputs: Mapping[str, Any],
+        guidance: str | None = None,
+    ) -> Any:
+        self.calls.append((point, guidance))
+        return await self.inner.choose(ctx, point, allowed, default, inputs, guidance=guidance)
