@@ -1,0 +1,10 @@
+# business_rules per business card (architecture item 55).
+# Store floors are 95% of list price, rounded up to the cent, so the household stub's 90%
+# counter is always below the floor total (G11). The seed expands `floor_pct` into a
+# `floors` rule: {"<sku>": <floor unit price minor>} over the card's seeded items.
+
+grocery:kroger-us: {floor_pct: 95}
+grocery:square-us: {floor_pct: 95}
+grocery:mock-us: {floor_pct: 95}
+restaurant:square-us: {floor_pct: 95}
+restaurant:mock-us: {floor_pct: 95}

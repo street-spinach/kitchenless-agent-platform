@@ -10,5 +10,11 @@ unattended.
 4. Re-run the issue's Verify commands and `make lint test-unit` locally until they pass.
 5. Commit and push to the same branch. Do not open a new PR. Do not merge.
 
+If the fix needs a small decision the design leaves open, decide it the way
+`scripts/prompts/implement.md` ("Small gaps in the design") describes, and add it to the
+PR body's `## Decisions` section (`gh pr edit {{PR}} --body-file -`) and to a comment on
+the issue. If a check needs something this environment doesn't have, fix what you can and
+say in a PR comment which check you could not reproduce locally.
+
 If you can't fix it, comment on issue #{{ISSUE}} with what you found, run
 `gh issue edit {{ISSUE}} --add-label needs-human`, and stop.

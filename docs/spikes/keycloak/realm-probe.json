@@ -1,0 +1,11 @@
+{
+  "realm": "probe2",
+  "enabled": true,
+  "users": [{"username": "${SPIKE_PHONE_1}", "enabled": true}],
+  "clients": [
+    {"clientId": "probe-client", "enabled": true, "publicClient": false,
+     "secret": "${SPIKE_PROBE_SECRET}",
+     "attributes": {"jwt.credential.certificate": "${SPIKE_PROBE_CERT}"},
+     "redirectUris": ["https://${SPIKE_DOMAIN}/me/callback"]}
+  ]
+}

@@ -456,7 +456,7 @@ Later designs use these identifiers and must not redefine them.
 
 | Identifier | Format | Created by | Notes |
 |---|---|---|---|
-| `agent_id` | `<class>:<instance>`, for example `household:us-1`, `grocery:square-us`. Non-agent senders: `channel:whatsapp`, `system:sweeper`, `system:api` | Seed script (`agent_cards`) | Matches the format `evals/checks.py` already uses. It is the address messages are sent to. |
+| `agent_id` | `<class>:<instance>`, for example `household:us-1`, `grocery:square-us`. Non-agent senders: `channel:whatsapp`, `system:sweeper`, `system:api`, `system:runs` (the retry prompt, item 24) | Seed script (`agent_cards`) | Matches the format `evals/checks.py` already uses. It is the address messages are sent to. |
 | `run_id` | UUID | `runs.start()`, called by `api` when a trigger arrives (a WhatsApp message or `POST /runs`) | Required in every agent message, MCP call and trace row. Stored on `orders`. Business agents adopt the requester's `run_id`. |
 | `thread_id` | `<agent_id>:<run_id>` | Agent host | The LangGraph checkpoint key for consumer and household agents. One thread per agent per run, never one per agent overall. Business handlers have no thread. |
 | `conversation_id` | UUID | The agent that opens an exchange, for example one household-to-store negotiation | Used only to correlate messages. Not a state key. |
@@ -859,6 +859,26 @@ check.
     `runs`, `orders`, `order_items`, `quotes`, `approvals`, `timers`, `agent_messages`,
     `idempotency_keys`, `pantry_events` and `sim_outbound`, plus `mock_*` rows with
     `env='eval'`. It then re-seeds the `eval` mock state. It refuses `env: live`.
+*   **Amended 2026-11-02 (reset scope, #50).** The list above left out `shortfalls`, whose
+    `run_id` and `order_id` foreign keys made the reset fail after any shortfall case. The
+    full rule:
+    *   **Eval runs** are runs whose `household_id` is a household with `env='eval'`.
+        That includes `a2a-demo`. Runs with no household are never deleted.
+    *   **Order of deletion,** in one transaction, children first: `agent_messages`,
+        `idempotency_keys`, `timers`, `approvals`, `quotes`, `shortfalls` (by eval
+        `run_id`), `order_items` (by eval orders), `pantry_events` (by eval
+        `household_id`; the seed writes none), `orders`, then `runs`. After those,
+        `sim_outbound` rows whose `run_id` is an eval run or whose `phone_e164` belongs to
+        a member of an eval household (`channel_identities` → `household_members`). Then
+        `mock_stock`, `mock_orders`, `mock_deliveries` and `mock_events` with
+        `env='eval'`.
+    *   **Kept:** `agent_traces`, which evals read by `run_id`, and `inbound_messages`,
+        which have no foreign keys.
+    *   **Re-seed:** in the same transaction, `reset` inserts the rows from
+        `services.seed.mock_stock_rows(env="eval")`. That is a pure function over the
+        seed data files (item 55), returning `(env, agent_id, sku, qty)` tuples. The
+        seed's own stock writer uses it too, so the two never drift. identity-authz step
+        9 widens this to the seed's whole eval part.
 *   The deploy scenario test also uses `eval` households. The nightly eval run does nothing
     while `/opt/app/DEPLOY_FREEZE` exists.
 
@@ -1472,6 +1492,9 @@ provisional shapes in §13 are enough to start every step in mock mode.
         others).
     *   `vendor_key(key: str) -> str` returns `str(uuid5(KEY_NAMESPACE, key))`.
         `KEY_NAMESPACE` is a fixed UUID constant in this file.
+*   **Amended 2026-11-02 (retry prompt, #36).** `retry_prompt_id(run_id: UUID) -> UUID`
+    returns `uuid5(run_id, "retry_prompt")`, the `message_id` of a run's retry prompt
+    (item 24).
 
 ##### 5. `services/common/modes.py` (Create)
 
@@ -1482,6 +1505,10 @@ provisional shapes in §13 are enough to start every step in mock mode.
     *   `resolve_modes(conn) -> dict[str, Literal["real", "mock"]]` applies the precedence
         in §5. `kroger_ordering` is always `mock`.
     *   `adapter_for(vendor, run_modes)` returns the real or mock adapter class.
+*   **Amended 2026-11-02 (mock events, #47).** Until a vendor's real adapter exists (build
+    step 7), `adapter_for` raises `AdapterFailure("adapter_not_configured",
+    retryable=False)` when that vendor resolves to `real`. It never falls back to the mock
+    (Alternative R).
 
 ##### 6. `services/common/money.py` (Create)
 
@@ -1917,6 +1944,24 @@ and values; none of these may be renamed or dropped.
         last 24 h if it ended `error` or `timeout`. It returns `None` if that run's order
         reached `placed`, and the caller then sends the "already placed" reply.
 *   **Amended 2026-11-01 (identity-authz I-A6, I-A16).** `start` refuses a household with no active household grant, except `kind IN ('hello','a2a_demo')` and runs with no household, and records the run's token source (`mock` for eval households). `finish(reason='grant_revoked')` sets the run's orders that are before `placed` to `failed` (identity-authz I39).
+*   **Amended 2026-11-02 (retry prompt, #36).** This settles how `finish()` sends the
+    retry prompt.
+    *   **When.** `finish()` sends it when it changes the run to `error` or `timeout`,
+        except for `a2a_demo` runs and for a reason in `NO_RETRY_PROMPT =
+        {"delivery_failed", "nothing_to_deliver", "no_offers"}`, a constant in this module.
+        For those reasons, the caller sends the message from §9 or agent-protocol §12. A
+        `finish()` that changes nothing sends nothing.
+    *   **Sender.** The prompt is always sent from `system:runs` (§3), never from the
+        `agent_id` passed in. That `agent_id` can be a seller's id from the poison rule,
+        which `whatsapp_out` refuses (agent-protocol §5 row 20). `agent_id` is still used
+        for the outcome trace row.
+    *   **Message.** `outbox.send(conn, message_id=ids.retry_prompt_id(run_id), run_id,
+        conversation_id=None, causation_id=None, from_agent="system:runs",
+        to_agent="channel:whatsapp", type="whatsapp_out", body={user_id:
+        <runs.trigger.user_id>, template: "retry_prompt", params: {}, buttons: []})`, in
+        the same transaction as the outcome. The template's text is §9's: "I couldn't
+        finish this. Reply *retry* to try again." The user replies with text, so there
+        are no buttons.
 
 ##### 25. `services/common/orders.py` (Create)
 
@@ -2286,6 +2331,27 @@ and values; none of these may be renamed or dropped.
 *   **Proposed Changes**: Stock, pricing and order placement over `mock_*` rows for the
     call's `env`. They apply active `mock_events` for that `env` (out of stock, kitchen
     overloaded, adapter down). Orders are idempotent on `idempotency_key`.
+*   **Amended 2026-11-02 (mock events, #47).** These rules define the events and stock:
+    *   **Available quantity** of a SKU is `mock_stock.qty`, or 0 while an active
+        `out_of_stock` event for that SKU (`params: {sku}`) targets the card. `quote`
+        marks a line unavailable when the available quantity is below the requested
+        `qty`.
+    *   **`place_order`** decrements `mock_stock.qty` for each line, conditionally
+        (`qty >= requested`), in the same transaction as the `mock_orders` insert. If any
+        line can't be filled, it raises `AdapterFailure("out_of_stock",
+        retryable=False)` and changes nothing. A replay with the same `idempotency_key`
+        returns the stored order and decrements nothing. `eval` stock is restored by
+        `/panel/reset` (§7). `live` stock is restored by `make seed`, which every deploy
+        runs.
+    *   **`kitchen_overloaded`** (restaurant cards, no params): `quote` and `place_order`
+        raise `AdapterFailure("kitchen_overloaded", retryable=False)`. `search_items`
+        still works. The handler treats it as a 4xx (§9: unavailable for this run).
+    *   **`adapter_down`** (any store or restaurant card, no params): every tool of that
+        card's adapter raises `AdapterFailure("adapter_5xx", retryable=True)`. The
+        client retries once with the same key (§9), and then the seller is unavailable
+        for this run.
+    *   An event applies only to the card in `target_agent_id` and to rows with the
+        call's `env`.
 
 ##### 46. `services/mocks/courier.py` (Create)
 
@@ -2297,6 +2363,36 @@ and values; none of these may be renamed or dropped.
         `next_state_at`. Each step lasts `MOCK_COURIER_STEP_SECONDS` (default 20), plus the
         delay of any active `courier_delayed` event.
     *   Each change is posted to `api` `/internal/delivery-status`.
+*   **Amended 2026-11-02 (mock courier, #48).** These rules define the quote, the batch
+    join, delays and status posting:
+    *   **Rules.** Each courier card has `business_rules` kind `delivery` = `{fee_minor,
+        slot_minutes, slot_capacity}` (item 55). The mock reads it on every quote and
+        booking.
+    *   **`quote_delivery(order_id, zone_id, window)`** returns `{price_minor, currency,
+        windows: [Window]}`. `price_minor` is `fee_minor` and `currency` is the card's.
+        `windows` splits the requested window into back-to-back slots of
+        `slot_minutes`, starting at `window.start`, keeping only whole slots inside the
+        window. It drops any slot that already overlaps `slot_capacity` `booked`
+        `mock_deliveries` rows with the same `env`, `agent_id` and `zone_id`. The list is
+        in start order and can be empty. `choose_window` picks from this list, with the
+        first slot as its default. The quote's `expires_at` is set by the handler
+        (`COURIER_QUOTE_TTL_SECONDS`), not by the adapter.
+    *   **Booking.** `external_delivery_id = vendor_key(key)`. A new booking joins a batch
+        only from rows with `state='booked'` and the same `env`, `agent_id` and
+        `zone_id`, whose window overlaps its own. It takes the earliest such row's
+        `batch_id`, and it keeps its own window and its own progression. If there is no
+        such row, `batch_id = ids.mock_batch_id(external_delivery_id)`, a new helper in
+        `services/common/ids.py` (item 4) that returns `uuid5(UUID(external_delivery_id),
+        "batch")`.
+    *   **`courier_delayed`.** `params: {delay_seconds: int > 0}`, matched on
+        `target_agent_id = mock_deliveries.agent_id` and `env`. When several events are
+        active, the largest `delay_seconds` applies. It is added to each step's
+        `MOCK_COURIER_STEP_SECONDS`.
+    *   **Status posts.** Each change posts `{external_delivery_id, status: <new state>,
+        event_id: f"{external_delivery_id}:{state}"}`. `mock_deliveries.state` and
+        `next_state_at` change only after a 2xx. On any other result, the loop logs it and
+        retries the same post on its next tick. Repeats are harmless, because
+        `apply_delivery_status` only moves forward.
 
 ##### 47. `services/mocks/control.py` (Create)
 
@@ -2305,6 +2401,8 @@ and values; none of these may be renamed or dropped.
     `reset(conn, env)`, `inject_event(...)`, `set_mode(vendor, mode)`,
     `expire_approval(approval_id)`. `reset` re-seeds `eval` mock stock from the seed data
     files.
+*   **Amended 2026-11-02 (reset scope, #50).** `reset` follows the §7 rule (deletion order,
+    `shortfalls`, `sim_outbound` by eval phone, and the `mock_stock_rows("eval")` re-seed).
 
 ##### 48. `services/mocks/panel.py` (Keep)
 
@@ -2348,6 +2446,31 @@ and values; none of these may be renamed or dropped.
     *   `check_approver(conn, household_id, user_id) -> None` raises `WrongApprover`.
     *   `check_coverage(card, zone_id)` and `check_window(card, window)`.
 *   **Amended 2026-11-01 (identity-authz I-A5, I-A10).** `check_approval_needed` replaces the budget part of `check_budget` (band or budget, one approval); `check_household_grant` is added for `place_order` (identity-authz I20).
+*   **Amended 2026-11-02 (limits, #44).** This settles the window rule, the knowledge
+    interface and the refusal reasons.
+    *   **Window.** `check_window(window, now) -> None` raises `OutsideWindow` unless
+        `window.start < window.end` and `window.end > now`. `window` is the protocol
+        `Window` (timezone-aware `start` and `end`). Per-card hours and capacity are not
+        checked here. They wait for the adapters design (§13), which defines their
+        `business_rules` shape. Until then, they apply only through the courier's own
+        quote and `choose_window`.
+    *   **Coverage.** `check_coverage(card, zone_id)` raises `OutOfZone` unless
+        `zone_id in card.zone_ids`.
+    *   **Knowledge.** `knowledge` is the `Knowledge` protocol of item 44
+        (`services/mcp/knowledge/adapters/neo4j_knowledge.py`). `check_allergens` calls
+        `knowledge.check_allergens(skus, codes)` with every member's allergen codes, and
+        skips the call when there are none. The first hit raises `AllergenConflict(sku,
+        code)`. When `hits` is empty, the first of `unknown_skus` raises
+        `AllergenUnknown(sku)`, because an unchecked SKU is never treated as
+        allergen-free. Any exception from the call raises `KnowledgeUnavailable`.
+    *   **Budget coverage.** An order is covered when it has an `approved` approval with
+        `amount_minor >= total` (§5: a re-quoted offer at or below the approved total).
+    *   **Currency.** `authorize_spend` raises `CurrencyMismatch` when the total's
+        currency differs from `orders.currency` (§5).
+    *   **Reasons.** Each exception subclasses `GuardRefused`, with reasons
+        `needs_approval`, `wrong_approver`, `allergen_conflict`, `allergen_unknown`,
+        `knowledge_unavailable`, `currency_mismatch`, `out_of_zone`, `outside_window`
+        and `a2a_demo_order` (agent-protocol P28).
 
 ##### 52. `services/safety/addresses.py` (Create, critical)
 
@@ -2398,6 +2521,9 @@ and values; none of these may be renamed or dropped.
     *   `data/rules.yaml`: `business_rules` per business card. Mock and sandbox store floors are
         95% of list price, so the household stub's 90% counter is always below the floor
         total and the G11 floor eval exercises a real refusal.
+        *Amended 2026-11-02 (mock courier, #48):* courier cards have a `delivery` rule
+        instead of `floor_pct`: `delivery:mock-us` and `delivery:doordash-us` both get
+        `{fee_minor: 599, slot_minutes: 60, slot_capacity: 2}`.
     *   `data/catalog_mock.yaml` and `data/menu_mock.yaml`: items for `grocery:mock-us`,
         `grocery:square-us`, `restaurant:mock-us` and `restaurant:square-us`, including at
         least one item with `tree_nuts`.
@@ -2693,6 +2819,7 @@ and values; none of these may be renamed or dropped.
     *   `test_panel_override_beats_env` (*db*)
     *   `test_vendor_env_beats_global_mode`
     *   `test_kroger_ordering_always_mock`
+    *   `test_adapter_for_real_without_adapter_not_configured` (amended 2026-11-02, #47)
 *   `test_money.py`: `test_mixed_currency_raises`, `test_minor_unit_arithmetic`.
 *   `test_trace_store.py` (*db*):
     *   `test_write_takes_run_id_per_call`
@@ -2712,6 +2839,9 @@ and values; none of these may be renamed or dropped.
     *   `test_finish_writes_single_outcome`
     *   `test_second_finish_is_noop`
     *   `test_finish_error_sends_retry_prompt`
+    *   `test_finish_no_retry_reason_sends_no_prompt` (amended 2026-11-02, #36: each
+        `NO_RETRY_PROMPT` reason; a poison finish with a seller `agent_id` still sends the
+        prompt from `system:runs`)
     *   `test_retry_target_refused_after_placed`
     *   `test_retry_starts_new_run_with_retry_of`
 *   `test_sweeper.py` (*db*):
@@ -2759,6 +2889,10 @@ and values; none of these may be renamed or dropped.
     *   `test_allergen_item_rejected`
     *   `test_knowledge_down_fails_closed`
     *   `test_out_of_zone_rejected`
+    *   Amended 2026-11-02 (#44): `test_unknown_sku_fails_closed`,
+        `test_window_must_end_in_future`, `test_authorize_spend_refuses_a2a_demo_order`
+        and `test_requote_within_approved_total_passes`. agent-protocol's and
+        identity-authz's tests of the same behavior keep their own files and names.
 *   `test_addresses.py` (*db*):
     *   `test_resolve_requires_delivery_agent_of_order`
     *   `test_data_share_row_has_no_address_fields`
@@ -2774,6 +2908,7 @@ and values; none of these may be renamed or dropped.
 *   `test_panel_reset.py` (*db*):
     *   `test_reset_eval_leaves_live_rows`
     *   `test_reset_live_refused`
+    *   `test_reset_eval_after_shortfall_succeeds` (amended 2026-11-02, #50)
 *   `test_directory.py` (*db*):
     *   `test_find_filters_zone_region_currency`
     *   `test_disabled_cards_excluded`
@@ -2814,12 +2949,17 @@ against every adapter of that interface:
     *   `test_search_shape`
     *   `test_place_order_idempotent`
     *   `test_out_of_stock_event_respected` (mock only)
+    *   `test_place_order_decrements_stock_once` (mock only; amended 2026-11-02, #47)
+    *   `test_adapter_down_event_is_retryable_5xx` (mock only; amended 2026-11-02, #47)
 *   `restaurant` (Square restaurant, mock restaurant):
     *   `test_place_order_idempotent`
     *   `test_capacity_event_respected` (mock only)
 *   `delivery` (DoorDash Drive, mock courier):
     *   `test_book_delivery_idempotent`
     *   `test_status_progression`
+    *   Amended 2026-11-02 (#48), mock only: `test_quote_windows_respect_slot_capacity`,
+        `test_booking_joins_overlapping_booked_batch`, `test_courier_delayed_largest_wins`,
+        `test_state_advances_only_after_status_post`.
     *   `test_result_has_no_address`
 
 **Smoke**: the existing tests with updated URLs, plus `test_internal_routes_not_public`.

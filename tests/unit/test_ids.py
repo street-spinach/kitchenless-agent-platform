@@ -29,6 +29,14 @@ def test_idempotency_key_rejects_missing_parts(order_id, action, agent) -> None:
         ids.idempotency_key(order_id, action, agent)
 
 
+def test_seed_ids_are_deterministic_and_distinct() -> None:
+    assert ids.seed_user_id("us-1-a") == ids.seed_user_id("us-1-a")
+    assert ids.seed_user_id("us-1-a") != ids.seed_user_id("us-1-a-eval")
+    assert ids.seed_address_ref("us-1") != ids.seed_address_ref("us-2")
+    with pytest.raises(ValueError):
+        ids.seed_user_id("")
+
+
 def test_idempotency_key_scope_appended() -> None:
     quote = uuid4()
     base = ids.idempotency_key(ORDER, "authorize_spend", "household:h1")

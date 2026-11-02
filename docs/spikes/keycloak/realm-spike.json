@@ -1,0 +1,18 @@
+{
+  "realm": "kitchenless",
+  "enabled": true,
+  "accessTokenLifespan": 300,
+  "offlineSessionIdleTimeout": 2592000,
+  "offlineSessionMaxLifespanEnabled": true,
+  "offlineSessionMaxLifespan": 2592000,
+  "users": [
+    {
+      "id": "11111111-1111-4111-8111-111111111111",
+      "username": "us-1.1",
+      "realmRoles": ["default-roles-kitchenless"],
+      "enabled": true,
+      "firstName": "Asha",
+      "lastName": "Spike"
+    }
+  ]
+}

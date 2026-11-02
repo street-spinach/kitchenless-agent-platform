@@ -1,0 +1,59 @@
+# Seeded agent cards (architecture item 55, §3 launch roster; agent-protocol §2, P34).
+# Household and consumer cards are built from households.yaml: `household:<household_id>`
+# and `consumer:<member_id>`. Business cards are shared by the live and eval households.
+
+organizations:
+  - {org_id: kroger-us, name: Kroger (US)}
+  - {org_id: square-grocery-us, name: Square Sandbox Grocery}
+  - {org_id: mock-grocery-us, name: Mock Grocery US}
+  - {org_id: square-restaurant-us, name: Square Sandbox Kitchen}
+  - {org_id: mock-restaurant-us, name: Mock Kitchen US}
+  - {org_id: doordash-us, name: DoorDash Drive (US)}
+  - {org_id: mock-courier-us, name: Mock Courier US}
+
+# Every business card covers zone us-oh-45202 and gets `config.description` and
+# `config.card_version` (P34; agent-protocol §4 default "1.0.0").
+business:
+  - agent_id: grocery:kroger-us
+    owner: kroger-us
+    vendor: kroger
+    description: Kroger grocery store. Real catalog, mock ordering.
+    # config.location_id is read from KROGER_LOCATION_ID at seed time.
+    location_id_from_env: KROGER_LOCATION_ID
+  - agent_id: grocery:square-us
+    owner: square-grocery-us
+    vendor: square
+    description: Grocery store on the Square sandbox.
+  - agent_id: grocery:mock-us
+    owner: mock-grocery-us
+    vendor: mock
+    description: Mock grocery store for demos and evals.
+  - agent_id: restaurant:square-us
+    owner: square-restaurant-us
+    vendor: square
+    description: Restaurant on the Square sandbox.
+  - agent_id: restaurant:mock-us
+    owner: mock-restaurant-us
+    vendor: mock
+    description: Mock restaurant for demos and evals.
+  - agent_id: delivery:doordash-us
+    owner: doordash-us
+    vendor: doordash
+    description: Courier on the DoorDash Drive sandbox.
+  - agent_id: delivery:mock-us
+    owner: mock-courier-us
+    vendor: mock
+    description: Mock courier for demos and evals.
+
+business_defaults:
+  region: us
+  zone_ids: [us-oh-45202]
+  currency: USD
+  card_version: "1.0.0"
+
+system:
+  - {agent_id: "channel:whatsapp", class: channel, host_process: api, owner_ref: system,
+     region: us}
+  # Agent-protocol P34 and §2: the one outside caller. Never returned by directory.find.
+  - {agent_id: "external:a2a-demo", class: external, host_process: external,
+     owner_ref: system, region: us}

@@ -1,0 +1,31 @@
+# Restaurant menus for the mock-backed restaurants (architecture item 55). Prices in USD
+# minor units. Every SKU has a product in off_subset.json with the same allergens.
+
+menus:
+  restaurant:mock-us:
+    - {sku: MOCK-DIN-CHICKEN-RICE, name: Grilled chicken and rice bowl,
+       ingredients: chicken rice vegetables, allergens: [], diets: [high_protein],
+       price_minor: 1299}
+    - {sku: MOCK-DIN-VEG-PASTA, name: Vegetable penne,
+       ingredients: penne pasta tomato vegetables, allergens: [gluten],
+       diets: [vegetarian, vegan], price_minor: 1149}
+    - {sku: MOCK-DIN-PESTO-PASTA, name: Pesto penne with pine nuts,
+       ingredients: penne pasta basil pine nuts parmesan, allergens: [gluten, milk, tree_nuts],
+       diets: [vegetarian], price_minor: 1349}
+    - {sku: MOCK-DIN-SALMON, name: Baked salmon with greens,
+       ingredients: salmon greens lemon, allergens: [fish], diets: [pescatarian, high_protein],
+       price_minor: 1699}
+    - {sku: MOCK-DIN-KIDS-MAC, name: Kids mac and cheese,
+       ingredients: macaroni cheese milk, allergens: [gluten, milk], diets: [vegetarian],
+       price_minor: 799}
+
+  restaurant:square-us:
+    - {sku: SQ-DIN-BURRITO, name: Bean burrito, ingredients: tortilla beans rice salsa,
+       allergens: [gluten], diets: [vegetarian, vegan], price_minor: 1099}
+    - {sku: SQ-DIN-CHICKEN-SALAD, name: Chicken salad, ingredients: chicken greens dressing,
+       allergens: [eggs], diets: [high_protein], price_minor: 1249}
+    - {sku: SQ-DIN-SATAY, name: Chicken satay with cashew sauce,
+       ingredients: chicken cashews soy sauce, allergens: [tree_nuts, soy],
+       diets: [high_protein], price_minor: 1449}
+    - {sku: SQ-DIN-PIZZA, name: Margherita pizza, ingredients: wheat dough tomato mozzarella,
+       allergens: [gluten, milk], diets: [vegetarian], price_minor: 1399}
