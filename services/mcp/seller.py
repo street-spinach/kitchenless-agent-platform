@@ -17,8 +17,9 @@
     `shortfalls.status = 'applied'`.
 
 Only cards of the server's class may call its tools. Each tool picks its adapter from the
-card's vendor: a `mock` card always uses the area's mock adapter; any other vendor goes
-through `modes.adapter_for(vendor, ctx.modes)`, which never falls back to the mock.
+card's vendor key, `vendors.card_vendor_key(area, card, tool)`: a `mock` card (`None`)
+always uses the area's mock adapter; any other key goes through
+`modes.adapter_for(key, ctx.modes)`, which never falls back to the mock.
 """
 
 import json
@@ -34,10 +35,10 @@ from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 from pydantic import BaseModel
 
-from services.common import db, directory, ids, modes, orders
+from services.common import db, directory, ids, modes, orders, vendors
 from services.common.directory import AgentCard
 from services.common.protocol.schemas import AllergenCode, DietCode, Minor, Qty
-from services.mcp.meta import AdapterFailure, CallContext, tool_error, tool_errors
+from services.mcp.meta import CallContext, tool_error, tool_errors
 from services.mcp.traced import Tool, traced
 from services.safety import limits
 from services.safety.guard import GuardRefused, run_guarded
@@ -106,23 +107,14 @@ class QuoteItem(BaseModel):
 
 @dataclass(frozen=True)
 class SellerTools:
-    """The three seller tools of one area, bound to its mock adapter and vendor keys.
-
-    `vendor_keys` maps a card's `vendor` to the `modes` vendor key of each tool.
-    """
+    """The seller tools of one area, bound to its mock adapter."""
 
     area: str
     mock_adapter: type[Any]
-    vendor_keys: Mapping[str, Mapping[str, str]]
 
     def adapter(self, card: AgentCard, tool: str, ctx: CallContext) -> SellerAdapter:
-        if card.vendor == "mock":
-            cls = self.mock_adapter
-        else:
-            vendor = self.vendor_keys.get(card.vendor or "", {}).get(tool)
-            if vendor is None:
-                raise AdapterFailure(modes.NOT_CONFIGURED, retryable=False)
-            cls = modes.adapter_for(vendor, ctx.modes)
+        key = vendors.card_vendor_key(self.area, card, tool)
+        cls = self.mock_adapter if key is None else modes.adapter_for(key, ctx.modes)
         return cls(card, ctx.env)
 
     async def seller_card(self, ctx: CallContext) -> AgentCard:

@@ -1,12 +1,13 @@
 """Runs: one start and exactly one outcome (architecture item 24 and §10, amended by A13 and
 for #36; agent-protocol P14).
 
-`start` inserts the `runs` row with its modes pinned, writes `run_start` and creates the
-`run_timeout` timer. `finish` is the only writer of `outcome`: the first call that moves the
-run out of `running`/`awaiting_approval` wins, and every later call changes nothing. When
-that call ends the run with `error` or `timeout`, it also sends the retry prompt from
-`system:runs`, in the same transaction, unless the run is `a2a_demo` or the reason is in
-`NO_RETRY_PROMPT` (those callers send their own message).
+`start` inserts the `runs` row with its modes pinned (all `mock` for an `eval` household,
+adapters §3), writes `run_start` and creates the `run_timeout` timer. `finish` is the only
+writer of `outcome`: the first call that moves the run out of `running`/`awaiting_approval`
+wins, and every later call changes nothing. When that call ends the run with `error` or
+`timeout`, it also sends the retry prompt from `system:runs`, in the same transaction,
+unless the run is `a2a_demo` or the reason is in `NO_RETRY_PROMPT` (those callers send
+their own message).
 
 `pause_timeout` and `resume_timeout` stop and restart `run_timeout` around an approval
 (architecture §4 timer table; #63).
@@ -21,7 +22,7 @@ from psycopg.types.json import Jsonb
 
 from services.common import ids, outbox
 from services.common.config import get_settings
-from services.common.modes import resolve_modes
+from services.common.modes import pin_for_env, resolve_modes
 from services.common.outbox import _on_behalf_of
 from services.common.trace import TraceStore
 
@@ -111,7 +112,13 @@ async def start(
         settings.a2a_demo_timeout_seconds if kind == A2A_DEMO else settings.run_timeout_seconds
     )
     async with conn.transaction():
-        modes = await resolve_modes(conn)
+        # An eval household's run never reaches a real vendor (adapters §3). A run with no
+        # household counts as `live`, as `CallContext.from_meta` does.
+        cur = await conn.execute(
+            "SELECT env FROM households WHERE household_id = %s", (household_id,)
+        )
+        row = await cur.fetchone()
+        modes = pin_for_env(await resolve_modes(conn), row[0] if row else "live")
         cur = await conn.execute(
             _INSERT_RUN_SQL, (run_id, household_id, kind, Jsonb(trigger), Jsonb(modes))
         )
