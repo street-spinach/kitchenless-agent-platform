@@ -87,6 +87,17 @@ def test_vendor_env_beats_global_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     assert resolved["kroger_catalog"] == "real"
 
 
+def test_empty_vendor_env_uses_global_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Compose passes an unset MODE_<VENDOR> as "" (infra/docker-compose.yml); the deploy
+    # seed failed with "MODE_SQUARE_RESTAURANT must be 'real' or 'mock', got ''".
+    empty = {f"MODE_{v.upper()}": "" for v in VENDORS}
+    _use_env(monkeypatch, MODE="mock", **empty)
+
+    resolved = _resolve(_FakeConn())
+
+    assert resolved == {v: "mock" for v in VENDORS}
+
+
 def test_kroger_ordering_always_mock(monkeypatch: pytest.MonkeyPatch) -> None:
     _use_env(monkeypatch, MODE="real", MODE_KROGER_ORDERING="real")
 
