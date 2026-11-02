@@ -103,6 +103,16 @@ def test_shortfall_id_one_per_order() -> None:
     assert ids.shortfall_conversation_id(sf) == uuid5(sf, "conversation")
 
 
+def test_order_status_id_one_per_order_state() -> None:
+    sent = ids.order_status_id(ORDER, "in_delivery")
+    assert sent == ids.order_status_id(ORDER, "in_delivery")
+    assert sent == uuid5(ORDER, "order_status|in_delivery")
+    assert sent != ids.order_status_id(ORDER, "delivered")
+    assert sent != ids.order_status_id(uuid4(), "in_delivery")
+    with pytest.raises(ValueError):
+        ids.order_status_id(ORDER, "")
+
+
 def test_a2a_message_id_namespaced_by_sender() -> None:
     a = ids.a2a_message_id("external:a2a-demo", "m-1")
     assert a == ids.a2a_message_id("external:a2a-demo", "m-1")

@@ -96,6 +96,13 @@ def shortfall_conversation_id(shortfall_id: UUID) -> UUID:
     return uuid5(shortfall_id, "conversation")
 
 
+def order_status_id(order_id: UUID, state: str) -> UUID:
+    """`message_id` of the `order_status` sent when a courier event moves `order_id` to
+    `state` (architecture item 37). An order enters each state at most once, so a repeated
+    courier event reuses the id and sends nothing new."""
+    return uuid5(order_id, f"order_status|{_require('state', state)}")
+
+
 def protocol_error_id(refused_message_id: UUID) -> UUID:
     """Id of the `protocol_error` sent back for a refused message."""
     return uuid5(refused_message_id, "protocol_error")

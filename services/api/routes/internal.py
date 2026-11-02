@@ -1,6 +1,7 @@
-"""Internal routes for the simulated WhatsApp channel (architecture item 35).
+"""Internal routes: the simulated WhatsApp channel and the mock courier's status posts
+(architecture item 35).
 
-Caddy does not route `/internal/*`. `POST /internal/delivery-status` belongs to #58.
+Caddy does not route `/internal/*`.
 """
 
 from typing import Any
@@ -11,6 +12,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from services.api.ingest import Content, ingest
+from services.api.routes.delivery import UnknownStatus, apply_delivery_status
 
 __all__ = ["SIM_CHANNEL", "routes"]
 
@@ -101,7 +103,31 @@ async def sim_outbox(request: Request) -> JSONResponse:
     )
 
 
+async def delivery_status(request: Request) -> JSONResponse:
+    """`{external_delivery_id, status, event_id}` from the mock courier (item 46).
+
+    Repeats are harmless because `apply_delivery_status` only moves forward, so the post is
+    not deduplicated. A known delivery always gets a 2xx, even when nothing changes, so the
+    mock courier moves on; an unknown delivery gets 404.
+    """
+    body = await _json_object(request)
+    if body is None:
+        return _error(400, "the body must be a JSON object")
+    edi, status, event_id = (body.get(k) for k in ("external_delivery_id", "status", "event_id"))
+    if not all(isinstance(v, str) and v for v in (edi, status, event_id)):
+        return _error(400, "external_delivery_id, status and event_id are required strings")
+    async with request.app.state.connect() as conn:
+        try:
+            result = await apply_delivery_status(conn, edi, status)
+        except UnknownStatus:
+            return _error(400, f"unknown courier status {status!r}")
+    if result == "unknown_delivery":
+        return _error(404, "no order has this delivery")
+    return JSONResponse({"result": result})
+
+
 routes = [
     Route("/internal/sim/whatsapp", sim_whatsapp, methods=["POST"]),
     Route("/internal/sim/outbox", sim_outbox, methods=["GET"]),
+    Route("/internal/delivery-status", delivery_status, methods=["POST"]),
 ]
