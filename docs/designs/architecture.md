@@ -456,7 +456,7 @@ Later designs use these identifiers and must not redefine them.
 
 | Identifier | Format | Created by | Notes |
 |---|---|---|---|
-| `agent_id` | `<class>:<instance>`, for example `household:us-1`, `grocery:square-us`. Non-agent senders: `channel:whatsapp`, `system:sweeper`, `system:api` | Seed script (`agent_cards`) | Matches the format `evals/checks.py` already uses. It is the address messages are sent to. |
+| `agent_id` | `<class>:<instance>`, for example `household:us-1`, `grocery:square-us`. Non-agent senders: `channel:whatsapp`, `system:sweeper`, `system:api`, `system:runs` (the retry prompt, item 24) | Seed script (`agent_cards`) | Matches the format `evals/checks.py` already uses. It is the address messages are sent to. |
 | `run_id` | UUID | `runs.start()`, called by `api` when a trigger arrives (a WhatsApp message or `POST /runs`) | Required in every agent message, MCP call and trace row. Stored on `orders`. Business agents adopt the requester's `run_id`. |
 | `thread_id` | `<agent_id>:<run_id>` | Agent host | The LangGraph checkpoint key for consumer and household agents. One thread per agent per run, never one per agent overall. Business handlers have no thread. |
 | `conversation_id` | UUID | The agent that opens an exchange, for example one household-to-store negotiation | Used only to correlate messages. Not a state key. |
@@ -1472,6 +1472,9 @@ provisional shapes in §13 are enough to start every step in mock mode.
         others).
     *   `vendor_key(key: str) -> str` returns `str(uuid5(KEY_NAMESPACE, key))`.
         `KEY_NAMESPACE` is a fixed UUID constant in this file.
+*   **Amended 2026-11-02 (retry prompt, #36).** `retry_prompt_id(run_id: UUID) -> UUID`
+    returns `uuid5(run_id, "retry_prompt")`, the `message_id` of a run's retry prompt
+    (item 24).
 
 ##### 5. `services/common/modes.py` (Create)
 
@@ -1917,6 +1920,24 @@ and values; none of these may be renamed or dropped.
         last 24 h if it ended `error` or `timeout`. It returns `None` if that run's order
         reached `placed`, and the caller then sends the "already placed" reply.
 *   **Amended 2026-11-01 (identity-authz I-A6, I-A16).** `start` refuses a household with no active household grant, except `kind IN ('hello','a2a_demo')` and runs with no household, and records the run's token source (`mock` for eval households). `finish(reason='grant_revoked')` sets the run's orders that are before `placed` to `failed` (identity-authz I39).
+*   **Amended 2026-11-02 (retry prompt, #36).** This settles how `finish()` sends the
+    retry prompt.
+    *   **When.** `finish()` sends it when it changes the run to `error` or `timeout`,
+        except for `a2a_demo` runs and for a reason in `NO_RETRY_PROMPT =
+        {"delivery_failed", "nothing_to_deliver", "no_offers"}`, a constant in this module.
+        For those reasons, the caller sends the message from §9 or agent-protocol §12. A
+        `finish()` that changes nothing sends nothing.
+    *   **Sender.** The prompt is always sent from `system:runs` (§3), never from the
+        `agent_id` passed in. That `agent_id` can be a seller's id from the poison rule,
+        which `whatsapp_out` refuses (agent-protocol §5 row 20). `agent_id` is still used
+        for the outcome trace row.
+    *   **Message.** `outbox.send(conn, message_id=ids.retry_prompt_id(run_id), run_id,
+        conversation_id=None, causation_id=None, from_agent="system:runs",
+        to_agent="channel:whatsapp", type="whatsapp_out", body={user_id:
+        <runs.trigger.user_id>, template: "retry_prompt", params: {}, buttons: []})`, in
+        the same transaction as the outcome. The template's text is §9's: "I couldn't
+        finish this. Reply *retry* to try again." The user replies with text, so there
+        are no buttons.
 
 ##### 25. `services/common/orders.py` (Create)
 
@@ -2712,6 +2733,9 @@ and values; none of these may be renamed or dropped.
     *   `test_finish_writes_single_outcome`
     *   `test_second_finish_is_noop`
     *   `test_finish_error_sends_retry_prompt`
+    *   `test_finish_no_retry_reason_sends_no_prompt` (amended 2026-11-02, #36: each
+        `NO_RETRY_PROMPT` reason; a poison finish with a seller `agent_id` still sends the
+        prompt from `system:runs`)
     *   `test_retry_target_refused_after_placed`
     *   `test_retry_starts_new_run_with_retry_of`
 *   `test_sweeper.py` (*db*):
