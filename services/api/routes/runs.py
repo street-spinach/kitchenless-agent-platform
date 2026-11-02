@@ -4,6 +4,10 @@ A21 and P32). Internal: the eval runner and the control panel call them.
 A run is started by `ingest` with a simulated message from the household's first member,
 so it follows the same path as a WhatsApp message. Only the allowed `overrides` are stored,
 in `runs.trigger.overrides`; any other key refuses the request.
+
+`GET /runs/{run_id}` names the run's seller and courier with
+`vendors.vendor_label(area, card, org_name, runs.modes).text` (adapters §6), or `null`
+while the run's order has none.
 """
 
 import uuid
@@ -16,7 +20,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from services.api.ingest import Content, ingest
-from services.common import ids
+from services.common import directory, ids, vendors
 
 __all__ = ["ALLOWED_OVERRIDES", "RUNS_CHANNEL", "SCENARIOS", "routes"]
 
@@ -55,6 +59,15 @@ _OUTCOME_SQL = """
 SELECT payload->>'summary' AS summary FROM agent_traces
 WHERE run_id = %s AND kind = 'outcome' ORDER BY seq DESC LIMIT 1
 """
+
+
+# The run's latest order: its seller and courier cards (adapters §6).
+_ORDER_SQL = """
+SELECT seller_agent_id, delivery_agent_id FROM orders
+WHERE run_id = %s ORDER BY created_at DESC, order_id LIMIT 1
+"""
+
+_ORG_NAME_SQL = "SELECT name FROM organizations WHERE 'org:' || org_id = %s"
 
 
 class _Refused(Exception):
@@ -122,6 +135,19 @@ async def _start(
     return started
 
 
+async def _label(
+    conn: AsyncConnection, agent_id: str | None, run_modes: dict[str, str] | None
+) -> str | None:
+    """The label text of card `agent_id` in a run pinned to `run_modes` (adapters §6)."""
+    if agent_id is None:
+        return None
+    card = await directory.card(conn, agent_id)
+    cur = await conn.execute(_ORG_NAME_SQL, (card.owner_ref,))
+    org = await cur.fetchone()
+    org_name = org[0] if org else card.owner_ref
+    return vendors.vendor_label(card.agent_class, card, org_name, run_modes or {}).text
+
+
 async def start_run(request: Request) -> JSONResponse:
     """`{scenario, household_id, input, overrides?}` returns `{run_id}`."""
     try:
@@ -155,24 +181,30 @@ async def start_run(request: Request) -> JSONResponse:
 
 
 async def get_run(request: Request) -> JSONResponse:
-    """Status, reason and outcome summary."""
+    """Status, reason, outcome summary, and the seller and courier labels."""
     try:
         run_id = uuid.UUID(request.path_params["run_id"])
     except ValueError:
         return _error(404, "unknown run")
     async with request.app.state.connect() as conn, conn.cursor(row_factory=dict_row) as cur:
-        await cur.execute("SELECT status, reason FROM runs WHERE run_id = %s", (run_id,))
+        await cur.execute("SELECT status, reason, modes FROM runs WHERE run_id = %s", (run_id,))
         run = await cur.fetchone()
         if run is None:
             return _error(404, "unknown run")
         await cur.execute(_OUTCOME_SQL, (run_id,))
         outcome = await cur.fetchone()
+        await cur.execute(_ORDER_SQL, (run_id,))
+        order = await cur.fetchone() or {}
+        seller = await _label(conn, order.get("seller_agent_id"), run["modes"])
+        courier = await _label(conn, order.get("delivery_agent_id"), run["modes"])
     return JSONResponse(
         {
             "run_id": str(run_id),
             "status": run["status"],
             "reason": run["reason"],
             "summary": None if outcome is None else outcome["summary"],
+            "seller": seller,
+            "courier": courier,
         }
     )
 
