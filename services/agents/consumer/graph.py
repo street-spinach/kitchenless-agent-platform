@@ -12,6 +12,10 @@ A member's consumer agent is a LangGraph graph checkpointed under
 *   `constraints_request` → `answer_constraints_request` calls `/mcp/household
     get_constraints` for the member and returns `constraints`: allergen codes, diet codes and
     dislikes only (an intent-only summary, never the profile row).
+*   `shortfall_relay` → `relay_shortfall` (agent-protocol §10, P22): one `whatsapp_out` to
+    the member per missing line. The model writes the text; code builds the buttons: up to
+    2 substitutes and "Skip it", payloads `sf:<shortfall_id>:<line>:<sku>` and
+    `sf:<shortfall_id>:<line>:drop`.
 
 Nodes never write to Postgres. They put the step's outgoing messages (ids from
 `ids.message_id(<inbound message_id>, <ordinal>)`) and the run outcome in graph state, and
@@ -24,6 +28,7 @@ A tool refusal or outage (`ToolRefused`, `AdapterUnavailable`) and a model failu
 of the step: an ordinary step failure, retried and then poisoned (§4, §9).
 """
 
+import json
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -70,13 +75,35 @@ CHAT_REPLY_MAX_CHARS = 1000
 WHATSAPP = "channel:whatsapp"
 HOUSEHOLD_SERVER = "household"
 CONSTRAINTS_SCOPE = "constraints:read"
-HANDLED_TYPES = frozenset({"user_message", "constraints_request"})
+HANDLED_TYPES = frozenset({"user_message", "constraints_request", "shortfall_relay"})
+# The shortfall question (agent-protocol §10). WhatsApp allows 3 reply buttons of at most
+# 20 characters each: 2 substitutes and "Skip it".
+SHORTFALL_PROMPT_TEMPLATE = "shortfall_prompt"
+SHORTFALL_PREFIX = "sf:"
+MAX_SHORTFALL_SUBSTITUTES = 2
+SKIP_TITLE = "Skip it"
+BUTTON_TITLE_MAX_CHARS = 20
 
 CLASSIFY_PROMPT = (
     "Classify the member's message as exactly one of: weekly_order, dinner, chat. "
     "Answer with that one word."
 )
 REPLY_PROMPT = "Reply briefly and kindly to the member's message."
+SHORTFALL_PROMPT = (
+    "The store is out of one item of the member's order. In one short, friendly message, "
+    "say what is missing and ask the member to pick one of the substitutes or skip it. "
+    "Plain text only."
+)
+
+
+def shortfall_buttons(shortfall_id: str, line: Mapping[str, Any]) -> list[dict[str, str]]:
+    """Up to 2 substitute buttons and "Skip it" for one notice line (agent-protocol §10)."""
+    prefix = f"{SHORTFALL_PREFIX}{shortfall_id}:{int(line['line'])}:"
+    buttons = [
+        {"payload": prefix + str(s["sku"]), "title": str(s["name"])[:BUTTON_TITLE_MAX_CHARS]}
+        for s in list(line.get("substitutes") or [])[:MAX_SHORTFALL_SUBSTITUTES]
+    ]
+    return [*buttons, {"payload": prefix + "drop", "title": SKIP_TITLE}]
 
 
 class UnsupportedMessage(ValueError):
@@ -218,6 +245,37 @@ def build_graph(model: ModelClient, call_tool: CallTool, issue_token: IssueToken
         ).model_dump(mode="json")
         return {"outgoing": [_out(state, 0, state["from_agent"], "constraints", summary)]}
 
+    async def relay_shortfall(state: ConsumerState) -> dict[str, Any]:
+        body = state["body"]
+        shortfall_id = str(body["shortfall_id"])
+        out = []
+        for line in body["lines"]:
+            # The model sees only the missing item and its substitutes, never a profile.
+            facts = {
+                "missing": line["name"],
+                "qty": line["qty_missing"],
+                "substitutes": [s["name"] for s in line.get("substitutes") or []],
+            }
+            result = await model.complete(
+                _ctx(state),
+                [
+                    {"role": "system", "content": SHORTFALL_PROMPT},
+                    {"role": "user", "content": json.dumps(facts, sort_keys=True)},
+                ],
+                None,
+                "relay_shortfall",
+                state=facts,
+            )
+            text = (result.text or "").strip()[:CHAT_REPLY_MAX_CHARS]
+            notice = {
+                "user_id": state["member_user_id"],
+                "template": SHORTFALL_PROMPT_TEMPLATE,
+                "params": {"text": text},
+                "buttons": shortfall_buttons(shortfall_id, line),
+            }
+            out.append(_out(state, len(out), WHATSAPP, "whatsapp_out", notice))
+        return {"outgoing": out}
+
     def route_message(state: ConsumerState) -> str:
         return state["message_type"]
 
@@ -235,10 +293,15 @@ def build_graph(model: ModelClient, call_tool: CallTool, issue_token: IssueToken
     g.add_node("answer_constraints_request", mark_handled(answer_constraints_request))
     g.add_node("relay_to_household", mark_handled(relay_to_household))
     g.add_node("reply_to_user", mark_handled(reply_to_user))
+    g.add_node("relay_shortfall", mark_handled(relay_shortfall))
     g.add_conditional_edges(
         START,
         route_message,
-        {"user_message": "understand_message", "constraints_request": "answer_constraints_request"},
+        {
+            "user_message": "understand_message",
+            "constraints_request": "answer_constraints_request",
+            "shortfall_relay": "relay_shortfall",
+        },
     )
     g.add_conditional_edges(
         "understand_message",
@@ -248,6 +311,7 @@ def build_graph(model: ModelClient, call_tool: CallTool, issue_token: IssueToken
     g.add_edge("relay_to_household", END)
     g.add_edge("reply_to_user", END)
     g.add_edge("answer_constraints_request", END)
+    g.add_edge("relay_shortfall", END)
     return g
 
 

@@ -1,5 +1,5 @@
 """The grocery handler under the negotiation state machine (agent-protocol §7, P23; issue
-#56). The shortfall tests of P23 belong to #69.
+#56) and the shortfall (agent-protocol §10, P23; issue #69).
 
 Each test runs real steps through the consumer (claim, `protocol.check`, handler, final
 transaction) against Postgres, with stub choices and a fake seller MCP server.
@@ -176,6 +176,7 @@ class World:
                     call_tool=self.seller,
                     issue_token=lambda sub, act, scopes: f"token:{sub}:{act}",
                     offer_ttl_seconds=600,
+                    shortfall_reply_seconds=900,
                 )
 
                 async def handle(msg: c.Inbound) -> c.StepResult:
@@ -491,3 +492,201 @@ def test_a2a_rejected_quote_finishes_run_cancelled(pg: str) -> None:
     assert (q["status"], q["closed_by"]) == ("rejected", "buyer")
     [run] = w.query("SELECT status, reason FROM runs WHERE run_id = %s", (w.run_id,))
     assert (run["status"], run["reason"]) == ("cancelled", "a2a_demo_closed")
+
+
+# The shortfall (agent-protocol §10, P23; #69) ---------------------------------------------
+
+API = "system:api"
+MILK_2PCT = "MOCK-MILK-2PCT"
+ALMOND = "MOCK-MILK-ALMOND"
+EGGS = "MOCK-EGGS-12"
+
+
+def _courier_booked(w: World, items: list[tuple[str, int]], allergens: list[str]) -> None:
+    """The order placed from the accepted quote, its lines stored, the courier booked."""
+    w.request(items, constraints={"allergens": allergens, "diets": []})
+    w.authorize()
+    w.accept()
+    assert w.quote()["status"] == "accepted"
+    w.execute("UPDATE orders SET state = 'courier_booked' WHERE order_id = %s", (w.order_id,))
+    for line in w.quote()["items"]["lines"]:
+        w.execute(
+            "INSERT INTO order_items (order_id, line, sku, name, qty, unit_minor)"
+            " VALUES (%s, %s, %s, %s, %s, %s)",
+            (
+                w.order_id,
+                line["line"],
+                line["offered_sku"],
+                line["offered_name"],
+                line["qty"],
+                line["unit_minor"],
+            ),
+        )
+
+
+def _detect(w: World, skus: list[str]) -> uuid.UUID:
+    body = {"order_id": str(w.order_id), "skus": skus, "event_id": str(uuid.uuid4())}
+    return w.step("shortfall_detected", body, from_agent=API)
+
+
+def test_shortfall_substitutes_filtered_and_within_line_total(pg: str) -> None:
+    # The order line is 2 x 2% milk (399). The broader "milk" search finds whole milk
+    # (429, above the line's unit price) and almond milk (379, tree nuts).
+    w = World(pg)
+    _courier_booked(w, [("reduced fat milk", 2)], ["tree_nuts"])
+    before = datetime.now(UTC)
+    mid = _detect(w, [MILK_2PCT])
+
+    [notice] = w.sent("shortfall_notice", cause=mid)
+    shortfall_id = ids.shortfall_id(w.order_id)
+    assert notice["to_agent"] == HOUSEHOLD
+    assert notice["conversation_id"] == ids.shortfall_conversation_id(shortfall_id)
+    body = notice["body"]
+    assert body["shortfall_id"] == str(shortfall_id)
+    [line] = body["lines"]
+    assert (line["line"], line["sku"], line["qty_missing"], line["line_total_minor"]) == (
+        0,
+        MILK_2PCT,
+        2,
+        2 * 399,
+    )
+    # Almond milk is filtered by the household's codes, whole milk by the line total: the
+    # line is offered as drop only.
+    assert line["substitutes"] == []
+    reply_by = datetime.fromisoformat(body["reply_by"])
+    assert before + timedelta(seconds=900) <= reply_by
+    assert reply_by <= datetime.now(UTC) + timedelta(seconds=900)
+    # The search carries the codes saved on the accepted quote, never a profile.
+    search = w.seller.of("search_items")[-1]
+    assert search["args"]["query"] == "milk"
+    assert search["args"]["filters"]["allergen_codes"] == ["tree_nuts"]
+    ranks = [inputs for point, inputs in w.stubs.seen if point == "rank_substitutes"]
+    assert ranks[-1]["message"]["type"] == "shortfall_detected"
+
+
+def test_shortfall_substitute_offered_within_line_total(pg: str) -> None:
+    # Without the tree-nut code almond milk is offered; whole milk is still too dear. The
+    # run override `SHORTFALL_REPLY_SECONDS` sets `reply_by`.
+    w = World(pg, overrides={"SHORTFALL_REPLY_SECONDS": 3})
+    _courier_booked(w, [("reduced fat milk", 2)], [])
+    before = datetime.now(UTC)
+    mid = _detect(w, [MILK_2PCT])
+    [notice] = w.sent("shortfall_notice", cause=mid)
+    [line] = notice["body"]["lines"]
+    assert line["substitutes"] == [
+        {"sku": ALMOND, "name": "Almond milk 64 oz", "qty": 2, "unit_minor": 379}
+    ]
+    for sub in line["substitutes"]:
+        assert sub["qty"] * sub["unit_minor"] <= line["line_total_minor"]
+    reply_by = datetime.fromisoformat(notice["body"]["reply_by"])
+    assert before + timedelta(seconds=3) <= reply_by <= datetime.now(UTC) + timedelta(seconds=3)
+
+
+def _closed_shortfall(w: World, picks: dict[str, str]) -> uuid.UUID:
+    shortfall_id = ids.shortfall_id(w.order_id)
+    substitute = {"sku": ALMOND, "name": "Almond milk 64 oz", "qty": 2, "unit_minor": 379}
+    notice = [
+        {
+            "line": 0,
+            "sku": MILK_2PCT,
+            "name": "Reduced fat 2% milk 1 gal",
+            "qty_missing": 2,
+            "line_total_minor": 798,
+            "substitutes": [substitute],
+        }
+    ]
+    w.execute(
+        "INSERT INTO shortfalls (shortfall_id, run_id, order_id, seller_agent_id, lines, picks,"
+        " status, due_at, closed_at) VALUES (%s, %s, %s, %s, %s, %s, 'closed', now(), now())",
+        (shortfall_id, w.run_id, w.order_id, GROCERY, Jsonb(notice), Jsonb(picks)),
+    )
+    return shortfall_id
+
+
+def _decide(w: World, shortfall_id: uuid.UUID, picks: dict[str, str]) -> uuid.UUID:
+    body = {"order_id": str(w.order_id), "shortfall_id": str(shortfall_id), "picks": picks}
+    return w.step(
+        "shortfall_decision",
+        body,
+        from_agent=HOUSEHOLD,
+        conversation_id=ids.shortfall_conversation_id(shortfall_id),
+    )
+
+
+def test_shortfall_decision_amends_once(pg: str) -> None:
+    w = World(pg)
+    _courier_booked(w, [("reduced fat milk", 2), ("large eggs", 1)], [])
+    picks = {"0": ALMOND}
+    shortfall_id = _closed_shortfall(w, picks)
+    amended_lines = [
+        {
+            "line": 0,
+            "sku": ALMOND,
+            "name": "Almond milk 64 oz",
+            "qty": 2,
+            "unit_minor": 379,
+            "substituted_for": MILK_2PCT,
+        },
+        {
+            "line": 1,
+            "sku": EGGS,
+            "name": "Large eggs 12 ct",
+            "qty": 1,
+            "unit_minor": 349,
+            "substituted_for": None,
+        },
+    ]
+    w.seller.amend_result = {
+        "order_id": str(w.order_id),
+        "shortfall_id": str(shortfall_id),
+        "state": "courier_booked",
+        "picks": picks,
+        "refused": [],
+        "lines": amended_lines,
+        "total_minor": 2 * 379 + 349,
+        "currency": "USD",
+    }
+    mid = _decide(w, shortfall_id, picks)
+
+    # One `amend_order` call carries every pick.
+    [call] = w.seller.of("amend_order")
+    assert call["args"] == {
+        "order_id": str(w.order_id),
+        "shortfall_id": str(shortfall_id),
+        "picks": picks,
+    }
+    [confirm] = w.sent("order_confirm", cause=mid)
+    assert confirm["to_agent"] == HOUSEHOLD
+    assert confirm["conversation_id"] == ids.shortfall_conversation_id(shortfall_id)
+    assert confirm["body"]["state"] == "courier_booked"
+    assert confirm["body"]["lines"] == amended_lines
+    assert confirm["body"]["total_minor"] == 2 * 379 + 349
+    assert "reason" not in confirm["body"]
+
+
+def test_shortfall_every_line_dropped_confirms_failed(pg: str) -> None:
+    w = World(pg)
+    _courier_booked(w, [("reduced fat milk", 2)], [])
+    shortfall_id = _closed_shortfall(w, {})
+    w.seller.amend_result = {"state": "failed", "lines": [], "total_minor": 0, "currency": "USD"}
+    mid = _decide(w, shortfall_id, {"0": "drop"})
+    assert len(w.seller.of("amend_order")) == 1
+    [failed] = w.sent("order_confirm", cause=mid)
+    assert (failed["body"]["state"], failed["body"]["reason"]) == ("failed", "nothing_to_deliver")
+    assert failed["body"]["lines"] == []
+
+
+def test_shortfall_decision_refused_changes_nothing(pg: str) -> None:
+    w = World(pg)
+    _courier_booked(w, [("reduced fat milk", 2)], [])
+    shortfall_id = _closed_shortfall(w, {"0": ALMOND})
+    w.seller.refuse_amend = "amendment_not_authorized"
+    mid = _decide(w, shortfall_id, {"0": ALMOND})
+    assert len(w.seller.of("amend_order")) == 1
+    assert w.sent("order_confirm", cause=mid) == []
+    [trace] = w.query(
+        "SELECT payload FROM agent_traces WHERE run_id = %s AND kind = 'decision'"
+        " AND payload->>'node' = 'shortfall_decision'",
+        (w.run_id,),
+    )
+    assert trace["payload"]["choice"] == "amend_refused_amendment_not_authorized"

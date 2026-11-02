@@ -312,11 +312,13 @@ def test_quote_round_sends_closed_to_ref_to(world: str) -> None:
     assert _timer(world, timer_id)["status"] == "done"
 
 
-def test_unknown_timer_kind_left_pending(world: str) -> None:
+def test_unknown_timer_kind_left_pending(world: str, monkeypatch: pytest.MonkeyPatch) -> None:
     run_id = _start(world)
     order_id = _add_order(world, run_id, "courier_booked")
     _exec(world, "UPDATE timers SET status = 'cancelled' WHERE run_id = %s", run_id)
-    # `shortfall_expiry` is not handled yet (#69).
+    # The `timers.kind` CHECK allows only kinds the sweeper now knows, so a sweeper that
+    # does not know `shortfall_expiry` (as before #69) stands in for an unknown kind.
+    monkeypatch.setattr(sweeper, "KINDS", sweeper.KINDS - {"shortfall_expiry"})
     unknown = _add_timer(world, "shortfall_expiry", run_id, {"shortfall_id": str(uuid.uuid4())})
     known = _add_timer(
         world,
@@ -333,6 +335,68 @@ def test_unknown_timer_kind_left_pending(world: str) -> None:
 
     assert _sweep(world) == 0
     assert _timer(world, unknown)["status"] == "pending"
+
+
+def _add_shortfall(pg: str, run_id: uuid.UUID, order_id: uuid.UUID) -> uuid.UUID:
+    shortfall_id = ids.shortfall_id(order_id)
+    _exec(pg, "UPDATE orders SET seller_agent_id = %s WHERE order_id = %s", GROCERY, order_id)
+    _exec(
+        pg,
+        "INSERT INTO shortfalls (shortfall_id, run_id, order_id, seller_agent_id, lines, due_at)"
+        " VALUES (%s, %s, %s, %s, '[]', now())",
+        shortfall_id,
+        run_id,
+        order_id,
+        GROCERY,
+    )
+    return shortfall_id
+
+
+def test_shortfall_expiry_closes_pending_once(world: str) -> None:
+    run_id = _start(world)
+    order_id = _add_order(world, run_id, "courier_booked")
+    _exec(world, "UPDATE timers SET status = 'cancelled' WHERE run_id = %s", run_id)
+    shortfall_id = _add_shortfall(world, run_id, order_id)
+    ref = {"shortfall_id": str(shortfall_id), "order_id": str(order_id)}
+    timer_id = _add_timer(world, "shortfall_expiry", run_id, ref)
+
+    assert _sweep(world) == 1
+
+    [row] = _query(world, "SELECT * FROM shortfalls WHERE shortfall_id = %s", shortfall_id)
+    assert row["status"] == "closed" and row["closed_at"] is not None
+    assert _timer(world, timer_id)["status"] == "done"
+    [msg] = _messages(world, run_id)
+    assert msg["message_id"] == ids.shortfall_closed_id(shortfall_id)
+    assert msg["conversation_id"] == ids.shortfall_conversation_id(shortfall_id)
+    assert (msg["from_agent"], msg["to_agent"], msg["type"]) == (
+        sweeper.SWEEPER,
+        HOUSEHOLD,
+        "shortfall_closed",
+    )
+    assert msg["body"] == {
+        "shortfall_id": str(shortfall_id),
+        "order_id": str(order_id),
+        "reason": "timeout",
+    }
+
+    # Once: a second timer for the same shortfall finds it closed and sends nothing.
+    again = _add_timer(world, "shortfall_expiry", run_id, ref)
+    assert _sweep(world) == 1
+    assert _timer(world, again)["status"] == "done"
+    assert len(_messages(world, run_id)) == 1
+
+    # A shortfall the last pick (or the pickup) already closed is left alone.
+    run2 = _start(world)
+    order2 = _add_order(world, run2, "courier_booked")
+    _exec(world, "UPDATE timers SET status = 'cancelled' WHERE run_id = %s", run2)
+    shortfall2 = _add_shortfall(world, run2, order2)
+    _exec(world, "UPDATE shortfalls SET status = 'closed' WHERE shortfall_id = %s", shortfall2)
+    timer2 = _add_timer(world, "shortfall_expiry", run2, {"shortfall_id": str(shortfall2)})
+    assert _sweep(world) == 1
+    assert _timer(world, timer2)["status"] == "done"
+    [row] = _query(world, "SELECT status FROM shortfalls WHERE shortfall_id = %s", shortfall2)
+    assert row["status"] == "closed"
+    assert _messages(world, run2) == []
 
 
 def test_failing_timer_left_pending_others_fire(world: str) -> None:

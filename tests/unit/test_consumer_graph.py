@@ -321,6 +321,59 @@ def test_unknown_state_version_ends_the_run() -> None:
     assert result == StepResult(finish=RunFinish("error", "state_version"))
 
 
+def test_shortfall_relay_one_message_per_line_with_buttons() -> None:
+    # Agent-protocol §10, P22 (#69).
+    w = World()
+    shortfall_id = str(uuid.uuid4())
+    subs = [
+        {"sku": "MOCK-MILK-2PCT", "name": "Reduced fat 2% milk 1 gal", "qty": 2, "unit_minor": 399},
+        {"sku": "MOCK-MILK-OAT", "name": "Oat milk", "qty": 2, "unit_minor": 350},
+    ]
+    body = {
+        "order_id": str(uuid.uuid4()),
+        "shortfall_id": shortfall_id,
+        "lines": [
+            {
+                "line": 0,
+                "sku": "MOCK-MILK-WHOLE",
+                "name": "Whole milk 1 gal",
+                "qty_missing": 2,
+                "line_total_minor": 858,
+                "substitutes": subs,
+            },
+            {
+                "line": 3,
+                "sku": "MOCK-EGGS-12",
+                "name": "Large eggs 12 ct",
+                "qty_missing": 1,
+                "line_total_minor": 349,
+                "substitutes": [],
+            },
+        ],
+        "reply_by": "2026-11-02T12:15:00+00:00",
+    }
+    msg = w.inbound("shortfall_relay", body, from_agent=HOUSEHOLD)
+    result = w.step(msg)
+    _valid(result)
+    first, second = result.messages
+    for i, out in enumerate(result.messages):
+        assert (out.type, out.to_agent) == ("whatsapp_out", "channel:whatsapp")
+        assert out.message_id == ids.message_id(msg.row.message_id, i)
+        assert out.body["user_id"] == str(USER)
+        assert out.body["template"] == cg.SHORTFALL_PROMPT_TEMPLATE
+        assert out.body["params"] == {"text": stubs.SHORTFALL_TEXT}
+    assert first.body["buttons"] == [
+        {"payload": f"sf:{shortfall_id}:0:MOCK-MILK-2PCT", "title": "Reduced fat 2% milk "},
+        {"payload": f"sf:{shortfall_id}:0:MOCK-MILK-OAT", "title": "Oat milk"},
+        {"payload": f"sf:{shortfall_id}:0:drop", "title": "Skip it"},
+    ]
+    # A line with no substitute is offered as drop only.
+    assert second.body["buttons"] == [{"payload": f"sf:{shortfall_id}:3:drop", "title": "Skip it"}]
+    assert result.finish is None
+    decisions = [d["node"] for d in w.traces.of("decision")]
+    assert decisions == ["relay_shortfall", "relay_shortfall"]
+
+
 def test_host_registers_the_consumer_handler() -> None:
     assert host.HANDLERS["consumer"] is cg.handle
 
