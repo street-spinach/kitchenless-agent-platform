@@ -1,12 +1,15 @@
-"""Migrations 0001-0013 apply in order to an empty database (issues #25, #26, #27, #112, #196,
-#226)."""
+"""Migrations 0001-0014 apply in order to an empty database (issues #25, #26, #27, #112, #196,
+#226, #254)."""
 
+import re
+import shutil
 import uuid
+from pathlib import Path
 
 import psycopg
 import pytest
 
-from migrations.apply import apply
+from migrations.apply import MIGRATIONS_DIR, apply
 
 pytestmark = pytest.mark.db
 
@@ -88,6 +91,7 @@ def test_applies_in_order_on_empty_database(empty_schema_dsn: str) -> None:
     ]
     assert done[9:11] == ["0010_identity.sql", "0011_approval_band.sql"]
     assert done[11:13] == ["0012_agents.sql", "0013_eval_history.sql"]
+    assert done[13:14] == ["0014_pantry.sql"]
     assert apply(empty_schema_dsn) == []
     with psycopg.connect(empty_schema_dsn) as conn:
         rows = conn.execute(
@@ -624,3 +628,76 @@ def test_eval_results_cascade_with_eval_run(pg: str) -> None:
     assert {r[0] for r in rows} == {keep}
     assert len(rows) == 2
     assert any("(case_id, model_mode, created_at DESC)" in r[0] for r in indexes)
+
+
+PANTRY_SQL = MIGRATIONS_DIR / "0014_pantry.sql"
+
+
+def test_0014_additive() -> None:
+    words = set(re.findall(r"[A-Z]+", PANTRY_SQL.read_text().upper()))
+    assert not words & {"DROP", "RENAME", "CHECK"}
+
+
+def test_0014_pantry_columns_and_index(pg: str) -> None:
+    with psycopg.connect(pg) as conn:
+        cols = conn.execute(
+            "SELECT table_name, column_name, data_type, is_nullable, column_default"
+            " FROM information_schema.columns WHERE table_schema = current_schema()"
+            " AND column_name IN ('pantry_item', 'kind', 'run_id')"
+            " AND table_name IN ('pantry_events', 'catalog_items')"
+        ).fetchall()
+        index = conn.execute(
+            "SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema()"
+            " AND indexname = 'pantry_events_item_latest'"
+        ).fetchone()
+    assert sorted(cols) == [
+        ("catalog_items", "pantry_item", "text", "YES", None),
+        ("pantry_events", "kind", "text", "NO", "'add'::text"),
+        ("pantry_events", "pantry_item", "text", "YES", None),
+        ("pantry_events", "run_id", "uuid", "YES", None),
+    ]
+    assert index is not None
+    assert "(household_id, pantry_item, event_id DESC)" in index[0]
+
+
+def test_0014_applies_over_existing_rows(empty_schema_dsn: str, tmp_path: Path) -> None:
+    for sql in MIGRATIONS_DIR.glob("*.sql"):
+        if sql.name < PANTRY_SQL.name:
+            shutil.copy(sql, tmp_path / sql.name)
+    apply(empty_schema_dsn, tmp_path)
+    with psycopg.connect(empty_schema_dsn) as conn:
+        run_id = _run(conn)
+        order_id = _order(conn, run_id)
+        conn.execute(
+            "INSERT INTO pantry_events (household_id, item, delta, unit, source, order_id)"
+            " VALUES ('hh:1', 'sku-milk', 1, 'each', 'delivery', %s)",
+            (order_id,),
+        )
+        conn.execute(
+            "INSERT INTO catalog_items (agent_id, sku, name, ingredients, price_minor, currency)"
+            " VALUES ('grocery:1', 'sku-milk', 'Milk', 'milk', 199, 'USD')"
+        )
+    assert apply(empty_schema_dsn) == ["0014_pantry.sql"]
+    with psycopg.connect(empty_schema_dsn) as conn:
+        event = conn.execute("SELECT item, pantry_item, kind, run_id FROM pantry_events").fetchone()
+        sku = conn.execute("SELECT pantry_item FROM catalog_items").fetchone()
+        # Old code that inserts without kind still writes an 'add'; any kind is accepted.
+        conn.execute(
+            "INSERT INTO pantry_events (household_id, item, delta, unit, source)"
+            " VALUES ('hh:1', 'sku-eggs', 1, 'each', 'delivery')"
+        )
+        conn.execute(
+            "INSERT INTO pantry_events (household_id, item, pantry_item, kind, delta, unit,"
+            " source, run_id) VALUES ('hh:1', 'eggs', 'eggs', 'receipt', 0, 'each', 'x', %s)",
+            (run_id,),
+        )
+        kinds = conn.execute("SELECT kind FROM pantry_events ORDER BY event_id").fetchall()
+        with pytest.raises(psycopg.errors.ForeignKeyViolation):
+            conn.execute(
+                "INSERT INTO pantry_events (household_id, item, delta, unit, source, run_id)"
+                " VALUES ('hh:1', 'x', 0, 'each', 'x', %s)",
+                (uuid.uuid4(),),
+            )
+    assert event == ("sku-milk", None, "add", None)
+    assert sku == (None,)
+    assert kinds == [("add",), ("add",), ("receipt",)]
