@@ -25,7 +25,7 @@ from uuid import UUID
 from psycopg import AsyncConnection
 from psycopg.types.json import Jsonb
 
-from services.common import directory, vendors
+from services.common import directory, dislikes, ids, vendors
 from services.common.config import get_settings
 from services.common.modes import ALWAYS_MOCK, VENDORS
 from services.seed import household_envs, mock_stock_rows, seeded_limits
@@ -120,6 +120,9 @@ class SetupKey:
     type: type
     apply: Callable[[AsyncConnection, str, Any], Awaitable[None]]
     undo: Callable[[AsyncConnection, str, Mapping[str, int | None]], Awaitable[None]]
+    # Checks the value's shape before anything is written; returns it normalized or raises
+    # `ControlRefused`. `None` means the type check alone is enough.
+    check: Callable[[str, Any], Any] | None = None
 
 
 # Every statement is limited to eval households in SQL as well as in Python.
@@ -167,9 +170,78 @@ async def _undo_per_order(
     )
 
 
+def _check_dislikes(name: str, value: Mapping[Any, Any]) -> dict[str, list[str]]:
+    """`{member id: [value]}`, each value normalized by `dislikes.check_value`."""
+    checked: dict[str, list[str]] = {}
+    for member_id, values in value.items():
+        if not isinstance(member_id, str) or not member_id or not isinstance(values, list):
+            raise ControlRefused(f"setup key {name!r} must map member ids to lists of values")
+        normalized = [dislikes.check_value(v) for v in values]
+        if any(v is None for v in normalized):
+            raise ControlRefused(f"setup key {name!r}: invalid dislike value for {member_id}")
+        checked[member_id] = [v for v in normalized if v is not None]
+    return checked
+
+
+async def _apply_dislikes(
+    conn: AsyncConnection, household_id: str, value: Mapping[str, list[str]]
+) -> None:
+    for member_id, values in value.items():
+        user_id = ids.seed_user_id(member_id)
+        cur = await conn.execute(
+            f"SELECT 1 FROM household_members WHERE user_id = %s AND household_id = %s"
+            f" AND {_EVAL_ONLY}",
+            (user_id, household_id),
+        )
+        if await cur.fetchone() is None:
+            raise ControlRefused(f"dislikes: {member_id} is not a member of {household_id}")
+        for v in values:
+            await conn.execute(
+                "INSERT INTO member_constraints (user_id, kind, value, source)"
+                " VALUES (%s, 'dislike', %s, 'learned')"
+                " ON CONFLICT (user_id, value) WHERE source = 'learned' DO NOTHING",
+                (user_id, v),
+            )
+
+
+async def _undo_dislikes(
+    conn: AsyncConnection, household_id: str, seeded: Mapping[str, int | None]
+) -> None:
+    # The reset's deletes already removed these (AG-A12); this keeps the key self-contained.
+    await conn.execute(
+        "DELETE FROM member_constraints WHERE source = 'learned' AND user_id IN"
+        f" (SELECT user_id FROM household_members WHERE household_id = %s AND {_EVAL_ONLY})",
+        (household_id,),
+    )
+
+
+async def _apply_take_turns(conn: AsyncConnection, household_id: str, value: bool) -> None:
+    cur = await conn.execute(
+        "INSERT INTO household_rules (household_id, take_turns)"
+        f" SELECT household_id, %s FROM households WHERE household_id = %s AND {_EVAL_ONLY}"
+        " ON CONFLICT (household_id) DO UPDATE"
+        " SET take_turns = EXCLUDED.take_turns, updated_at = now()",
+        (value, household_id),
+    )
+    if cur.rowcount != 1:
+        raise ControlRefused(f"take_turns: {household_id} is not an eval household")
+
+
+async def _undo_take_turns(
+    conn: AsyncConnection, household_id: str, seeded: Mapping[str, int | None]
+) -> None:
+    # The reset's deletes already removed these (AG-A12); this keeps the key self-contained.
+    await conn.execute(
+        f"DELETE FROM household_rules WHERE household_id = %s AND {_EVAL_ONLY}",
+        (household_id,),
+    )
+
+
 SETUP_KEYS: Mapping[str, SetupKey] = {
     "budget_minor": SetupKey(int, _apply_budget, _undo_budget),
     "per_order_minor": SetupKey(int, _apply_per_order, _undo_per_order),
+    "dislikes": SetupKey(dict, _apply_dislikes, _undo_dislikes, _check_dislikes),
+    "take_turns": SetupKey(bool, _apply_take_turns, _undo_take_turns),
 }
 
 
@@ -180,16 +252,18 @@ def _validate_setup(setup: Mapping[str, Any] | None, household_id: str) -> dict[
         return {}
     if not isinstance(setup, Mapping):
         raise ControlRefused("setup must be an object")
+    checked: dict[str, Any] = {}
     for name, value in setup.items():
         key = SETUP_KEYS.get(name)
         if key is None:
             raise ControlRefused(f"unknown setup key {name!r}")
         # bool is an int subclass; a setup value of true is never an amount.
-        if isinstance(value, bool) or not isinstance(value, key.type):
+        if (isinstance(value, bool) and key.type is not bool) or not isinstance(value, key.type):
             raise ControlRefused(f"setup key {name!r} must be {key.type.__name__}")
         if key.type is int and value < 0:
             raise ControlRefused(f"setup key {name!r} must not be negative")
-    return dict(setup)
+        checked[name] = key.check(name, value) if key.check is not None else value
+    return checked
 
 
 async def reset(
