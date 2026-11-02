@@ -1,6 +1,6 @@
 """The `api` service (architecture item 32): `/health`, the reserved routes, the simulated
-WhatsApp routes, `/runs`, the real WhatsApp webhook, and the consumer that sends
-`whatsapp_out` messages.
+WhatsApp routes, `/runs`, the real WhatsApp webhook, the control panel routes, and the
+consumer that sends `whatsapp_out` messages.
 
 Run with `python -m services.api.main`. It serves on port 8000.
 """
@@ -16,7 +16,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from services.api.connect import Connect, pool_connect
-from services.api.routes import internal, reserved, runs, whatsapp
+from services.api.routes import internal, panel, reserved, runs, whatsapp
 from services.api.whatsapp.sender import GraphSender, Sender
 from services.common import db
 from services.common import logging as app_logging
@@ -43,6 +43,7 @@ def create_app(connect: Connect = pool_connect) -> Starlette:
             *internal.routes,
             *runs.routes,
             *whatsapp.routes,
+            *panel.routes,
         ]
     )
     app.state.connect = connect
