@@ -200,3 +200,15 @@ def test_keycloak_client_id_replaces_the_class_separator() -> None:
     for bad in ("", "household", "household:", "consumer:hh-1:2"):
         with pytest.raises(ValueError):
             ids.keycloak_client_id(bad)
+
+
+def test_take_turns_button_round_trips_and_rejects_anything_else() -> None:
+    # Agents §10: `tt:<order_id>:on|off`; anything else is not a take-turns tap.
+    order = uuid4()
+    for on, state in ((True, "on"), (False, "off")):
+        payload = ids.take_turns_button(order, on)
+        assert payload == f"tt:{order}:{state}"
+        assert ids.parse_take_turns_button(payload) == (order, on)
+    others = ["", "tt:x:on", f"tt:{order}:no", f"tt:{order}", f"ap:{order}:approved"]
+    for payload in others:
+        assert ids.parse_take_turns_button(payload) is None
