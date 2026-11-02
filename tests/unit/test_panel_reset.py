@@ -570,3 +570,92 @@ def test_bad_setup_refused_and_writes_nothing(world: dict[str, Any]) -> None:
             _reset_setup(pg, setup)
     with psycopg.connect(pg) as conn:
         assert _count(conn, "SELECT count(*) FROM runs WHERE run_id = %s", eval_run) == 1
+
+
+def _learned(conn: psycopg.Connection) -> list[tuple[uuid.UUID, str]]:
+    rows = conn.execute(
+        "SELECT user_id, value FROM member_constraints WHERE source = 'learned' ORDER BY 1, 2"
+    ).fetchall()
+    return [(r[0], r[1]) for r in rows]
+
+
+@pytest.mark.db
+def test_dislikes_setup_removed_by_next_reset(world: dict[str, Any]) -> None:
+    """Evals §4 (step 3b): `dislikes` inserts learned dislike rows for the eval household's
+    members; the next reset deletes them (agents AG-A12). Seeded rows and a live
+    household's learned rows are kept."""
+    pg = world["pg"]
+    member_b, member_c = ids.seed_user_id("us-1-b-eval"), ids.seed_user_id("us-1-c-eval")
+    live_user = ids.seed_user_id("us-1-a")
+    with psycopg.connect(pg) as conn:
+        conn.execute(
+            "INSERT INTO member_constraints (user_id, kind, value, source)"
+            " VALUES (%s, 'dislike', 'okra', 'learned')",
+            (live_user,),
+        )
+        seeded = _count(conn, "SELECT count(*) FROM member_constraints WHERE source <> 'learned'")
+
+    setup = {"dislikes": {"us-1-b-eval": ["Rice", "rice"], "us-1-c-eval": ["spinach"]}}
+    _reset_setup(pg, setup)
+    with psycopg.connect(pg) as conn:
+        kinds = conn.execute(
+            "SELECT DISTINCT kind FROM member_constraints WHERE source = 'learned'"
+        ).fetchall()
+        assert kinds == [("dislike",)]
+        assert _learned(conn) == sorted(
+            [(live_user, "okra"), (member_b, "rice"), (member_c, "spinach")]
+        )
+
+    _reset(pg, "eval")
+    with psycopg.connect(pg) as conn:
+        assert _learned(conn) == [(live_user, "okra")]
+        after = _count(conn, "SELECT count(*) FROM member_constraints WHERE source <> 'learned'")
+        assert after == seeded
+
+    # Members of another household, live members and bad values are refused; nothing written.
+    bad: list[Any] = [
+        {"dislikes": {"us-2-a-eval": ["rice"]}},
+        {"dislikes": {"us-1-a": ["rice"]}},
+        {"dislikes": {"nobody": ["rice"]}},
+        {"dislikes": {"us-1-a-eval": ["rice; drop"]}},
+        {"dislikes": {"us-1-a-eval": "rice"}},
+        {"dislikes": {"us-1-a-eval": [1]}},
+        {"dislikes": ["rice"]},
+    ]
+    for bad_setup in bad:
+        with pytest.raises(control.ControlRefused):
+            _reset_setup(pg, bad_setup)
+    with psycopg.connect(pg) as conn:
+        assert _learned(conn) == [(live_user, "okra")]
+
+
+@pytest.mark.db
+def test_take_turns_setup_removed(world: dict[str, Any]) -> None:
+    """Evals §4 (step 3b): `take_turns` writes the eval household's `household_rules` row;
+    the next reset deletes it (agents AG-A12). A live household's row is kept."""
+    pg = world["pg"]
+    with psycopg.connect(pg) as conn:
+        conn.execute(
+            "INSERT INTO household_rules (household_id, take_turns) VALUES (%s, true)", (LIVE,)
+        )
+
+    def rules() -> list[tuple[str, bool]]:
+        with psycopg.connect(pg) as conn:
+            rows = conn.execute(
+                "SELECT household_id, take_turns FROM household_rules ORDER BY 1"
+            ).fetchall()
+        return [(r[0], r[1]) for r in rows]
+
+    _reset_setup(pg, {"take_turns": True})
+    assert rules() == sorted([(LIVE, True), (EVAL, True)])
+
+    _reset_setup(pg, {"take_turns": False}, "us-2-eval")
+    assert rules() == sorted([(LIVE, True), ("us-2-eval", False)])
+
+    _reset(pg, "eval")
+    assert rules() == [(LIVE, True)]
+
+    for value in (1, 0, "true", None):
+        with pytest.raises(control.ControlRefused):
+            _reset_setup(pg, {"take_turns": value})
+    assert rules() == [(LIVE, True)]
