@@ -10,7 +10,10 @@ import httpx
 import pytest
 
 from services.api.whatsapp import sender as s
-from services.common.consumer import StepFailed
+from services.common.consumer import Inbound, StepFailed
+from services.common.protocol.a2a import AgentMessageRow
+from services.common.protocol.schemas import WhatsAppOut
+from tests.unit import api_world as w
 
 PHONE = "+15550100301"
 TOKEN = "test-token"
@@ -250,3 +253,79 @@ def test_buttons_sent_as_reply_buttons() -> None:
             "buttons": [{"type": "reply", "reply": {"id": "approve:1", "title": "Approve"}}]
         },
     }
+
+
+# --- the sim path (EX-I3) -----------------------------------------------------------------
+
+
+@pytest.fixture
+def sim_world(pg: str, monkeypatch: pytest.MonkeyPatch) -> str:
+    w.patch_settings(monkeypatch)
+    w.seed(pg)
+    return pg
+
+
+def _sim_send(world: str, body: dict[str, Any]) -> Inbound:
+    body = {"user_id": str(w.MEMBER), "params": {}, "buttons": [], **body}
+    row = AgentMessageRow(
+        message_id=uuid.uuid4(),
+        run_id=uuid.uuid4(),
+        conversation_id=None,
+        causation_id=None,
+        from_agent="system:runs",
+        to_agent=w.WHATSAPP,
+        type="whatsapp_out",
+        body=body,
+    )
+    msg = Inbound(row=row, attempts=1, body=WhatsAppOut.model_validate(body))
+    asyncio.run(s.Sender(w.connect_to(world))(msg))
+    return msg
+
+
+@pytest.mark.db
+@pytest.mark.parametrize(
+    "body",
+    [
+        {**RETRY, "buttons": [{"payload": f"p{i}", "title": "t"} for i in range(4)]},
+        {**RETRY, "buttons": [{"payload": "p", "title": "x" * (s.MAX_TITLE_CHARS + 1)}]},
+        {"template": "chat_reply", "params": {"text": "x" * (s.MAX_BODY_CHARS + 1)}},
+        {"template": "approval_request"},  # a missing param
+    ],
+)
+def test_sim_applies_limits(sim_world: str, body: dict[str, Any]) -> None:
+    body = {k: v for k, v in body.items() if k != "user_id"}
+    msg = _sim_send(sim_world, body)
+    assert w.query(sim_world, "SELECT * FROM sim_outbound") == []
+    [trace] = w.query(sim_world, "SELECT * FROM agent_traces WHERE run_id = %s", msg.row.run_id)
+    assert (trace["kind"], trace["agent_id"]) == ("decision", w.WHATSAPP)
+    assert trace["message_id"] == msg.row.message_id
+    payload = trace["payload"]
+    assert (payload["node"], payload["choice"], payload["reason"]) == (
+        s.WINDOW_NODE,
+        s.REFUSED,
+        s.UNRENDERABLE,
+    )
+    assert payload["ref"] == str(msg.row.message_id)
+
+
+@pytest.mark.db
+def test_sim_keeps_message_id_and_template(sim_world: str) -> None:
+    buttons = [{"payload": "approve:1", "title": "x" * s.MAX_TITLE_CHARS}]
+    msg = _sim_send(sim_world, {"template": "retry_prompt", "buttons": buttons})
+    asyncio.run(s.Sender(w.connect_to(sim_world))(msg))  # a replayed step inserts nothing
+    longest = "y" * s.MAX_BODY_CHARS
+    _sim_send(sim_world, {"template": "chat_reply", "params": {"text": longest}})
+
+    first, second = w.query(sim_world, "SELECT * FROM sim_outbound ORDER BY id")
+    body = first["body"]
+    assert body["message_id"] == str(msg.row.message_id)
+    assert body["template"] == "retry_prompt"
+    assert body["buttons"] == buttons
+    assert body["graph"] == s.graph_payload(w.MEMBER_PHONE, msg.body.model_dump(mode="json"))
+    assert body["graph"]["to"] == w.MEMBER_PHONE.removeprefix("+")
+    assert body["graph"]["interactive"]["body"]["text"] == s.TEXTS["retry_prompt"]
+    assert second["body"]["graph"]["text"]["body"] == longest
+    assert w.query(sim_world, "SELECT * FROM agent_traces") == []
+
+    resp = w.client(sim_world).get(f"/internal/sim/outbox?phone={w.MEMBER_PHONE}&after_id=0")
+    assert [m["id"] for m in resp.json()["messages"]] == [first["id"], second["id"]]
