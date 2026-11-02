@@ -6,8 +6,11 @@
 
 *   `POST /panel/reset {env}`: `env: eval` only; refuses anything else with 400.
 *   `POST /panel/events {env, kind, target_agent_id, params}` writes `mock_events`. The
-    `shortfall` kind (agent-protocol P31, shortfall event) is refused with 501 until its
-    route checks and `shortfall_detected` land (#70).
+    `shortfall` kind (agent-protocol §10 and P31, #70) is refused with 409 unless the
+    order is `courier_booked` and has no shortfall (no `shortfalls` row and no earlier
+    shortfall event); `target_agent_id` must be the order's seller and `env` the order's
+    household env. It then sends `shortfall_detected` from `system:api` to
+    `orders.seller_agent_id` in the same transaction.
 *   `PUT /panel/modes/{vendor} {mode}` writes `adapter_modes`.
 *   `POST /panel/approvals/{id}/expire` makes that approval's expiry timer due now.
 *   `GET /panel/runs/live` returns recent `message` and `error` trace rows, grouped per run
@@ -26,6 +29,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from services.common import ids, outbox
 from services.common.protocol import schemas
 from services.common.protocol.a2a import AgentMessageRow, QuoteRow, to_a2a_message
 from services.common.protocol.catalog import render_summary
@@ -33,6 +37,7 @@ from services.mocks import control
 
 __all__ = ["DETAIL_TYPES", "HOUSEHOLD_LANE", "LIVE_LIMIT", "LIVE_LIMIT_MAX", "routes"]
 
+API_AGENT = "system:api"
 # The lane of people and system rows that have no conversation (§8).
 HOUSEHOLD_LANE = "household"
 LIVE_LIMIT = 200
@@ -114,7 +119,7 @@ async def events(request: Request) -> JSONResponse:
     if params is not None and not isinstance(params, dict):
         return _error(400, "params must be an object")
     if kind == "shortfall":
-        return _error(501, "shortfall events are not available yet")
+        return await _shortfall_event(request, env, target, params or {})
     async with request.app.state.connect() as conn, conn.transaction():
         try:
             event_id = await control.inject_event(
@@ -122,6 +127,70 @@ async def events(request: Request) -> JSONResponse:
             )
         except control.ControlRefused as exc:
             return _error(400, str(exc))
+    return JSONResponse({"event_id": event_id})
+
+
+_SHORTFALL_ORDER_SQL = """
+SELECT o.order_id, o.run_id, o.state, o.seller_agent_id, h.env
+FROM orders o JOIN households h ON h.household_id = o.household_id
+WHERE o.order_id = %s
+FOR UPDATE OF o
+"""
+
+# A shortfall row, or an earlier shortfall event that has not opened its row yet.
+_SHORTFALL_EXISTS_SQL = """
+SELECT 1 FROM shortfalls WHERE order_id = %(order_id)s
+UNION ALL
+SELECT 1 FROM mock_events WHERE kind = 'shortfall' AND params->>'order_id' = %(order_id)s::text
+LIMIT 1
+"""
+
+
+async def _shortfall_event(
+    request: Request, env: str, target: str, params: dict[str, Any]
+) -> JSONResponse:
+    """`kind=shortfall` (agent-protocol §10 "Trigger" and P31).
+
+    409 unless the order is `courier_booked` and has no shortfall; otherwise one
+    transaction writes the `mock_events` row and sends `shortfall_detected` from
+    `system:api` to `orders.seller_agent_id`.
+    """
+    order_id = _uuid(params.get("order_id"))
+    if order_id is None:
+        return _error(400, "shortfall params.order_id must be a uuid")
+    async with request.app.state.connect() as conn, conn.transaction():
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(_SHORTFALL_ORDER_SQL, (order_id,))
+            order = await cur.fetchone()
+        if order is None:
+            return _error(400, f"unknown order {order_id}")
+        if order["env"] != env:
+            return _error(400, f"order {order_id} is not in env {env!r}")
+        if order["state"] != "courier_booked":
+            return _error(409, f"order {order_id} is {order['state']}, not courier_booked")
+        cur = await conn.execute(_SHORTFALL_EXISTS_SQL, {"order_id": order_id})
+        if await cur.fetchone() is not None:
+            return _error(409, f"order {order_id} already has a shortfall")
+        if target != order["seller_agent_id"]:
+            return _error(400, "target_agent_id must be the order's seller")
+        try:
+            event_id = await control.inject_event(
+                conn, env=env, kind="shortfall", target_agent_id=target, params=params
+            )
+        except control.ControlRefused as exc:
+            return _error(400, str(exc))
+        source = ids.mock_event_id(event_id)
+        await outbox.send(
+            conn,
+            message_id=ids.message_id(source, 0),
+            run_id=order["run_id"],
+            conversation_id=None,
+            causation_id=None,
+            from_agent=API_AGENT,
+            to_agent=target,
+            type="shortfall_detected",
+            body={"order_id": str(order_id), "skus": params["skus"], "event_id": str(source)},
+        )
     return JSONResponse({"event_id": event_id})
 
 

@@ -237,3 +237,80 @@ def test_route_refuses_bad_posts(pg: str, body: Any, code: int) -> None:
     _, order_id = _seed(pg)
     assert _post(pg, body).status_code == code
     assert _state(pg, order_id) == "courier_booked"
+
+
+# --- agent-protocol P30: pickup closes a pending shortfall (#70) ----------------------------
+
+
+def _shortfall(pg: str, run_id: uuid.UUID, order_id: uuid.UUID, status: str) -> uuid.UUID:
+    shortfall_id = ids.shortfall_id(order_id)
+    lines = [
+        {
+            "line": 1,
+            "sku": "SKU-1",
+            "name": "Oat milk",
+            "qty_missing": 1,
+            "line_total_minor": 350,
+            "substitutes": [{"sku": "SKU-2", "name": "Soy milk", "qty": 1, "unit_minor": 300}],
+        }
+    ]
+    with psycopg.connect(pg) as conn:
+        conn.execute(
+            "INSERT INTO shortfalls (shortfall_id, run_id, order_id, seller_agent_id, lines,"
+            " status, due_at) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            (shortfall_id, run_id, order_id, SELLER, Jsonb(lines), status, START),
+        )
+    return shortfall_id
+
+
+def _shortfall_closed(pg: str, run_id: uuid.UUID) -> list[dict[str, Any]]:
+    return w.query(
+        pg,
+        "SELECT * FROM agent_messages WHERE run_id = %s AND type = 'shortfall_closed'",
+        run_id,
+    )
+
+
+def test_picked_up_closes_pending_shortfall(pg: str) -> None:
+    run_id, order_id = _seed(pg)
+    shortfall_id = _shortfall(pg, run_id, order_id, "pending")
+
+    assert _apply(pg, "picked_up") == "applied"
+    assert _state(pg, order_id) == "in_delivery"
+    [row] = w.query(pg, "SELECT * FROM shortfalls WHERE shortfall_id = %s", shortfall_id)
+    assert row["status"] == "closed"
+    assert row["closed_at"] is not None
+    assert row["picks"] == {}
+    [msg] = _shortfall_closed(pg, run_id)
+    assert msg["message_id"] == ids.shortfall_closed_id(shortfall_id)
+    assert msg["conversation_id"] == ids.shortfall_conversation_id(shortfall_id)
+    assert (msg["from_agent"], msg["to_agent"]) == ("system:api", HOUSEHOLD_AGENT)
+    assert msg["body"] == {
+        "shortfall_id": str(shortfall_id),
+        "order_id": str(order_id),
+        "reason": "picked_up",
+    }
+
+    # Later courier events change nothing about the shortfall.
+    assert _apply(pg, "delivered") == "applied"
+    assert len(_shortfall_closed(pg, run_id)) == 1
+
+
+def test_delivered_without_pickup_closes_pending_shortfall(pg: str) -> None:
+    run_id, order_id = _seed(pg)
+    shortfall_id = _shortfall(pg, run_id, order_id, "pending")
+    assert _apply(pg, "delivered") == "applied"
+    [row] = w.query(pg, "SELECT status FROM shortfalls WHERE shortfall_id = %s", shortfall_id)
+    assert row["status"] == "closed"
+    [msg] = _shortfall_closed(pg, run_id)
+    assert msg["body"]["reason"] == "picked_up"
+
+
+@pytest.mark.parametrize("status", ["closed", "applied"])
+def test_picked_up_leaves_a_decided_shortfall_alone(pg: str, status: str) -> None:
+    run_id, order_id = _seed(pg)
+    shortfall_id = _shortfall(pg, run_id, order_id, status)
+    assert _apply(pg, "picked_up") == "applied"
+    [row] = w.query(pg, "SELECT status FROM shortfalls WHERE shortfall_id = %s", shortfall_id)
+    assert row["status"] == status
+    assert _shortfall_closed(pg, run_id) == []

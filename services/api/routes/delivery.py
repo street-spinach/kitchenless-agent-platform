@@ -10,9 +10,10 @@ later, by the DoorDash webhook (step 7). In the caller's transaction it:
     events are harmless. Events for a terminal order (`failed` included, agent-protocol
     P30) are ignored;
 *   sends `order_status` from `system:api` to the household agent;
-*   on `failed`, calls `runs.finish(status=error, reason=delivery_failed)`.
-
-Closing a pending shortfall on `in_delivery` (agent-protocol P30) belongs to #70.
+*   on `failed`, calls `runs.finish(status=error, reason=delivery_failed)`;
+*   when the order moves to `in_delivery` (agent-protocol P30, #70), closes the order's
+    `pending` shortfall with the §10 conditional update and, if a row changed, sends
+    `shortfall_closed {reason: picked_up}` from `system:api` to the household agent.
 """
 
 import logging
@@ -23,12 +24,21 @@ from psycopg.rows import dict_row
 
 from services.common import ids, orders, outbox, runs
 
-__all__ = ["API_AGENT", "DELIVERY_FAILED", "Applied", "UnknownStatus", "apply_delivery_status"]
+__all__ = [
+    "API_AGENT",
+    "DELIVERY_FAILED",
+    "PICKED_UP",
+    "Applied",
+    "UnknownStatus",
+    "apply_delivery_status",
+]
 
 log = logging.getLogger(__name__)
 
 API_AGENT = "system:api"
 DELIVERY_FAILED = "delivery_failed"
+# The `shortfall_closed` reason when the courier picks the order up (agent-protocol §10).
+PICKED_UP = "picked_up"
 
 # `applied`: the order moved. `no_change`: the status maps to no change or is not forward.
 # `ignored`: the order is terminal. `unknown_delivery`: no order has this delivery id.
@@ -45,6 +55,39 @@ SELECT order_id, run_id, household_id, state, total_minor, currency, delivery_ag
 FROM orders WHERE external_delivery_id = %s
 FOR UPDATE
 """
+
+
+# Agent-protocol §10 "Closing early": only a `pending` row closes, so the expiry timer and
+# this route never both send `shortfall_closed`.
+_CLOSE_SHORTFALL_SQL = """
+UPDATE shortfalls SET status = 'closed', closed_at = now()
+WHERE order_id = %s AND status = 'pending'
+RETURNING shortfall_id
+"""
+
+
+async def _close_shortfall(conn: AsyncConnection, order: dict[str, Any]) -> None:
+    """Close the order's pending shortfall, if any, and send `shortfall_closed`."""
+    cur = await conn.execute(_CLOSE_SHORTFALL_SQL, (order["order_id"],))
+    row = await cur.fetchone()
+    if row is None:
+        return
+    shortfall_id = row[0]
+    await outbox.send(
+        conn,
+        message_id=ids.shortfall_closed_id(shortfall_id),
+        run_id=order["run_id"],
+        conversation_id=ids.shortfall_conversation_id(shortfall_id),
+        causation_id=None,
+        from_agent=API_AGENT,
+        to_agent=f"household:{order['household_id']}",
+        type="shortfall_closed",
+        body={
+            "shortfall_id": str(shortfall_id),
+            "order_id": str(order["order_id"]),
+            "reason": PICKED_UP,
+        },
+    )
 
 
 def _path(current: str, target: str) -> list[str] | None:
@@ -106,6 +149,8 @@ async def apply_delivery_status(
             if not await orders.transition(conn, order["order_id"], current, state):
                 raise RuntimeError(f"order {order['order_id']} changed state while locked")
             current = state
+            if state == "in_delivery":
+                await _close_shortfall(conn, order)
         await outbox.send(
             conn,
             message_id=ids.order_status_id(order["order_id"], current),

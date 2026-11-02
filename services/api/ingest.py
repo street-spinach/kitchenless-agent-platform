@@ -7,9 +7,18 @@
 2.  Look up the phone in `channel_identities`, then the member's household and consumer
     agent. An unknown phone gets no run. Its "not registered" reply belongs to
     identity-authz I26 (#124).
-3.  An approval button (`ap:<approval_id>:approved|rejected`, #63) calls `/mcp/household
-    decide_approval` with `api`'s service token; see `_approval_tap`. Shortfall buttons
-    are #70; until then any other button starts nothing.
+3.  Buttons.
+    *   A payload starting `sf:` (agent-protocol §10 and P29, #70) is parsed as
+        `sf:<shortfall_id>:<line>:<sku | drop>` and calls the household tool
+        `choose_shortfall_option` with the `api` service token, in a `RunContext` for the
+        shortfall's run. On `already_decided` the member gets "Already decided."; nothing
+        else is sent, because the tool sends `shortfall_closed` when the last line is
+        picked. A malformed payload, an unknown shortfall or a refused call starts nothing.
+        If the tool is unavailable the error propagates, so the transaction rolls back and
+        the inbound row is not kept: a redelivered tap is tried again.
+    *   An approval button (`ap:<approval_id>:approved|rejected`, #63) calls
+        `/mcp/household decide_approval` with `api`'s service token; see `_approval_tap`.
+    *   Any other button starts nothing.
 4.  Text equal to "retry", any case: if `runs.retry_target` finds a run, start a new run
     with `retry_of` and send the original request again as `user_message`. Otherwise it is
     normal text.
@@ -31,18 +40,21 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from services.common import ids, mcp_client, outbox, runs
-from services.common.mcp_client import ToolRefused
+from services.common.mcp_client import ToolRefused, call_tool
 from services.common.run_context import RunContext
 from services.identity.tokens import MockIssuer
 
 __all__ = [
+    "ALREADY_DECIDED",
     "API_AGENT",
     "APPROVAL_EXPIRED",
     "MEDIA_NOT_SUPPORTED",
     "NOT_APPROVER",
+    "SHORTFALL_PREFIX",
     "WHATSAPP",
     "Content",
     "ingest",
+    "parse_shortfall_button",
 ]
 
 log = logging.getLogger(__name__)
@@ -60,6 +72,40 @@ NOT_APPROVER = "approval_not_approver"
 WRONG_APPROVER = "wrong_approver"
 CHAT = "chat"
 RETRY_TEXT = "retry"
+# Shortfall buttons (agent-protocol §10): `sf:<shortfall_id>:<line>:<sku | drop>`.
+SHORTFALL_PREFIX = "sf:"
+HOUSEHOLD_SERVER = "household"
+CHOOSE_SHORTFALL_OPTION = "choose_shortfall_option"
+# The `whatsapp_out` template for "Already decided." (agent-protocol §10).
+ALREADY_DECIDED = "already_decided"
+
+
+@dataclass(frozen=True)
+class ShortfallPick:
+    shortfall_id: uuid.UUID
+    line: int
+    pick: str
+
+
+def parse_shortfall_button(payload: str) -> ShortfallPick | None:
+    """`sf:<shortfall_id>:<line>:<sku | drop>`, or `None` if malformed (fails closed)."""
+    parts = payload.split(":", 3)
+    if len(parts) != 4 or parts[0] + ":" != SHORTFALL_PREFIX:
+        return None
+    _, raw_id, raw_line, pick = parts
+    try:
+        shortfall_id = uuid.UUID(raw_id)
+    except ValueError:
+        return None
+    if not raw_line.isdecimal() or int(raw_line) < 1 or not pick:
+        return None
+    return ShortfallPick(shortfall_id, int(raw_line), pick)
+
+
+def _service_token() -> str:
+    # The `api` service token. Every caller uses the mock issuer until identity-authz
+    # moves `ingest` to `call_tool_as` (identity-authz Q4 and its `ingest.py` row).
+    return MockIssuer().issue(API_AGENT, API_AGENT, ())
 
 
 @dataclass(frozen=True)
@@ -180,9 +226,14 @@ async def ingest(
 
         inbound = ids.inbound_id(channel, external_id)
         if content.kind == "button":
+            if content.button.startswith(SHORTFALL_PREFIX):
+                run = await _shortfall_button(conn, member, inbound, content.button)
+                if run is not None:
+                    await conn.execute(_SET_RUN_SQL, (run, channel, external_id))
+                return None
             tap = ids.parse_approval_button(content.button)
             if tap is None:
-                log.info("inbound button ignored: not an approval button (shortfalls are #70)")
+                log.info("inbound button ignored: neither a shortfall nor an approval button")
                 return None
             approval_run = await _approval_tap(conn, member, inbound, *tap, call_tool=call_tool)
             if approval_run is not None:
@@ -381,3 +432,64 @@ async def _media_reply(
     )
     await runs.finish(conn, started, API_AGENT, "completed", MEDIA_NOT_SUPPORTED)
     return started
+
+
+async def _shortfall_button(
+    conn: AsyncConnection, member: _Member, inbound: uuid.UUID, payload: str
+) -> uuid.UUID | None:
+    """Send one shortfall pick to `choose_shortfall_option`; return the shortfall's run.
+
+    Returns `None` for a malformed payload, an unknown shortfall or a refused call. Raises
+    `AdapterUnavailable` if the tool cannot be reached.
+    """
+    parsed = parse_shortfall_button(payload)
+    if parsed is None:
+        log.info("inbound shortfall button ignored: malformed payload")
+        return None
+    cur = await conn.execute(
+        "SELECT run_id FROM shortfalls WHERE shortfall_id = %s", (parsed.shortfall_id,)
+    )
+    row = await cur.fetchone()
+    if row is None:
+        log.info("inbound shortfall button ignored: unknown shortfall")
+        return None
+    run_id: uuid.UUID = row[0]
+    ctx = RunContext(
+        run_id=run_id,
+        agent_id=API_AGENT,
+        conversation_id=ids.shortfall_conversation_id(parsed.shortfall_id),
+    )
+    try:
+        result = await call_tool(
+            HOUSEHOLD_SERVER,
+            CHOOSE_SHORTFALL_OPTION,
+            {
+                "shortfall_id": str(parsed.shortfall_id),
+                "line": parsed.line,
+                "pick": parsed.pick,
+                "user_id": str(member.user_id),
+            },
+            ctx=ctx,
+            token=_service_token(),
+        )
+    except ToolRefused as exc:
+        log.info("shortfall pick refused", extra={"reason": exc.reason})
+        return run_id
+    if result.get("outcome") == "already_decided":
+        await outbox.send(
+            conn,
+            message_id=ids.message_id(inbound, 0),
+            run_id=run_id,
+            conversation_id=None,
+            causation_id=None,
+            from_agent=API_AGENT,
+            to_agent=WHATSAPP,
+            type="whatsapp_out",
+            body={
+                "user_id": str(member.user_id),
+                "template": ALREADY_DECIDED,
+                "params": {},
+                "buttons": [],
+            },
+        )
+    return run_id

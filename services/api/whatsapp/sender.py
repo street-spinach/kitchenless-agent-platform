@@ -91,6 +91,8 @@ MAX_BUTTONS = 3
 TEXTS: dict[str, str] = {
     "retry_prompt": "I couldn't finish this. Reply *retry* to try again.",
     "media_not_supported": "Photos and voice notes aren't supported yet.",
+    # Agent-protocol §10 "Replies".
+    "already_decided": "Already decided.",
     # Approvals (architecture §8, CUJs 3 and 7, item 33; #63). `{name}` is a `params` value.
     "approval_request": "Your agent wants to spend {amount}, over this week's budget. Approve?",
     "approval_expired": "This approval has already expired.",
