@@ -5,6 +5,8 @@ mock restaurant backend in `services/mocks/restaurants.py`, for one card and the
 `env`. The real adapter (Square restaurant) arrives in build step 7.
 """
 
+from typing import ClassVar
+
 from services.common.directory import AgentCard
 from services.mocks.restaurants import MockRestaurant
 
@@ -12,5 +14,7 @@ __all__ = ["MockRestaurantAdapter"]
 
 
 class MockRestaurantAdapter(MockRestaurant):
+    OPERATIONS: ClassVar[frozenset[str]] = frozenset({"place_order", "amend_order"})
+
     def __init__(self, card: AgentCard, env: str) -> None:
         super().__init__(env=env, agent_id=card.agent_id, zone_ids=card.zone_ids)

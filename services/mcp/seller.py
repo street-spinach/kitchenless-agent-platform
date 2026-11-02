@@ -20,6 +20,10 @@ Only cards of the server's class may call its tools. Each tool picks its adapter
 card's vendor key, `vendors.card_vendor_key(area, card, tool)`: a `mock` card (`None`)
 always uses the area's mock adapter; any other key goes through
 `modes.adapter_for(key, ctx.modes)`, which never falls back to the mock.
+
+`place_order` and `amend_order` resolve the adapter before the guard. The first limit
+refuses with `unsupported` when the tool is not in the adapter class's `OPERATIONS`
+(adapters §8), so the refusal comes before the idempotency key is claimed.
 """
 
 import json
@@ -27,7 +31,7 @@ import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any, Protocol
+from typing import Any, ClassVar, Protocol
 
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import CallToolResult, TextContent
@@ -52,6 +56,7 @@ __all__ = [
     "SearchFilters",
     "SellerAdapter",
     "SellerTools",
+    "UNSUPPORTED",
     "register",
 ]
 
@@ -62,12 +67,19 @@ INVALID_STATE = "invalid_state"
 ITEMS_CHANGED = "items_changed"
 # `delivery_agent_id` is not an enabled delivery card.
 INVALID_COURIER = "invalid_courier"
+# The card's adapter class does not support this guarded tool (adapters §8).
+UNSUPPORTED = "unsupported"
 # `amend_order` changes an order only after the courier is booked and before `delivered`.
 _AMEND_STATES = frozenset({"courier_booked", "in_delivery"})
 
 
 class SellerAdapter(Protocol):
-    """The grocery and restaurant adapter interface (item 44). Real and mock alike."""
+    """The grocery and restaurant adapter interface (item 44). Real and mock alike.
+
+    `OPERATIONS` names the guarded seller tools the class supports (adapters §8).
+    """
+
+    OPERATIONS: ClassVar[frozenset[str]]
 
     async def search_items(self, query: str, filters: Mapping[str, Any]) -> dict[str, Any]: ...
 
@@ -190,11 +202,14 @@ class SellerTools:
         delivery_agent_id: str,
     ) -> dict[str, Any]:
         card = await self.seller_card(ctx)
+        adapter = self.adapter(card, "place_order", ctx)
         org = card.owner_ref if card.owner_ref.startswith("org:") else None
         key = ids.idempotency_key(order_id, "place_order", ctx.agent_id)
         order: dict[str, Any] = {}
 
         async def check(conn: AsyncConnection) -> None:
+            if "place_order" not in type(adapter).OPERATIONS:
+                raise GuardRefused(UNSUPPORTED)
             self.require_seller(card)
             if org is None:
                 raise GuardRefused(AUTHZ_DENIED)
@@ -216,7 +231,7 @@ class SellerTools:
             limits.check_coverage(courier, order["zone_id"])
 
         async def call() -> dict[str, Any]:
-            placed = await self.adapter(card, "place_order", ctx).place_order(
+            placed = await adapter.place_order(
                 idempotency_key=ids.vendor_key(key),
                 order_id=str(order_id),
                 lines=order["lines"],
@@ -269,6 +284,7 @@ class SellerTools:
         picks: Mapping[Any, str],
     ) -> dict[str, Any]:
         card = await self.seller_card(ctx)
+        adapter = self.adapter(card, "amend_order", ctx)
         org = card.owner_ref if card.owner_ref.startswith("org:") else None
         given = {str(int(line)): str(pick) for line, pick in picks.items()}
         final: dict[str, str] = {}
@@ -276,6 +292,8 @@ class SellerTools:
         order: dict[str, Any] = {}
 
         async def check(conn: AsyncConnection) -> None:
+            if "amend_order" not in type(adapter).OPERATIONS:
+                raise GuardRefused(UNSUPPORTED)
             self.require_seller(card)
             if org is None:
                 raise GuardRefused(AUTHZ_DENIED)
@@ -320,7 +338,7 @@ class SellerTools:
                         conn, order_id, amend_picks(), order["notice"]
                     )
             lines = [_wire_line(row) for row in preview.lines]
-            amended = await self.adapter(card, "amend_order", ctx).amend_order(
+            amended = await adapter.amend_order(
                 external_order_id=order["external_order_id"],
                 lines=[
                     {"sku": i["sku"], "qty": i["qty"], "unit_minor": i["unit_minor"]} for i in lines
