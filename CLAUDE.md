@@ -6,7 +6,10 @@ negotiate and order food on behalf of people. See docs/designs/SITEMAP.md.
 
 ## Source of truth
 - Approved designs in docs/designs/ define what to build. Follow them exactly.
-- If a design is ambiguous or wrong, stop and say so. Don't guess, and don't redesign.
+- If a design is wrong, stop and say so. Don't redesign.
+- If a design leaves a small detail open, decide it (follow existing designs and code first,
+  fail closed, smallest change), keep every safety rule, and record the decision under
+  `## Decisions` in the PR body (scripts/prompts/implement.md).
 
 ## Commands
 - make up / make down: run the stack locally (Docker Compose)

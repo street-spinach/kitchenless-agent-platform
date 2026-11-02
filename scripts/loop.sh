@@ -4,7 +4,7 @@ set -uo pipefail
 
 MAX_ISSUES="${MAX_ISSUES:-10}"
 MAX_TURNS="${MAX_TURNS:-80}"
-MERGE_TIMEOUT_MIN="${MERGE_TIMEOUT_MIN:-20}"
+MERGE_TIMEOUT_MIN="${MERGE_TIMEOUT_MIN:-45}"
 STOP_FILE=".loop-stop"
 LOG_DIR=".loop-logs"
 mkdir -p "$LOG_DIR"
@@ -91,6 +91,15 @@ while [ "$done_count" -lt "$MAX_ISSUES" ] && [ ! -f "$STOP_FILE" ]; do
 
   pr=$(gh pr list --head "issue-$issue" --state open --json number -q '.[0].number')
   if [ -z "$pr" ]; then
+    if has_label "$issue" ready && ! deps_done "$issue"; then
+      # The agent found an unlisted blocker, added it under "Depends on" and put the issue
+      # back to ready. That run doesn't count as an attempt.
+      gh issue edit "$issue" --remove-label "in-progress,attempt-$((a + 1))"
+      log "#$issue waits for a blocker the agent added. Back to ready."
+      git checkout -q main
+      continue
+    fi
+    gh issue edit "$issue" --remove-label ready 2>/dev/null || true
     if ! has_label "$issue" needs-human && ! has_label "$issue" design-change; then
       gh issue edit "$issue" --add-label needs-human
       gh issue comment "$issue" --body "Loop: agent finished without opening a PR. See local logs."
