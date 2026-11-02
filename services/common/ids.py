@@ -1,8 +1,8 @@
 """Every shared id and idempotency key (architecture item 4, agent-protocol P6).
 
 All ids are deterministic: they are derived from values passed in and never from random or
-time-based parts, so a replayed step produces the same ids. The one exception is
-`new_run_id`, which is only called once per trigger (see its docstring).
+time-based parts, so a replayed step produces the same ids. The exceptions are the two
+random ids: `new_run_id` and `new_eval_run_id` (see their docstrings).
 """
 
 from uuid import UUID, uuid4, uuid5
@@ -232,9 +232,18 @@ def inbound_id(channel: str, external_id: str) -> UUID:
 def new_run_id() -> UUID:
     """A fresh `run_id` for `runs.start()` when the caller has none to derive it from.
 
-    The one random id in this module. A run is started once, inside the transaction that
+    One of the two random ids in this module. A run is started once, inside the transaction that
     inserts its trigger (an `inbound_messages` row or a `POST /runs` call), so a replay never
     reaches it. A2A demo runs derive theirs with `a2a_run_id`.
+    """
+    return uuid4()
+
+
+def new_eval_run_id() -> UUID:
+    """A fresh `eval_run_id` for an `eval_runs` row (evals design §6).
+
+    The other random id in this module. The eval runner calls it once at the start of an
+    eval run; nothing replays an eval run, so there is nothing to derive it from.
     """
     return uuid4()
 

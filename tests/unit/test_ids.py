@@ -193,6 +193,13 @@ def test_new_run_id_is_fresh() -> None:
     assert ids.new_run_id() != ids.new_run_id()
 
 
+def test_new_eval_run_id_is_fresh() -> None:
+    # Evals §6: random (uuid4), so two calls differ.
+    first, second = ids.new_eval_run_id(), ids.new_eval_run_id()
+    assert first != second
+    assert first.version == 4
+
+
 def test_keycloak_client_id_replaces_the_class_separator() -> None:
     assert ids.keycloak_client_id("household:us-1") == "household.us-1"
     assert ids.keycloak_client_id("consumer:us-1-a") == "consumer.us-1-a"
