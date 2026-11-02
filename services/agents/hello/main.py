@@ -2,6 +2,7 @@
 
 import json
 import os
+import uuid
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -20,6 +21,19 @@ def run(writer: Any, text: str) -> None:
     writer.write("message", {"direction": "in", "text": text})
     writer.write("decision", {"reply": f"hello, {text}"})
     writer.write("outcome", {"status": "ok"})
+
+
+def start_run(text: str, on_behalf_of: str | None = None) -> uuid.UUID:
+    """Run the hello flow with the real trace writer and return its run id.
+
+    `api` serves `POST /hello/run` with this (architecture item 31, build step 6).
+    """
+    writer = real_writer(on_behalf_of)
+    try:
+        run(writer, text)
+    finally:
+        writer.close()
+    return writer.run_id
 
 
 class Handler(BaseHTTPRequestHandler):

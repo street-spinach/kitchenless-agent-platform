@@ -10,14 +10,17 @@
 	handle /health {
 		reverse_proxy api:8000
 	}
-	# Placeholder hello agent, including POST /hello/run, which writes trace rows.
-	# Moves into api in build step 6.
+	# Placeholder hello flow: POST /hello/run on api writes trace rows (architecture item 31).
 	handle /hello* {
-		reverse_proxy hello:8000
+		reverse_proxy api:8000
 	}
-	# Mock business systems and the demo control panel.
+	# Control panel routes on api, behind basic auth (architecture items 39 and 57).
+	# PANEL_USER and PANEL_PASSWORD_HASH come from docker-compose.yml.
 	handle /panel* {
-		reverse_proxy mocks:8001
+		basic_auth {
+			{$PANEL_USER} {$PANEL_PASSWORD_HASH}
+		}
+		reverse_proxy api:8000
 	}
 	# Keycloak, served under /auth (KC_HTTP_RELATIVE_PATH in docker-compose.yml).
 	handle /auth* {

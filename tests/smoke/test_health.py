@@ -18,8 +18,6 @@ def http_ok(url: str) -> bool:
 @pytest.mark.parametrize(
     "url",
     [
-        "http://hello:8000/health",
-        "http://mocks:8001/health",
         "http://api:8000/health",
         "http://mcp:8002/health",
         "http://agents:8003/health",
@@ -74,3 +72,17 @@ def test_caddy_serves_health_over_https() -> None:
 def test_internal_routes_not_public(method: str, path: str) -> None:
     # These live on api, mcp and agents but must only be reachable inside the Compose network.
     assert caddy_status_line(method, path).startswith(b"HTTP/1.1 404")
+
+
+def test_caddy_routes_hello_run_to_api() -> None:
+    # The hello container is retired (build step 6); Caddy sends /hello* to api.
+    assert caddy_status_line("POST", "/hello/run").startswith(b"HTTP/1.1 200")
+
+
+@pytest.mark.parametrize(
+    "method,path",
+    [("POST", "/panel/reset"), ("GET", "/panel/runs/live"), ("PUT", "/panel/modes/doordash")],
+)
+def test_panel_requires_basic_auth(method: str, path: str) -> None:
+    # The panel routes live on api now; Caddy refuses them without credentials.
+    assert caddy_status_line(method, path).startswith(b"HTTP/1.1 401")

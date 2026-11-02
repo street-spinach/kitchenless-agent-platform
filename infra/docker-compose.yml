@@ -10,19 +10,6 @@ x-app: &app
   image: spinach-app:local
   restart: unless-stopped
 
-# Environment for the Phase 0 hello and mocks containers (retired in build step 6).
-x-legacy-env: &legacy-env
-  MODE: ${MODE:-mock}
-  DOMAIN: ${DOMAIN:-localhost}
-  DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
-  NEO4J_URI: bolt://neo4j:7687
-  NEO4J_USER: neo4j
-  NEO4J_PASSWORD: ${NEO4J_PASSWORD}
-  OPENFGA_API_URL: http://openfga:8080
-  KEYCLOAK_URL: http://keycloak:8080/auth
-  ORCHESTRATOR_URL: http://hello:8000
-  MUSE_API_KEY: ${MUSE_API_KEY:-}
-
 # Environment matrix (docs/designs/architecture.md, "Environment matrix"). One block per
 # row group; each service merges the blocks the matrix names for it. SERVICE_NAME is set
 # per service.
@@ -258,40 +245,16 @@ services:
       - "127.0.0.1:8003:8003"
     healthcheck: *app-health
 
-  # Phase 0 containers, kept until build step 6.
-  hello:
-    <<: *app
-    command: ["python", "-m", "services.agents.hello.main"]
-    environment:
-      <<: *legacy-env
-      PORT: "8000"
-    depends_on:
-      migrate: { condition: service_completed_successfully }
-    # Host port 8000 belongs to api; until step 6 hello is reached from the host on 8004
-    # (`make eval-fast`). Inside the network it stays at hello:8000.
-    ports:
-      - "127.0.0.1:8004:8000"
-    healthcheck: *app-health
-
-  mocks:
-    <<: *app
-    command: ["python", "-m", "services.mocks.panel"]
-    environment:
-      <<: *legacy-env
-      PORT: "8001"
-    depends_on:
-      migrate: { condition: service_completed_successfully }
-    ports:
-      - "127.0.0.1:8001:8001"
-    healthcheck: *app-health
-
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
     environment:
       DOMAIN: ${DOMAIN:-localhost}
-      PANEL_USER: ${PANEL_USER:-}
-      PANEL_PASSWORD_HASH: ${PANEL_PASSWORD_HASH:-}
+      # /panel/* basic auth (Caddyfile). When these are empty the panel fails closed: the
+      # default is a base64 bcrypt hash of a discarded random password, so nobody can log in
+      # and Caddy still starts.
+      PANEL_USER: ${PANEL_USER:-panel-disabled}
+      PANEL_PASSWORD_HASH: ${PANEL_PASSWORD_HASH:-JDJiJDE0JEd3djJVcVhOUTNPU0Nza01uQXFJNS5BYTVTTHdhWm85M3VQVWxLL0NFWGtJN24vOVUyWHFx}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddydata:/data
@@ -301,8 +264,6 @@ services:
       - "443:443"
     depends_on:
       api: { condition: service_healthy }
-      hello: { condition: service_healthy }
-      mocks: { condition: service_healthy }
       keycloak: { condition: service_healthy }
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2019/config/"]
@@ -323,9 +284,9 @@ services:
       A2A_DEMO_TOKEN: ${A2A_DEMO_TOKEN}
       AGENTS_URL: ${AGENTS_URL:-http://agents:8003}
       SEED_US1_PHONES: ${SEED_US1_PHONES:-}
-      # Used by the smoke tests (Caddy SNI) and the eval runner until step 6.
+      # Used by the smoke tests (Caddy SNI) and the eval runner (POST /hello/run on api).
       DOMAIN: ${DOMAIN:-localhost}
-      ORCHESTRATOR_URL: http://hello:8000
+      ORCHESTRATOR_URL: http://api:8000
 
   # The ci profile is reserved for CI-only helpers (for example a stub token issuer).
   # Today `--profile ci` starts the same services as `make up`.
