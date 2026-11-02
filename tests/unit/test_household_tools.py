@@ -102,15 +102,16 @@ def _seed(pg: str) -> uuid.UUID:
     return run_id
 
 
-def _order(pg: str, run_id: uuid.UUID, state: str) -> uuid.UUID:
+def _order(pg: str, run_id: uuid.UUID, state: str, kind: str = "grocery") -> uuid.UUID:
     order_id = uuid.uuid4()
     _exec(
         pg,
         "INSERT INTO orders (order_id, run_id, household_id, kind, state, currency, address_ref)"
-        " VALUES (%s, %s, %s, 'grocery', %s, 'USD', %s)",
+        " VALUES (%s, %s, %s, %s, %s, 'USD', %s)",
         order_id,
         run_id,
         HOUSEHOLD,
+        kind,
         state,
         ids.seed_address_ref(HOUSEHOLD),
     )
@@ -315,3 +316,289 @@ def test_set_order_state_limited_states(pg: str, monkeypatch: pytest.MonkeyPatch
     refused = [r for r in _results(pg, run_id, "set_order_state") if r["refused"]]
     assert [r["reason"] for r in refused] == [household.STATE_NOT_ALLOWED] * 7
     assert household.SETTABLE_STATES == {"quoting", "negotiating", "cancelled"}
+
+
+# --- agents tools (agents design §9, §10; file 13) ------------------------------------
+
+CONSUMER = "consumer:us-1-a"
+OTHER_USER = ids.seed_user_id("us-1-b")
+
+
+def _agent_ctx(run_id: uuid.UUID, agent: str, sub: str) -> CallContext:
+    return CallContext(
+        run_id=run_id,
+        agent_id=agent,
+        conversation_id=None,
+        attempt=1,
+        token=tokens.MockIssuer(secret=SECRET).issue(sub, agent, []),
+        env="live",
+        modes={},
+        on_behalf_of=agent,
+    )
+
+
+def _consumer_ctx(run_id: uuid.UUID) -> CallContext:
+    return _agent_ctx(run_id, CONSUMER, f"user:{USER}")
+
+
+def _api_ctx(run_id: uuid.UUID) -> CallContext:
+    return _agent_ctx(run_id, household.API_AGENT, household.API_AGENT)
+
+
+def _add_member(pg: str, user_id: uuid.UUID, name: str, role: str = "member") -> None:
+    _exec(pg, "INSERT INTO users (user_id, display_name) VALUES (%s, %s)", user_id, name)
+    _exec(
+        pg,
+        "INSERT INTO household_members (household_id, user_id, role) VALUES (%s, %s, %s)",
+        HOUSEHOLD,
+        user_id,
+        role,
+    )
+
+
+def _constraint(pg: str, user_id: uuid.UUID, kind: str, value: str, source: str = "seed") -> None:
+    _exec(
+        pg,
+        "INSERT INTO member_constraints (user_id, kind, value, source) VALUES (%s, %s, %s, %s)",
+        user_id,
+        kind,
+        value,
+        source,
+    )
+
+
+def _dislike(
+    pg: str, monkeypatch: pytest.MonkeyPatch, run_id: uuid.UUID, value: str, action: str
+) -> dict[str, Any]:
+    return _with_pool(
+        pg,
+        monkeypatch,
+        lambda: household.record_dislike(
+            _consumer_ctx(run_id), user_id=USER, value=value, action=action
+        ),
+    )
+
+
+def _dislike_rows(pg: str) -> list[tuple[str, str]]:
+    rows = _query(
+        pg,
+        "SELECT value, source FROM member_constraints WHERE user_id = %s AND kind = 'dislike'"
+        " ORDER BY value, source",
+        USER,
+    )
+    return [(r["value"], r["source"]) for r in rows]
+
+
+def test_record_dislike_add_remove(
+    pg: str, monkeypatch: pytest.MonkeyPatch, _auth: list[tuple[str, str, str]]
+) -> None:
+    run_id = _seed(pg)
+
+    outcomes = [
+        _dislike(pg, monkeypatch, run_id, " Mushrooms ", "add")["outcome"],
+        _dislike(pg, monkeypatch, run_id, "mushrooms", "add")["outcome"],
+    ]
+    assert outcomes == ["added", "already_present"]
+    assert _dislike_rows(pg) == [("mushrooms", "learned")]
+
+    outcomes = [
+        _dislike(pg, monkeypatch, run_id, "mushrooms", "remove")["outcome"],
+        _dislike(pg, monkeypatch, run_id, "mushrooms", "remove")["outcome"],
+    ]
+    assert outcomes == ["removed", "not_learned"]
+    assert _dislike_rows(pg) == []
+    assert ("agent:" + CONSUMER, "acts_for", f"user:{USER}") in _auth
+    # The guard traced every call.
+    assert len(_results(pg, run_id, "record_dislike")) == 4
+
+
+def test_record_dislike_seeded_row_present(pg: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    run_id = _seed(pg)
+    _constraint(pg, USER, "dislike", "olives")
+
+    assert _dislike(pg, monkeypatch, run_id, "Olives", "add")["outcome"] == "already_present"
+    assert _dislike_rows(pg) == [("olives", "seed")]
+    # A seeded row is never deleted.
+    assert _dislike(pg, monkeypatch, run_id, "olives", "remove")["outcome"] == "not_learned"
+    assert _dislike_rows(pg) == [("olives", "seed")]
+
+
+def test_record_dislike_other_user_denied(pg: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    run_id = _seed(pg)
+    _add_member(pg, OTHER_USER, "Ben")
+    allowed = (f"agent:{CONSUMER}", "acts_for", f"user:{USER}")
+
+    def check(user: str, relation: str, object: str) -> tuple[bool, str]:
+        return (user, relation, object) == allowed, "model-1"
+
+    monkeypatch.setattr(fga, "check", check)
+
+    with pytest.raises(GuardRefused) as e:
+        _with_pool(
+            pg,
+            monkeypatch,
+            lambda: household.record_dislike(
+                _consumer_ctx(run_id), user_id=OTHER_USER, value="okra", action="add"
+            ),
+        )
+    assert e.value.reason == household.AUTHZ_DENIED
+    assert _query(pg, "SELECT 1 FROM member_constraints WHERE user_id = %s", OTHER_USER) == []
+
+
+def test_record_dislike_bad_shape(pg: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    run_id = _seed(pg)
+
+    for value in ("5 dollars", ""):
+        with pytest.raises(GuardRefused) as e:
+            _dislike(pg, monkeypatch, run_id, value, "add")
+        assert e.value.reason == household.INVALID_VALUE
+    # An action outside add and remove fails closed the same way.
+    with pytest.raises(GuardRefused) as e:
+        _dislike(pg, monkeypatch, run_id, "okra", "replace")
+    assert e.value.reason == household.INVALID_VALUE
+    assert _dislike_rows(pg) == []
+    refused = [r["reason"] for r in _results(pg, run_id, "record_dislike") if r["refused"]]
+    assert refused == [household.INVALID_VALUE] * 3
+
+
+def test_get_household_allergens_union(
+    pg: str, monkeypatch: pytest.MonkeyPatch, _auth: list[tuple[str, str, str]]
+) -> None:
+    run_id = _seed(pg)
+    _add_member(pg, OTHER_USER, "Ben")
+    outsider = uuid.uuid4()
+    _exec(pg, "INSERT INTO users (user_id, display_name) VALUES (%s, 'Out')", outsider)
+    _constraint(pg, USER, "allergy", "peanuts")
+    _constraint(pg, USER, "allergy", "milk")
+    _constraint(pg, OTHER_USER, "allergy", "sesame")
+    _constraint(pg, OTHER_USER, "allergy", "milk")
+    _constraint(pg, OTHER_USER, "diet", "vegetarian")
+    _constraint(pg, OTHER_USER, "dislike", "okra")
+    _constraint(pg, outsider, "allergy", "fish")
+
+    result = _with_pool(pg, monkeypatch, lambda: household.get_household_allergens(_ctx(run_id)))
+
+    assert result == {"allergens": ["milk", "peanuts", "sesame"]}
+    assert ("agent:" + AGENT, "acts_for", f"household:{HOUSEHOLD}") in _auth
+
+
+def test_get_household_rules_default(pg: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    run_id = _seed(pg)
+
+    def rules() -> dict[str, Any]:
+        return _with_pool(pg, monkeypatch, lambda: household.get_household_rules(_ctx(run_id)))
+
+    assert rules() == {"take_turns": False, "turn_index": 0, "approver_user_id": str(USER)}
+    _exec(
+        pg,
+        "INSERT INTO household_rules (household_id, take_turns, turn_index) VALUES (%s, true, 3)",
+        HOUSEHOLD,
+    )
+    assert rules() == {"take_turns": True, "turn_index": 3, "approver_user_id": str(USER)}
+
+
+def _advance(
+    pg: str, monkeypatch: pytest.MonkeyPatch, run_id: uuid.UUID, order_id: uuid.UUID
+) -> dict[str, Any]:
+    return _with_pool(
+        pg, monkeypatch, lambda: household.advance_turn(_ctx(run_id), order_id=order_id)
+    )
+
+
+def _turn(pg: str) -> dict[str, Any]:
+    [row] = _query(
+        pg,
+        "SELECT turn_index, last_turn_order_id FROM household_rules WHERE household_id = %s",
+        HOUSEHOLD,
+    )
+    return row
+
+
+def test_advance_turn_once_per_order(pg: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    run_id = _seed(pg)
+    first = _order(pg, run_id, "delivered", "dinner")
+    second = _order(pg, run_id, "delivered", "dinner")
+
+    # With no rule row, or take-turns off, nothing advances.
+    assert _advance(pg, monkeypatch, run_id, first) == {"advanced": False}
+    _exec(pg, "INSERT INTO household_rules (household_id) VALUES (%s)", HOUSEHOLD)
+    assert _advance(pg, monkeypatch, run_id, first) == {"advanced": False}
+    assert _turn(pg) == {"turn_index": 0, "last_turn_order_id": None}
+
+    _exec(pg, "UPDATE household_rules SET take_turns = true WHERE household_id = %s", HOUSEHOLD)
+    assert _advance(pg, monkeypatch, run_id, first) == {"advanced": True}
+    assert _advance(pg, monkeypatch, run_id, first) == {"advanced": False}
+    assert _turn(pg) == {"turn_index": 1, "last_turn_order_id": first}
+
+    assert _advance(pg, monkeypatch, run_id, second) == {"advanced": True}
+    assert _turn(pg) == {"turn_index": 2, "last_turn_order_id": second}
+
+
+def test_advance_turn_wrong_order(pg: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    run_id = _seed(pg)
+    _exec(
+        pg,
+        "INSERT INTO household_rules (household_id, take_turns) VALUES (%s, true)",
+        HOUSEHOLD,
+    )
+    wrong = [
+        _order(pg, run_id, "delivered", "grocery"),
+        _order(pg, run_id, "placed", "dinner"),
+        uuid.uuid4(),
+    ]
+
+    for order_id in wrong:
+        with pytest.raises(GuardRefused) as e:
+            _advance(pg, monkeypatch, run_id, order_id)
+        assert e.value.reason == household.WRONG_ORDER_STATE
+    assert _turn(pg) == {"turn_index": 0, "last_turn_order_id": None}
+
+
+def _set_take_turns(
+    pg: str,
+    monkeypatch: pytest.MonkeyPatch,
+    ctx: CallContext,
+    order_id: uuid.UUID,
+    on: bool,
+    user_id: uuid.UUID,
+) -> dict[str, Any]:
+    return _with_pool(
+        pg,
+        monkeypatch,
+        lambda: household.set_take_turns(ctx, order_id=order_id, on=on, user_id=user_id),
+    )
+
+
+def test_set_take_turns_approver_only(pg: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    run_id = _seed(pg)
+    _add_member(pg, OTHER_USER, "Ben")
+    order_id = _order(pg, run_id, "delivered", "dinner")
+
+    cases = [
+        (_api_ctx(run_id), order_id, OTHER_USER, "wrong_approver"),
+        (_ctx(run_id), order_id, USER, household.AUTHZ_DENIED),
+        (_api_ctx(run_id), uuid.uuid4(), USER, household.AUTHZ_DENIED),
+    ]
+    for ctx, order, user, reason in cases:
+        with pytest.raises(GuardRefused) as e:
+            _set_take_turns(pg, monkeypatch, ctx, order, True, user)
+        assert e.value.reason == reason
+    assert _query(pg, "SELECT 1 FROM household_rules") == []
+
+
+def test_set_take_turns_changed_flag(pg: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    run_id = _seed(pg)
+    order_id = _order(pg, run_id, "delivered", "dinner")
+
+    def tap(on: bool) -> dict[str, Any]:
+        return _set_take_turns(pg, monkeypatch, _api_ctx(run_id), order_id, on, USER)
+
+    assert tap(False) == {"changed": False, "take_turns": False}
+    assert tap(True) == {"changed": True, "take_turns": True}
+    assert tap(True) == {"changed": False, "take_turns": True}
+    [row] = _query(
+        pg, "SELECT take_turns, set_by FROM household_rules WHERE household_id = %s", HOUSEHOLD
+    )
+    assert row == {"take_turns": True, "set_by": USER}
+    assert tap(False) == {"changed": True, "take_turns": False}
+    assert len(_results(pg, run_id, "set_take_turns")) == 4

@@ -73,6 +73,18 @@ _RESET_SQL: tuple[tuple[str, str], ...] = (
         " (SELECT household_id FROM households WHERE env = 'eval')",
     ),
     ("orders", "DELETE FROM orders WHERE run_id = ANY(%(runs)s)"),
+    # Learned dislikes and take-turns rules of eval households (agents §9, §10; AG-A12).
+    (
+        "member_constraints",
+        "DELETE FROM member_constraints WHERE source = 'learned' AND user_id IN"
+        " (SELECT hm.user_id FROM household_members hm JOIN households h"
+        "  ON h.household_id = hm.household_id WHERE h.env = 'eval')",
+    ),
+    (
+        "household_rules",
+        "DELETE FROM household_rules WHERE household_id IN"
+        " (SELECT household_id FROM households WHERE env = 'eval')",
+    ),
     ("runs", "DELETE FROM runs WHERE run_id = ANY(%(runs)s)"),
     (
         "sim_outbound",
