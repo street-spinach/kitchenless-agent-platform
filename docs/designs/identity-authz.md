@@ -277,6 +277,8 @@ below as asked.
     rather than Expo Go. The experience design confirms which one. Build step 13 waits for
     this answer.
 
+*Amended 2026-11-03 (experience, #271):* Q5 is resolved by the utility templates `consent_renewal_v1` and `consent_revoked_v1`, holdable as `grant`, with a Renew button that sends a fresh link. Q6 is resolved: the owner app is a web export at `/owner/`, redirect `https://<host>/owner/auth` (experience.md EX-A10).
+
 ## Critical User Journeys (CUJs)
 
 ### I-CUJ 1: Admin joins and grants consent
@@ -620,6 +622,8 @@ first start against an empty `keycloak` database (I-D16).
 
 Business owners and organizations are seeded only (Non-Goals).
 
+*Amended 2026-11-03 (experience, #271):* the onboarding chat calls `create_child` (on an admin's "Yes" tap, in `api`) and `create_person` (on a `JOIN <code>` message from the code's bound phone, in `api`) (experience.md §9, EX-A10).
+
 ### 6. Consent and grants
 
 **Scopes per agent class** (Keycloak client scopes; the consent screen lists them):
@@ -684,6 +688,8 @@ for a child).
 *   The app's `expires_at` decides.
 *   Keycloak's offline idle and max limits are set to the same 30 days, as a backstop.
 *   Keycloak's idle timer resets on every refresh, so it cannot be the only clock.
+
+*Amended 2026-11-03 (experience, #271):* `links.issue` gains `next: Literal["household", "pantry", "history", "agents"] | None`, stored on the link and used by the callback redirect (default `/me/agents`) (experience.md §7, EX-A15).
 
 ### 7. OpenFGA model
 
@@ -866,6 +872,8 @@ raises `AuthzUnavailable` with reason `authz_unavailable`, not a refusal (I-G9).
 
 *Amended 2026-11-02 (agents, #186):* `household_rules` joins the list of household-owned tables (agents.md §10, AG-A6).
 
+*Amended 2026-11-03 (experience, #271):* the tables `join_codes`, `onboarding_proposals`, `held_messages`, `whatsapp_sends`, `reminders` and `meal_reactions` join the household-scoped list; the `unscoped` allowlist gains `join_lookup`, `held_release`, `setup_phone_check`, `reminder_pass` and `control.reset`; `scope.org_scoped` is added; `TOOL_SCOPES` gains `get_setup_state`, `propose_setup` (delegated) and `apply_setup`, `complete_join`, `set_household_take_turns`, `react_to_meal`, `record_pantry_check` (service, `svc.api`) (experience.md EX-A11).
+
 ### 9. Money: one approval, two triggers
 
 **The rule** (I-D17). For each `authorize_spend`, the guard computes, in code:
@@ -991,6 +999,8 @@ when it can be sent).
 "validate the caller token (sub and act)", accepted by the owner on 2026-11-01 and active
 only in this mode. The `act_missing` refusal applies in every other mode. Demo moment 1
 shows `azp` instead of `act`.
+
+*Amended 2026-11-03 (experience, #271):* the renew text becomes `consent_renewal` and the revoke notice `consent_revoked` (experience.md §6 wording, a Renew button, Meta templates outside the window, holdable as `grant`), replacing "outside it, the panel shows re-consent needed". The approval prompt is neutral (amount and reply-by time); I26's `test_approval_prompt_names_both_limits` becomes `test_approval_prompt_has_amount_and_reply_by` (experience.md EX-A15).
 
 ### 12a. Spike outcomes
 

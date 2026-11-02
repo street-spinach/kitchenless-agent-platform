@@ -157,6 +157,8 @@ Building Square for real also exposes gaps the provisional contracts never had t
 *   **A courier price check at booking.** Quotes stay zone-level. Re-pricing with the
     address is defined when the first real courier is connected (Future Improvements).
 
+*Amended 2026-11-03 (experience, #271):* the owner app shows connection status read-only (`resolve_modes` and `adapter_modes.set_at`); no OAuth (experience.md EX-A13).
+
 ## Open Questions
 
 *   **Square sandbox behaviour not yet checked.** Build step 0 (an extended spike the owner

@@ -471,6 +471,8 @@ pure function over `services/seed/data/households.yaml` and `rules.yaml` (modell
 | `no_grant_for` | [agent id] | Marks those seeded grants `revoked` | Sets eval grants back to `active` | identity-authz step 11 (E-A18) |
 | `add_child` | `{display_name, consented}` | `onboarding.create_child` | Deletes eval members whose `member_id` is not in the seed file | identity-authz step 9 (E-A18) |
 
+*Amended 2026-11-03 (experience, #271):* experience.md §14 adds safety and task cases and the setup keys `last_inbound_hours_ago`, `setup_incomplete` and `join_code`, each undone by the next reset (experience.md EX-A14).
+
 ### 5. Runner contract
 
 **Flags.** `--tag <tag>` or `--all` (existing), `--cases-file <yaml list of ids>`,

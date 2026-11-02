@@ -277,6 +277,8 @@ Each goal has a test, an eval or a measurement in the Verification Plan.
     *Amended 2026-11-02 (adapters, #146):* restated. Q6 closes when the first real courier key exists (adapters.md §12).
     It blocks no build step. DoorDash Drive is simulated until then.
 
+*Amended 2026-11-03 (experience, #271):* Q5 is resolved: messages outside the 24-hour window go as utility Meta templates submitted by hand, and as held items until one is approved; groups stay out (experience.md EX-OD4, EX-OD14, EX-A1).
+
 ## Critical User Journeys (CUJs)
 
 ### CUJ 1: Weekly grocery order, within budget
@@ -633,6 +635,8 @@ outbox and marks the timer `done`.
 | `shortfall_expiry` | When the household agent opens a shortfall (due at its `reply_by`) | Never; the update is conditional | Close the shortfall if still `pending` and send `shortfall_closed {reason: timeout}` (agent-protocol §10) |
 
 *Amended 2026-11-02 (agents, #186):* business choice points pass their own guidance to `choose()`, placed before the existing contract text. Allowed sets, rule defaults and rationale rules are unchanged (agents.md §12, AG-A10 and AG-A11). In the household graph, code decides the counter and the offer; Spark writes only the explanation (agents.md §7, §11).
+
+*Amended 2026-11-03 (experience, #271):* the sweeper also runs a reminder pass every 60 s that derives due reminders from current state (`delivery_today`, `pantry_summary`); `timers` is unchanged (experience.md §10, EX-A2). `runs.retry_target` never returns a run with `household_id IS NULL` or `trigger.source` in (`code`, `join`, `tap`, `me`, `reminder`) (experience.md §3, EX-A16).
 
 ### 5. MCP servers and adapters
 
@@ -1056,6 +1060,8 @@ and is not retried) and a token refused by the guard (one fresh token, then the 
 When the poison rule's last attempt fails with `identity_unavailable` or
 `authz_unavailable`, the run's reason is that code, not `poison_message`.
 
+*Amended 2026-11-03 (experience, #271):* the sim sender applies the same payload validation and 24-hour window check as the real sender; seeded and sim phones start inside the window (`last_inbound_at = now()` at seed and at `POST /panel/reset`) (experience.md §5, EX-A4).
+
 ### 10. Trace model
 
 `agent_traces` (`migrations/0001_agent_traces.sql`) gets additive changes:
@@ -1159,6 +1165,8 @@ G6 measures the **peak** during a full weekly-order run: `docker stats` sampled 
     approves it.
 *   Create `/opt/app/DEPLOY_FREEZE`.
 
+*Amended 2026-11-03 (experience, #271):* Caddy adds `handle /owner/*`, reverse-proxied to `api`, which serves the Expo owner-app web export from the image; the image build gains a `node:22` stage that produces the export, and the runtime image has no Node (experience.md §11, EX-A3).
+
 ### 12. What runs where
 
 *Amended 2026-11-02 (evals, #142):* the rows of this table are replaced by evals.md §13 (E-A1). The paragraph below on `reason_counts` and "more than half `model_unavailable`" is replaced by evals.md §5 (outcome) and §8 (triage).
@@ -1197,6 +1205,8 @@ without changing this design too.
 | `pantry_events` | pantry | `household_id`, `item`, `delta`, `unit`, `source`, `order_id`, `ts`, unique `(order_id, item)` |
 | Token source and OpenFGA relations | identity-authz | Resolved 2026-11-01 (identity-authz I-A15): `TokenSource`, per-agent grants and the OpenFGA model in identity-authz §6–§8 |
 | `/app/*` and `/me/*` behavior | experience, identity-authz | The routes are reserved and return 501 |
+
+*Amended 2026-11-03 (experience, #271):* `/me/*` and `/app/*` are served by identity-authz I24/I32 and experience.md; "return 501" holds only until those land (experience.md EX-A1).
 
 ## Risks & Mitigations
 

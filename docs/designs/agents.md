@@ -545,6 +545,8 @@ as today.
 
 The consumer agent never decides spend and never talks to business agents.
 
+*Amended 2026-11-03 (experience, #271):* `INTENTS` adds `onboard`, handled by a new node `propose_setup`. Code routes an admin of a household with no budget to it before the classifier runs. Spark picks allergy and diet codes from the fixed lists; code validates, cross-checks and restates, and nothing is saved without the admin's tap, so OD-14 holds (experience.md §9, EX-A6).
+
 ### 6. Household agent: constraint merging
 
 *Amended 2026-11-02 (pantry, #251):* on a household weekly grocery order, `build_list` runs the pantry skip after the item-name check and before the dislike rule, and only for eval households; when the skip empties the list, the run ends `nothing_needed` (pantry.md §5, PT-A7).
@@ -611,6 +613,8 @@ least one dislike. They are sorted by `user_id`, and the holder is the member at
 `turn_index` mod their count. If none of them has a dislike, there is no turn holder. Two
 runs at the same time read the same `turn_index`. This is accepted: the cost is one
 repeated turn.
+
+*Amended 2026-11-03 (experience, #271):* the household's allergen and diet merge (`_member_allergens`, `get_household_allergens`, `get_constraints`) also includes the codes stored on the household's open join codes (experience.md §9, EX-A9).
 
 ### 7. Household agent: comparing offers and the counter
 
@@ -848,6 +852,8 @@ accepts is handled before `ids.parse_approval_button`:
 The new run exists because the order's run has ended, and guard step 0 refuses an ended
 run.
 
+*Amended 2026-11-03 (experience, #271):* `set_household_take_turns(on: bool, user_id: UUID)` is an order-less form for the household page: `system:api` only, household from the run, `check_approver`, `set_by`. The tap refusal for `wrong_approver` sends `take_turns_not_approver` (experience.md EX-A7).
+
 ### 11. Explanations and templates
 
 *Amended 2026-11-02 (pantry, #251):* the order summary gains "Skipped, already at home: {names}." when items were skipped, and a new text `nothing_needed` reads "Nothing to order this week. Already at home: {items}." (pantry.md §6, PT-A8).
@@ -911,6 +917,8 @@ are passed already joined, as one string parameter.
 | `approval_request` (changed) | "Your agent wants to spend {amount} and needs your approval. Approve?" | `amount` |
 
 The experience design owns the final wording.
+
+*Amended 2026-11-03 (experience, #271):* experience.md §6 gives the final wording of every text key; keys are unchanged. `approval_request` takes `amount` and `reply_by`; `dislike_not_saved` takes `admin` (experience.md EX-A8).
 
 ### 12. Prompts
 

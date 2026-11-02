@@ -1282,6 +1282,8 @@ Makefile (P44).
     *   `address_ref` exists only on `DeliveryRequest`.
     *   `SCHEMAS: dict[str, type[BaseModel]]` keyed by message type.
 
+*Amended 2026-11-03 (experience, #271):* `WhatsAppOut` gains an optional `ref: {kind: "approval" | "order" | "grant" | "reminder", id: str} | None`, which the sender uses to hold and re-check a message outside the 24-hour window; old code ignores it (experience.md §5, EX-A5).
+
 ##### P3. `services/common/protocol/catalog.py` (Create; extends architecture §13)
 
 *   **Type / Scope**: Python module, data plus one function.
