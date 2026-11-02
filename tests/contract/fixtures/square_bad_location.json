@@ -1,0 +1,59 @@
+{
+  "case": "bad_location",
+  "request": {
+    "body": {
+      "idempotency_key": "8620eb89-cb4c-4957-89ef-90537b99b280",
+      "order": {
+        "fulfillments": [
+          {
+            "pickup_details": {
+              "recipient": {
+                "display_name": "11111111-1111-4111-8111-111111111111"
+              },
+              "schedule_type": "ASAP"
+            },
+            "state": "PROPOSED",
+            "type": "PICKUP"
+          }
+        ],
+        "line_items": [
+          {
+            "base_price_money": {
+              "amount": 399,
+              "currency": "USD"
+            },
+            "name": "Oat milk 1L",
+            "note": "MOCK-OAT-MILK",
+            "quantity": "2"
+          },
+          {
+            "base_price_money": {
+              "amount": 550,
+              "currency": "USD"
+            },
+            "name": "Sourdough loaf",
+            "note": "MOCK-SOURDOUGH",
+            "quantity": "1"
+          }
+        ],
+        "location_id": "NOTALOCATION",
+        "reference_id": "11111111-1111-4111-8111-111111111111"
+      }
+    },
+    "method": "POST",
+    "path": "/orders"
+  },
+  "response": {
+    "body": {
+      "errors": [
+        {
+          "category": "AUTHENTICATION_ERROR",
+          "code": "FORBIDDEN",
+          "detail": "Not authorized to access orders with location_id=NOTALOCATION"
+        }
+      ]
+    },
+    "status": 403
+  },
+  "square_version": "2025-01-23"
+}
