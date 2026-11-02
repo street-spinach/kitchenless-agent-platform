@@ -244,3 +244,31 @@ def test_issuer_url_derived_from_domain() -> None:
     assert Settings.from_env(env).issuer_url == "https://example.org/tokens"
     env = {**full_env("mcp"), "ISSUER_URL": "https://issuer.test/x"}
     assert Settings.from_env(env).issuer_url == "https://issuer.test/x"
+
+
+_TEMPLATE_SETTINGS = (
+    "wa_tpl_approval_request",
+    "wa_tpl_take_turns_offer",
+    "wa_tpl_order_summary",
+    "wa_tpl_consent_renewal",
+    "wa_tpl_consent_revoked",
+    "wa_tpl_reminder_delivery_today",
+    "wa_tpl_reminder_pantry_summary",
+)
+
+
+def test_template_settings_default_empty() -> None:
+    # Experience EX-I7: empty until a template is approved; never required.
+    s = Settings.from_env(full_env("api"))
+    for name in _TEMPLATE_SETTINGS:
+        assert getattr(s, name) == "", name
+        assert _FIELDS[name.upper()].metadata["services"] == {"api"}
+    assert s.insights_sample is False
+    env = {
+        **full_env("api"),
+        "WA_TPL_APPROVAL_REQUEST": "approval_request_v1",
+        "INSIGHTS_SAMPLE": "1",
+    }
+    s = Settings.from_env(env)
+    assert s.wa_tpl_approval_request == "approval_request_v1"
+    assert s.insights_sample is True

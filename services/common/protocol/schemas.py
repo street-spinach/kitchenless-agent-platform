@@ -295,11 +295,42 @@ class Button(_Part):
     title: str
 
 
+class Ref(_Part):
+    """What a `whatsapp_out` is about (experience EX-I6), for delivery and status tracking."""
+
+    kind: Literal["approval", "order", "grant", "reminder"]
+    id: str
+
+
 class WhatsAppOut(_Body):
     user_id: UUID
     template: str
     params: dict[str, str]
     buttons: list[Button]
+    # Experience EX-I6: additive with a default, so no `schema_version` bump.
+    ref: Ref | None = None
+
+
+# Experience §9 step 2: what Spark returns for an onboarding message. Codes outside the
+# enums are refused here; the `propose_setup` tool moves them to `unmatched` first.
+E164 = Annotated[str, StringConstraints(pattern=r"^\+[1-9][0-9]{7,14}$")]
+
+
+class SetupPerson(_Part):
+    name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+    phone: E164 | None = None
+    child: bool
+    add_allergies: list[AllergenCode] = []
+    add_diets: list[DietCode] = []
+    remove_allergies: list[AllergenCode] = []
+    remove_diets: list[DietCode] = []
+
+
+class SetupAnswer(_Part):
+    people: list[SetupPerson] = []
+    # Household currency, integer minor units.
+    budget_minor: Annotated[Minor, Field(ge=0)] | None = None
+    unmatched: list[str] = []
 
 
 class ShortfallDetected(_Body):
