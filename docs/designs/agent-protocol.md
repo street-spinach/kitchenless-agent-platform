@@ -1738,6 +1738,8 @@ Makefile (P44).
 
 ##### P37. `evals/checks.py` (Modify, *critical*; extends architecture item 66)
 
+*Amended 2026-11-02 (evals, #142):* every check declares `invariant` (evals.md §5) (E-A4).
+
 *   **Type / Scope**: Eval checks. Add only; existing checks unchanged. Checks that need
     table rows receive a read-only `db` argument (A23).
 *   **Proposed Changes**:
@@ -1904,6 +1906,8 @@ Makefile (P44).
 passing.
 
 ### Eval cases
+
+*Amended 2026-11-02 (evals, #142):* case files use evals.md §4's format; each `checks:` entry is written as `expect: [{check, args}]` with the check's parameter names (E-A4).
 
 Cases use the architecture's YAML shape, plus the `inject`, `shortfall` and `a2a_steps`
 fields from P38. The cases the brief requires are marked ★. Every shortfall case adds the

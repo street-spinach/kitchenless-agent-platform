@@ -610,6 +610,8 @@ repeated turn.
 
 ### 7. Household agent: comparing offers and the counter
 
+*Amended 2026-11-02 (evals, #142):* in stub mode, `STUB_COUNTER_REJECT: true` makes the seller stub's `respond_to_counter` return `reject`, so an eval case can show that a rejected counter never costs items (evals.md E-A13, §12 case 8).
+
 **Comparison (`compare_offers(offers) -> list`, a pure function that replaces
 `_cheapest`).** It sorts the valid offers (`valid_offers`, unchanged) by:
 
@@ -1010,6 +1012,8 @@ this design `negotiate` makes no call.
 | Business choice points | Model failure, a pick outside the allowed set, a failed rationale | The rule default (unchanged, architecture §4). |
 
 ### 15. Traces
+
+*Amended 2026-11-02 (evals, #142):* the `choose_offer` decision row with choice `explanation_model` or `explanation_template` carries the member-facing sentence in `explanation` and the facts object in a new `facts` payload key (evals.md E-A12).
 
 Code decisions write `decision` rows. The existing household helper `trace_decision(state,
 node, choice, explanation="")` gains the optional `explanation` argument, which carries a

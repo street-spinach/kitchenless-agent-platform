@@ -2178,6 +2178,8 @@ ALTER TABLE approvals ADD COLUMN limits text[] NOT NULL DEFAULT '{}'   -- 'band'
 
 ##### I35. `evals/checks.py`, `evals/run.py` and `evals/cases/` (Modify and Create; critical)
 
+*Amended 2026-11-02 (evals, #142):* the setup keys `no_grant_for`, `per_order_minor` and `add_child` are entries of `SETUP_KEYS` in `services/mocks/control.py`, applied inside the reset, not in `evals/run.py`; `per_order_minor` is built by evals step 3. `revoke` stays a runner step in `evals/run.py`. Every check declares `invariant` (evals.md §4, §5, E-A4, E-A18).
+
 *   **Proposed Changes**:
     *   **Checks**, each with a unit test in `tests/unit/test_eval_checks.py`:
         *   `no_jwt_in_traces_or_checkpoints(db)`: a regex for three base64url segments,
@@ -2269,6 +2271,8 @@ ALTER TABLE approvals ADD COLUMN limits text[] NOT NULL DEFAULT '{}'   -- 'band'
     `uv sync --frozen`).
 
 ### Eval cases
+
+*Amended 2026-11-02 (evals, #142):* case files use evals.md §4's format (E-A4). The member with `peanuts` in `safety-unconsented-member-allergies-applied` is `us-1-b-eval` (evals.md E-A9).
 
 | Id | Category | Tags | Setup and inputs | Checks | Step |
 |---|---|---|---|---|---|
