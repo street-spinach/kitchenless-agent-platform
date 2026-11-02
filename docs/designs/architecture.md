@@ -2369,6 +2369,31 @@ and values; none of these may be renamed or dropped.
     *   `check_approver(conn, household_id, user_id) -> None` raises `WrongApprover`.
     *   `check_coverage(card, zone_id)` and `check_window(card, window)`.
 *   **Amended 2026-11-01 (identity-authz I-A5, I-A10).** `check_approval_needed` replaces the budget part of `check_budget` (band or budget, one approval); `check_household_grant` is added for `place_order` (identity-authz I20).
+*   **Amended 2026-11-02 (limits, #44).** This settles the window rule, the knowledge
+    interface and the refusal reasons.
+    *   **Window.** `check_window(window, now) -> None` raises `OutsideWindow` unless
+        `window.start < window.end` and `window.end > now`. `window` is the protocol
+        `Window` (timezone-aware `start` and `end`). Per-card hours and capacity are not
+        checked here. They wait for the adapters design (§13), which defines their
+        `business_rules` shape. Until then, they apply only through the courier's own
+        quote and `choose_window`.
+    *   **Coverage.** `check_coverage(card, zone_id)` raises `OutOfZone` unless
+        `zone_id in card.zone_ids`.
+    *   **Knowledge.** `knowledge` is the `Knowledge` protocol of item 44
+        (`services/mcp/knowledge/adapters/neo4j_knowledge.py`). `check_allergens` calls
+        `knowledge.check_allergens(skus, codes)` with every member's allergen codes, and
+        skips the call when there are none. The first hit raises `AllergenConflict(sku,
+        code)`. When `hits` is empty, the first of `unknown_skus` raises
+        `AllergenUnknown(sku)`, because an unchecked SKU is never treated as
+        allergen-free. Any exception from the call raises `KnowledgeUnavailable`.
+    *   **Budget coverage.** An order is covered when it has an `approved` approval with
+        `amount_minor >= total` (§5: a re-quoted offer at or below the approved total).
+    *   **Currency.** `authorize_spend` raises `CurrencyMismatch` when the total's
+        currency differs from `orders.currency` (§5).
+    *   **Reasons.** Each exception subclasses `GuardRefused`, with reasons
+        `needs_approval`, `wrong_approver`, `allergen_conflict`, `allergen_unknown`,
+        `knowledge_unavailable`, `currency_mismatch`, `out_of_zone`, `outside_window`
+        and `a2a_demo_order` (agent-protocol P28).
 
 ##### 52. `services/safety/addresses.py` (Create, critical)
 
@@ -2783,6 +2808,10 @@ and values; none of these may be renamed or dropped.
     *   `test_allergen_item_rejected`
     *   `test_knowledge_down_fails_closed`
     *   `test_out_of_zone_rejected`
+    *   Amended 2026-11-02 (#44): `test_unknown_sku_fails_closed`,
+        `test_window_must_end_in_future`, `test_authorize_spend_refuses_a2a_demo_order`
+        and `test_requote_within_approved_total_passes`. agent-protocol's and
+        identity-authz's tests of the same behavior keep their own files and names.
 *   `test_addresses.py` (*db*):
     *   `test_resolve_requires_delivery_agent_of_order`
     *   `test_data_share_row_has_no_address_fields`
