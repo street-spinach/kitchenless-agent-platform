@@ -107,7 +107,13 @@ def _seed(pg: str) -> None:
 @pytest.fixture
 def world(pg: str, monkeypatch: pytest.MonkeyPatch) -> str:
     settings = Settings.from_env(
-        {"SERVICE_NAME": "migrate", "DATABASE_URL": "x", "LOG_LEVEL": "info"}
+        {
+            "SERVICE_NAME": "migrate",
+            "DATABASE_URL": "x",
+            "LOG_LEVEL": "info",
+            "OPENFGA_PRESHARED_KEY": "x",
+            "OPENFGA_API_URL": "x",
+        }
     )
     for module in (runs, modes, demo):
         monkeypatch.setattr(module, "get_settings", lambda: settings)

@@ -33,10 +33,12 @@ def apply(dsn: str, migrations_dir: Path = MIGRATIONS_DIR) -> list[str]:
 
 
 def main() -> None:
+    import authz.apply  # the OpenFGA model, after the SQL migrations (identity-authz I8)
     from migrations import checkpointer  # imported here: checkpointer imports LOCK_ID from us
 
     done = apply(os.environ["DATABASE_URL"])
     print(f"Applied {len(done)} migration(s): {', '.join(done) or 'none pending'}")
+    authz.apply.main()
     checkpointer.main()
 
 

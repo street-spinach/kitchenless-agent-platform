@@ -280,7 +280,7 @@ NOTICE = [
 @pytest.fixture
 def _auth(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(tokens, "_secret", lambda: SECRET)
-    monkeypatch.setattr(fga, "check", lambda user, relation, object: True)
+    monkeypatch.setattr(fga, "check", lambda user, relation, object: (True, "model-1"))
 
 
 def _query(pg: str, sql: str, *params: Any) -> list[dict[str, Any]]:

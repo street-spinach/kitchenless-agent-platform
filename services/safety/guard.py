@@ -139,10 +139,13 @@ async def run_guarded(
             await _check_run(conn, ctx.run_id)
             # Step 1: the caller's token.
             _check_token(ctx)
-            # Step 2: the OpenFGA relation.
+            # Step 2: the OpenFGA relation. A timeout raises `AuthzUnavailable`, which is
+            # not a refusal and propagates (identity-authz §8 step 2, I-G9).
             if relation is not None:
                 rel, obj = relation
-                allowed = await asyncio.to_thread(fga.check, f"agent:{ctx.agent_id}", rel, obj)
+                allowed, _model_id = await asyncio.to_thread(
+                    fga.check, f"agent:{ctx.agent_id}", rel, obj
+                )
                 if not allowed:
                     raise GuardRefused("authz_denied")
             # Step 3: the limits.

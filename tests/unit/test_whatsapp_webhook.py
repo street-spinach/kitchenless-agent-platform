@@ -29,6 +29,8 @@ def _settings(monkeypatch: pytest.MonkeyPatch) -> None:
         "SERVICE_NAME": "migrate",
         "DATABASE_URL": "x",
         "LOG_LEVEL": "info",
+        "OPENFGA_PRESHARED_KEY": "x",
+        "OPENFGA_API_URL": "x",
         "WHATSAPP_APP_SECRET": SECRET,
         "WHATSAPP_VERIFY_TOKEN": VERIFY_TOKEN,
     }
@@ -88,7 +90,13 @@ def test_bad_signature_401(header: str | None) -> None:
 
 
 def test_missing_app_secret_refuses_every_signature(monkeypatch: pytest.MonkeyPatch) -> None:
-    env = {"SERVICE_NAME": "migrate", "DATABASE_URL": "x", "LOG_LEVEL": "info"}
+    env = {
+        "SERVICE_NAME": "migrate",
+        "DATABASE_URL": "x",
+        "LOG_LEVEL": "info",
+        "OPENFGA_PRESHARED_KEY": "x",
+        "OPENFGA_API_URL": "x",
+    }
     monkeypatch.setattr(whatsapp, "get_settings", lambda: Settings.from_env(env))
     body = _payload()
     resp = TestClient(api.create_app(_no_db)).post(

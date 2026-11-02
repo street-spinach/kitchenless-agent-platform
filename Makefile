@@ -7,7 +7,7 @@ define allow_empty
 s=$$?; if [ $$s -eq 5 ]; then echo "No $(1) tests yet."; exit 0; fi; exit $$s
 endef
 
-.PHONY: up down lint test-unit test-contract smoke scenario eval-fast eval-full seed seed-local
+.PHONY: up down lint test-unit test-contract fga-test smoke scenario eval-fast eval-full seed seed-local
 
 up:
 	$(COMPOSE) up -d --build --remove-orphans --wait
@@ -24,6 +24,12 @@ test-unit:
 
 test-contract:
 	MODE=$${MODE:-mock} REAL=$(REAL) uv run pytest $(CONTRACT_PATH) -q; $(call allow_empty,contract)
+
+# The OpenFGA model tests, and authz/model.json against a fresh transform (identity-authz
+# I7). Needs the pinned `fga` CLI (.github/workflows/ci.yml installs it).
+fga-test:
+	fga model test --tests authz/model.fga.yaml
+	fga model transform --file authz/model.fga | uv run python -m authz.check_transform
 
 smoke:
 	$(COMPOSE) run --rm testrunner pytest tests/smoke -q

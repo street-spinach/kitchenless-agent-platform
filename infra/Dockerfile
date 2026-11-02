@@ -8,6 +8,8 @@ ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-install-project
 COPY migrations ./migrations
+# The OpenFGA model, applied by migrate (identity-authz I8, I41).
+COPY authz ./authz
 COPY services ./services
 COPY evals ./evals
 COPY tests ./tests

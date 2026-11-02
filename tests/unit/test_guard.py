@@ -86,9 +86,9 @@ def test_guard_order_of_checks(pg: str, monkeypatch: pytest.MonkeyPatch) -> None
         steps.append("token")
         return real_validate(token)
 
-    def check(user: str, relation: str, object: str) -> bool:
+    def check(user: str, relation: str, object: str) -> tuple[bool, str]:
         steps.append(f"fga {user} {relation} {object}")
-        return True
+        return True, "model-1"
 
     async def write(self: TraceStore, run: uuid.UUID, agent: str, kind: str, *a, **kw) -> int:
         steps.append(f"trace {kind}")
@@ -232,7 +232,7 @@ def test_trace_failure_blocks_adapter_call(pg: str, monkeypatch: pytest.MonkeyPa
         called.append("adapter")
         return RESULT
 
-    monkeypatch.setattr(fga, "check", lambda user, relation, object: True)
+    monkeypatch.setattr(fga, "check", lambda user, relation, object: (True, "model-1"))
     monkeypatch.setattr(TraceStore, "write", write)
 
     with pytest.raises(psycopg.OperationalError):
@@ -275,7 +275,9 @@ def test_refusal_writes_tool_result(
         "bad_token": "not-a-jwt",
         "other_agent": _token(act="grocery:someone-else"),
     }.get(case, _token())
-    monkeypatch.setattr(fga, "check", lambda user, relation, object: case != "fga_denied")
+    monkeypatch.setattr(
+        fga, "check", lambda user, relation, object: (case != "fga_denied", "model-1")
+    )
     if case == "conflict":
         with psycopg.connect(pg) as conn:
             conn.execute(
@@ -341,7 +343,7 @@ def test_retry_after_adapter_failure_reaches_adapter(
     run_id = _seed_run(pg)
     calls: list[str] = []
     applied: list[Any] = []
-    monkeypatch.setattr(fga, "check", lambda user, relation, object: True)
+    monkeypatch.setattr(fga, "check", lambda user, relation, object: (True, "model-1"))
 
     async def call() -> dict[str, Any]:
         calls.append("adapter")
@@ -378,7 +380,7 @@ def test_retry_after_adapter_failure_reaches_adapter(
 def test_concurrent_same_run_calls_apply_once(pg: str, monkeypatch: pytest.MonkeyPatch) -> None:
     run_id = _seed_run(pg)
     applied: list[Any] = []
-    monkeypatch.setattr(fga, "check", lambda user, relation, object: True)
+    monkeypatch.setattr(fga, "check", lambda user, relation, object: (True, "model-1"))
     ctx = Ctx(run_id, SELLER, _token())
 
     async def go() -> list[Any]:

@@ -1,0 +1,22 @@
+model
+  schema 1.1
+type user
+  relations
+    define acts_for: [agent]
+type agent
+type household
+  relations
+    define admin: [user]
+    define child: [user]
+    define member: [user] or admin or child
+    define guardian: admin
+    define acts_for: [agent]
+    define can_deliver_for: [agent]
+type org
+  relations
+    define owner: [user]
+    define member_of: [agent]
+type budget
+  relations
+    define household: [household]
+    define can_spend: [agent]

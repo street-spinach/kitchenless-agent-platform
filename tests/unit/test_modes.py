@@ -20,7 +20,13 @@ from services.mcp.restaurant.adapters.mock_restaurant import MockRestaurantAdapt
 
 
 def _use_env(monkeypatch: pytest.MonkeyPatch, **env: str) -> None:
-    base = {"SERVICE_NAME": "migrate", "DATABASE_URL": "x", "LOG_LEVEL": "info"}
+    base = {
+        "SERVICE_NAME": "migrate",
+        "DATABASE_URL": "x",
+        "LOG_LEVEL": "info",
+        "OPENFGA_PRESHARED_KEY": "x",
+        "OPENFGA_API_URL": "x",
+    }
     settings = Settings.from_env({**base, **env})
     monkeypatch.setattr(modes, "get_settings", lambda: settings)
 
