@@ -1,4 +1,4 @@
-"""Migrations 0001-0011 apply in order to an empty database (issues #25, #26, #27, #112)."""
+"""Migrations 0001-0012 apply in order to an empty database (issues #25, #26, #27, #112, #196)."""
 
 import uuid
 
@@ -46,6 +46,7 @@ TABLES = {
     "consent_links",
     "audit_events",
     "fga_models",
+    "household_rules",
 }
 # Tables whose own time column records creation (architecture, Migrations preamble).
 OWN_TIME_COLUMN = {
@@ -82,6 +83,7 @@ def test_applies_in_order_on_empty_database(empty_schema_dsn: str) -> None:
         "0009_trace_additions.sql",
     ]
     assert done[9:11] == ["0010_identity.sql", "0011_approval_band.sql"]
+    assert done[11:12] == ["0012_agents.sql"]
     assert apply(empty_schema_dsn) == []
     with psycopg.connect(empty_schema_dsn) as conn:
         rows = conn.execute(
@@ -526,3 +528,39 @@ def test_approval_band_columns(pg: str) -> None:
         ).fetchone()
     assert cols[:2] == ("ARRAY", "NO")
     assert cols[2].startswith("'{}'")
+
+
+CONSTRAINT_INSERT = (
+    "INSERT INTO member_constraints (user_id, kind, value, source) VALUES (%s, %s, %s, %s)"
+)
+
+
+def test_learned_rows_are_dislikes_only(pg: str) -> None:
+    with psycopg.connect(pg) as conn:
+        user_id = _household_with_user(conn)
+        with pytest.raises(psycopg.errors.CheckViolation) as err:
+            conn.execute(CONSTRAINT_INSERT, (user_id, "allergy", "milk", "learned"))
+        assert err.value.diag.constraint_name == "member_constraints_learned_dislike_only"
+    with psycopg.connect(pg) as conn:
+        user_id = uuid.uuid4()
+        conn.execute("INSERT INTO users (user_id, display_name) VALUES (%s, 'B')", (user_id,))
+        conn.execute(CONSTRAINT_INSERT, (user_id, "dislike", "olives", "learned"))
+
+
+def test_learned_dislike_unique(pg: str) -> None:
+    with psycopg.connect(pg) as conn:
+        user_id = _household_with_user(conn)
+        conn.execute(CONSTRAINT_INSERT, (user_id, "dislike", "olives", "seed"))
+        conn.execute(CONSTRAINT_INSERT, (user_id, "dislike", "olives", "learned"))
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            conn.execute(CONSTRAINT_INSERT, (user_id, "dislike", "olives", "learned"))
+
+
+def test_household_rules_defaults(pg: str) -> None:
+    with psycopg.connect(pg) as conn:
+        _household_with_user(conn)
+        conn.execute("INSERT INTO household_rules (household_id) VALUES ('hh:1')")
+        row = conn.execute(
+            "SELECT take_turns, turn_index, last_turn_order_id, set_by FROM household_rules"
+        ).fetchone()
+    assert row == (False, 0, None, None)
