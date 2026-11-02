@@ -1,4 +1,4 @@
-"""Migrations 0001-0009 apply in order to an empty database (issues #25, #26, #27)."""
+"""Migrations 0001-0011 apply in order to an empty database (issues #25, #26, #27, #112)."""
 
 import uuid
 
@@ -41,9 +41,22 @@ TABLES = {
     "mock_deliveries",
     "mock_events",
     "sim_outbound",
+    "agent_clients",
+    "agent_grants",
+    "consent_links",
+    "audit_events",
+    "fga_models",
 }
 # Tables whose own time column records creation (architecture, Migrations preamble).
-OWN_TIME_COLUMN = {"agent_traces", "runs", "inbound_messages", "approvals", "pantry_events"}
+OWN_TIME_COLUMN = {
+    "agent_traces",
+    "runs",
+    "inbound_messages",
+    "approvals",
+    "pantry_events",
+    "audit_events",
+    "fga_models",
+}
 
 
 def _card(conn: psycopg.Connection, agent_id: str, cls: str, host: str) -> None:
@@ -68,6 +81,7 @@ def test_applies_in_order_on_empty_database(empty_schema_dsn: str) -> None:
         "0008_mock_backends.sql",
         "0009_trace_additions.sql",
     ]
+    assert done[9:11] == ["0010_identity.sql", "0011_approval_band.sql"]
     assert apply(empty_schema_dsn) == []
     with psycopg.connect(empty_schema_dsn) as conn:
         rows = conn.execute(
@@ -416,3 +430,99 @@ def test_agent_traces_additions(pg: str) -> None:
     assert any(d.endswith("(ts)") for d in defs)
     assert any(d.endswith("(agent_id, ts)") for d in defs)
     assert all(k in comment[0] for k in ("run_start", "error", "data_share"))
+
+
+def _household_with_user(conn: psycopg.Connection) -> uuid.UUID:
+    conn.execute(
+        "INSERT INTO households (household_id, name, region, zone_id, timezone, currency)"
+        " VALUES ('hh:1', 'H', 'us', 'z1', 'UTC', 'USD')"
+    )
+    user_id = uuid.uuid4()
+    conn.execute("INSERT INTO users (user_id, display_name) VALUES (%s, 'A')", (user_id,))
+    return user_id
+
+
+GRANT_INSERT = (
+    "INSERT INTO agent_grants (grant_id, agent_id, agent_kind, user_id, consented_by,"
+    " household_id, scopes, refresh_ciphertext, key_version, expires_at, status)"
+    " VALUES (%s, %s, %s, %s, %s, 'hh:1', '{}', '\\x00', 1, now() + interval '1 day', %s)"
+)
+
+
+def test_one_active_household_grant(pg: str) -> None:
+    with psycopg.connect(pg) as conn:
+        asha = _household_with_user(conn)
+        ben = uuid.uuid4()
+        conn.execute("INSERT INTO users (user_id, display_name) VALUES (%s, 'B')", (ben,))
+        _card(conn, "household:1", "household", "agents")
+        conn.execute(
+            GRANT_INSERT, (uuid.uuid4(), "household:1", "household", asha, asha, "revoked")
+        )
+        conn.execute(GRANT_INSERT, (uuid.uuid4(), "household:1", "household", asha, asha, "active"))
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            conn.execute(
+                GRANT_INSERT, (uuid.uuid4(), "household:1", "household", ben, ben, "active")
+            )
+
+
+def test_one_active_grant_per_agent_and_user(pg: str) -> None:
+    with psycopg.connect(pg) as conn:
+        asha = _household_with_user(conn)
+        ben = uuid.uuid4()
+        conn.execute("INSERT INTO users (user_id, display_name) VALUES (%s, 'B')", (ben,))
+        _card(conn, "consumer:1", "consumer", "agents")
+        conn.execute(GRANT_INSERT, (uuid.uuid4(), "consumer:1", "consumer", asha, asha, "active"))
+        conn.execute(GRANT_INSERT, (uuid.uuid4(), "consumer:1", "consumer", ben, ben, "active"))
+        conn.execute(GRANT_INSERT, (uuid.uuid4(), "consumer:1", "consumer", asha, asha, "expired"))
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            conn.execute(
+                GRANT_INSERT, (uuid.uuid4(), "consumer:1", "consumer", asha, asha, "active")
+            )
+
+
+def test_agent_clients_need_no_card(pg: str) -> None:
+    with psycopg.connect(pg) as conn:
+        conn.execute(
+            "INSERT INTO agent_clients (agent_id, client_id, kind)"
+            " VALUES ('system:api', 'system-api', 'service')"
+        )
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(
+                "INSERT INTO agent_clients (agent_id, client_id, kind)"
+                " VALUES ('x:1', 'x-1', 'robot')"
+            )
+
+
+@pytest.mark.parametrize(
+    ("kind", "ok"),
+    [("keycloak_revoke_failed", True), ("consent_granted", True), ("token_minted", False)],
+)
+def test_audit_events_kind(pg: str, kind: str, ok: bool) -> None:
+    with psycopg.connect(pg) as conn:
+        insert = "INSERT INTO audit_events (kind) VALUES (%s)"
+        if ok:
+            conn.execute(insert, (kind,))
+            assert conn.execute("SELECT detail FROM audit_events").fetchone() == ({},)
+        else:
+            with pytest.raises(psycopg.errors.CheckViolation):
+                conn.execute(insert, (kind,))
+
+
+def test_approval_band_columns(pg: str) -> None:
+    with psycopg.connect(pg) as conn:
+        user_id = _household_with_user(conn)
+        conn.execute(
+            "INSERT INTO approval_rules (household_id, approver_user_id) VALUES ('hh:1', %s)",
+            (user_id,),
+        )
+        assert conn.execute("SELECT per_order_minor FROM approval_rules").fetchone() == (None,)
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute("UPDATE approval_rules SET per_order_minor = -1")
+    with psycopg.connect(pg) as conn:
+        cols = conn.execute(
+            "SELECT data_type, is_nullable, column_default FROM information_schema.columns"
+            " WHERE table_schema = current_schema() AND table_name = 'approvals'"
+            " AND column_name = 'limits'"
+        ).fetchone()
+    assert cols[:2] == ("ARRAY", "NO")
+    assert cols[2].startswith("'{}'")
