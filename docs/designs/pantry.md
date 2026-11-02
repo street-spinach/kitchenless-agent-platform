@@ -335,6 +335,8 @@ Rules (`services/common/pantry.py`, pure, `as_of` passed in):
     code constant. It reaches θ exactly when the window ends. No rule reads it; it is written
     into decision rows so that the brief's "confidence decays" is visible in traces (PT-OD3).
 
+*Amended 2026-11-03 (experience, #271):* `enabled` is computed by one pure function, `pantry.is_enabled(env)` in `services/common/pantry.py`; `get_pantry`, the reminder pass and `GET /me/pantry` all call it. PT-OD4 is unchanged (experience.md EX-A17).
+
 ### 5. The weekly order
 
 `build_list` (household graph) on a weekly order with order kind `grocery`, after the model
@@ -627,6 +629,8 @@ The brief is not edited; this table records where pantry.md decides differently 
 *   **Typed notes** ("we're out of sugar") through a consumer pantry intent.
 *   **Cooked-meal deductions** once a meal-to-ingredients mapping exists.
 *   **Quantities and consumption rates,** once consumption is measured.
+
+*Amended 2026-11-03 (experience, #271):* the PT-OD7 correction path is `/me/pantry` and `record_pantry_check`, reached from the weekly pantry summary; the gate (PT-OD4) is unchanged (experience.md EX-A12).
 
 --------------------------------------------------------------------------------
 
