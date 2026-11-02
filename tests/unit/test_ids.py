@@ -1,3 +1,5 @@
+import base64
+import hashlib
 from uuid import UUID, uuid4, uuid5
 
 import pytest
@@ -219,3 +221,127 @@ def test_take_turns_button_round_trips_and_rejects_anything_else() -> None:
     others = ["", "tt:x:on", f"tt:{order}:no", f"tt:{order}", f"ap:{order}:approved"]
     for payload in others:
         assert ids.parse_take_turns_button(payload) is None
+
+
+# Experience EX-I5.
+
+
+def test_setup_button_round_trips() -> None:
+    proposal = uuid4()
+    for answer in ("yes", "no"):
+        payload = ids.setup_button(proposal, answer)
+        assert payload == f"ob:{proposal}:{answer}"
+        assert ids.parse_setup_button(payload) == (proposal, answer, None)
+    for answer in ("remove", "keep"):
+        for n in (0, 3, 12):
+            payload = ids.setup_button(proposal, answer, n)
+            assert payload == f"ob:{proposal}:{answer}:{n}"
+            assert ids.parse_setup_button(payload) == (proposal, answer, n)
+
+
+def test_setup_button_n_required_for_remove_keep_and_forbidden_otherwise() -> None:
+    proposal = uuid4()
+    for answer in ("remove", "keep"):
+        for bad_n in (None, -1, True, "1"):
+            with pytest.raises(ValueError):
+                ids.setup_button(proposal, answer, bad_n)
+    for answer in ("yes", "no"):
+        with pytest.raises(ValueError):
+            ids.setup_button(proposal, answer, 0)
+    with pytest.raises(ValueError):
+        ids.setup_button(proposal, "maybe")
+
+
+def test_parse_setup_button_rejects_malformed_payloads() -> None:
+    proposal = uuid4()
+    for payload in (
+        "",
+        None,
+        42,
+        "ob",
+        f"ob:{proposal}",
+        f"ob:{proposal}:maybe",
+        f"ob:{proposal}:yes:0",
+        f"ob:{proposal}:no:1",
+        f"ob:{proposal}:remove",
+        f"ob:{proposal}:keep:",
+        f"ob:{proposal}:keep:-1",
+        f"ob:{proposal}:keep:01",
+        f"ob:{proposal}:keep:x",
+        f"ob:{proposal}:keep:1:2",
+        f"ob:{proposal.hex}:yes",
+        f"ob:{str(proposal).upper()}:yes",
+        "ob:not-a-uuid:yes",
+        f"ap:{proposal}:yes",
+        f"OB:{proposal}:yes",
+    ):
+        assert ids.parse_setup_button(payload) is None, payload
+
+
+def test_reminder_stop_payload() -> None:
+    assert ids.REMINDER_STOP == "rs:stop"
+
+
+def test_page_button_round_trips_and_rejects_anything_else() -> None:
+    for page in ("household", "pantry", "renew"):
+        payload = ids.page_button(page)
+        assert payload == f"me:{page}"
+        assert ids.parse_page_button(payload) == page
+    with pytest.raises(ValueError):
+        ids.page_button("admin")
+    for payload in ("", None, "me", "me:", "me:admin", "me:pantry:1", "rs:stop", "ME:pantry"):
+        assert ids.parse_page_button(payload) is None, payload
+
+
+def test_proposal_id_is_derived_from_run_id() -> None:
+    run = uuid4()
+    assert ids.proposal_id(run) == uuid5(run, "proposal") == ids.proposal_id(run)
+    assert ids.proposal_id(run) != ids.proposal_id(uuid4())
+    assert ids.proposal_id(run) != ids.order_id(run)
+
+
+def test_new_join_code_is_8_base32_characters_and_fresh() -> None:
+    codes = {ids.new_join_code() for _ in range(50)}
+    assert len(codes) == 50
+    for code in codes:
+        assert len(code) == 8
+        assert set(code) <= set("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567")
+
+
+def test_join_code_listed_as_random_in_module_docstring() -> None:
+    doc = ids.__doc__ or ""
+    for name in ("new_run_id", "new_eval_run_id", "new_join_code"):
+        assert name in doc
+
+
+def test_held_ids_are_fixed_and_distinct() -> None:
+    assert ids.NS_HELD == UUID("37630901-4b78-4ad9-ac16-f8b7f0af0841")
+    assert ids.held_release_id(7) == uuid5(ids.NS_HELD, "7") == ids.held_release_id(7)
+    assert ids.held_release_id(7) != ids.held_release_id(8)
+    inbound = uuid4()
+    assert ids.held_cancelled_id(inbound) == uuid5(ids.NS_HELD, f"cancelled:{inbound}")
+    assert ids.held_cancelled_id(inbound) != ids.held_cancelled_id(uuid4())
+    for bad in ("7", True, None):
+        with pytest.raises(ValueError):
+            ids.held_release_id(bad)
+
+
+def test_reminder_message_id_is_fixed() -> None:
+    assert ids.NS_REMINDER == UUID("173484b3-c5d5-4a5d-966b-be5f299ae04d")
+    assert ids.reminder_message_id(3) == uuid5(ids.NS_REMINDER, "3")
+    assert ids.reminder_message_id(3) != ids.reminder_message_id(4)
+    assert ids.reminder_message_id(3) != ids.held_release_id(3)
+    for bad in ("3", False, None):
+        with pytest.raises(ValueError):
+            ids.reminder_message_id(bad)
+
+
+def test_org_order_ref_is_short_stable_and_per_org() -> None:
+    order = uuid4()
+    ref = ids.org_order_ref("org-1", order)
+    expected = base64.b32encode(hashlib.sha256(f"org-1:{order}".encode()).digest())[:8]
+    assert ref == expected.decode()
+    assert len(ref) == 8 and ref == ids.org_order_ref("org-1", order)
+    assert ref != ids.org_order_ref("org-2", order)
+    with pytest.raises(ValueError):
+        ids.org_order_ref("", order)

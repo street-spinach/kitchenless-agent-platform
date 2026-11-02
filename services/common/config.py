@@ -171,6 +171,17 @@ class Settings:
 
     seed_us1_phones: str | None = _var({"testrunner"})
 
+    # Experience EX-I7: approved Meta template names (§5); empty until approved.
+    wa_tpl_approval_request: str = _var({"api"}, "")
+    wa_tpl_take_turns_offer: str = _var({"api"}, "")
+    wa_tpl_order_summary: str = _var({"api"}, "")
+    wa_tpl_consent_renewal: str = _var({"api"}, "")
+    wa_tpl_consent_revoked: str = _var({"api"}, "")
+    wa_tpl_reminder_delivery_today: str = _var({"api"}, "")
+    wa_tpl_reminder_pantry_summary: str = _var({"api"}, "")
+    # On: `GET /app/insights` serves the fixed sample in services/api/insights_sample.yaml (§11).
+    insights_sample: bool = _var({"api"}, False)
+
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> "Settings":
         """Build settings for the service named by `SERVICE_NAME`; raise if any is missing."""

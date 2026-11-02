@@ -3,7 +3,13 @@
 import pytest
 from pydantic import BaseModel, ValidationError
 
-from services.common.protocol.schemas import SCHEMAS, DeliveryRequest
+from services.common.protocol.schemas import (
+    SCHEMAS,
+    DeliveryRequest,
+    Ref,
+    SetupAnswer,
+    SetupPerson,
+)
 
 TYPES_26 = {
     "user_message",
@@ -140,3 +146,48 @@ def test_start_order_scope_defaults_to_household(samples, type_):
     assert SCHEMAS[type_].model_validate({**body, "scope": "solo"}).scope == "solo"
     with pytest.raises(ValidationError):
         SCHEMAS[type_].model_validate({**body, "scope": "everyone"})
+
+
+# Experience EX-I6.
+
+
+def test_whatsapp_out_ref_optional(samples):
+    out = SCHEMAS["whatsapp_out"].model_validate(samples["whatsapp_out"])
+    assert out.ref is None
+    with_ref = SCHEMAS["whatsapp_out"].model_validate(
+        {**samples["whatsapp_out"], "ref": {"kind": "approval", "id": "abc"}}
+    )
+    assert with_ref.ref == Ref(kind="approval", id="abc")
+
+
+def test_ref_kind_closed():
+    for kind in ("approval", "order", "grant", "reminder"):
+        assert Ref(kind=kind, id="1").kind == kind
+    for kind in ("household", "", "Approval"):
+        with pytest.raises(ValidationError):
+            Ref.model_validate({"kind": kind, "id": "1"})
+
+
+def test_setup_answer_rejects_unknown_codes():
+    person = {"name": "Kavi", "child": True, "add_allergies": ["sesame"]}
+    ok = SetupAnswer.model_validate(
+        {"people": [person], "budget_minor": 15000, "unmatched": ["spicy"]}
+    )
+    assert ok.people[0] == SetupPerson(name="Kavi", child=True, add_allergies=["sesame"])
+    assert ok.people[0].phone is None and ok.people[0].remove_diets == []
+    for field in ("add_allergies", "remove_allergies"):
+        with pytest.raises(ValidationError):
+            SetupAnswer.model_validate({"people": [{**person, field: ["nuts"]}]})
+    for field in ("add_diets", "remove_diets"):
+        with pytest.raises(ValidationError):
+            SetupAnswer.model_validate({"people": [{**person, field: ["paleo"]}]})
+    for bad in (
+        {"people": [{**person, "phone": "0771234567"}]},
+        {"people": [{**person, "name": " "}]},
+        {"people": [{"name": "Kavi"}]},
+        {"budget_minor": -1},
+        {"budget_minor": 12.5},
+    ):
+        with pytest.raises(ValidationError):
+            SetupAnswer.model_validate(bad)
+    assert SetupAnswer.model_validate({}).people == []

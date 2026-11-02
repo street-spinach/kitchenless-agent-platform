@@ -1,10 +1,15 @@
 """Every shared id and idempotency key (architecture item 4, agent-protocol P6).
 
 All ids are deterministic: they are derived from values passed in and never from random or
-time-based parts, so a replayed step produces the same ids. The exceptions are the two
-random ids: `new_run_id` and `new_eval_run_id` (see their docstrings).
+time-based parts, so a replayed step produces the same ids. The exceptions are the only
+random ids: `new_run_id`, `new_eval_run_id` and `new_join_code` (see their docstrings).
 """
 
+import base64
+import hashlib
+import re
+import secrets
+from typing import Literal
 from uuid import UUID, uuid4, uuid5
 
 # Fixed namespaces. Changing either value changes every derived id; never edit them.
@@ -284,3 +289,135 @@ def seed_user_id(member_id: str) -> UUID:
 def seed_address_ref(household_id: str) -> UUID:
     """`address_ref` of a seeded household's one address."""
     return uuid5(NS_SEED, f"address|{_require('household_id', household_id)}")
+
+
+# Experience EX-I5 (docs/designs/experience.md §5, §9, §10, §11).
+
+SETUP_ANSWERS = ("yes", "no", "remove", "keep")
+_SETUP_NUMBERED = ("remove", "keep")
+
+
+def _canonical_uuid(raw: str) -> UUID | None:
+    """`raw` as a UUID only when it is in canonical form (what `str(UUID)` gives)."""
+    try:
+        value = UUID(raw)
+    except ValueError:
+        return None
+    return value if str(value) == raw else None
+
+
+def setup_button(
+    proposal_id: UUID,
+    answer: Literal["yes", "no", "remove", "keep"],
+    n: int | None = None,
+) -> str:
+    """The onboarding button payload (§9): `ob:<proposal_id>:<answer>`, or
+    `ob:<proposal_id>:<answer>:<n>` for `remove` and `keep`, where `n` numbers the removal
+    (0, 1, …). `n` is required for `remove` and `keep` and forbidden otherwise."""
+    if answer not in SETUP_ANSWERS:
+        raise ValueError(f"answer must be one of {SETUP_ANSWERS}, got {answer!r}")
+    base = f"ob:{UUID(_require('proposal_id', proposal_id))}:{answer}"
+    if answer not in _SETUP_NUMBERED:
+        if n is not None:
+            raise ValueError(f"n is forbidden for {answer!r}")
+        return base
+    if not isinstance(n, int) or isinstance(n, bool) or n < 0:
+        raise ValueError(f"n must be a non-negative int for {answer!r}, got {n!r}")
+    return f"{base}:{n}"
+
+
+def parse_setup_button(payload: str) -> tuple[UUID, str, int | None] | None:
+    """`(proposal_id, answer, n)` from an onboarding button payload, or `None` if it is not
+    one (fails closed: an unknown payload decides nothing)."""
+    if not isinstance(payload, str):
+        return None
+    parts = payload.split(":")
+    if len(parts) not in (3, 4) or parts[0] != "ob" or parts[2] not in SETUP_ANSWERS:
+        return None
+    proposal = _canonical_uuid(parts[1])
+    if proposal is None:
+        return None
+    answer = parts[2]
+    if answer not in _SETUP_NUMBERED:
+        return (proposal, answer, None) if len(parts) == 3 else None
+    if len(parts) != 4 or not re.fullmatch(r"0|[1-9][0-9]*", parts[3]):
+        return None
+    return proposal, answer, int(parts[3])
+
+
+# The "Stop these" button on a reminder (§10).
+REMINDER_STOP = "rs:stop"
+
+PAGES = ("household", "pantry", "renew")
+
+
+def page_button(page: Literal["household", "pantry", "renew"]) -> str:
+    """The button payload that opens a `/me` page (§8): `me:<page>`."""
+    if page not in PAGES:
+        raise ValueError(f"page must be one of {PAGES}, got {page!r}")
+    return f"me:{page}"
+
+
+def parse_page_button(payload: str) -> str | None:
+    """The page named by a page button payload, or `None` if it is not one."""
+    if not isinstance(payload, str):
+        return None
+    prefix, sep, page = payload.partition(":")
+    if prefix != "me" or not sep or page not in PAGES:
+        return None
+    return page
+
+
+def proposal_id(run_id: UUID) -> UUID:
+    """The onboarding proposal an `onboard` run stores (§9 step 4); a replayed run makes no
+    second proposal."""
+    return uuid5(UUID(_require("run_id", run_id)), "proposal")
+
+
+_JOIN_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"  # RFC 4648 base32
+
+
+def new_join_code() -> str:
+    """A fresh join code (EX-OD15): 8 base32 characters from `secrets` (40 bits).
+
+    One of the random ids in this module. A code is created once, inside the `apply_setup`
+    transaction that stores it, so a replay never reaches it.
+    """
+    return "".join(secrets.choice(_JOIN_ALPHABET) for _ in range(8))
+
+
+def _int_id(name: str, value: object) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"{name} must be an int, got {value!r}")
+    return value
+
+
+# Held items (§5). Changing this value changes every derived id; never edit it.
+NS_HELD = UUID("37630901-4b78-4ad9-ac16-f8b7f0af0841")
+
+
+def held_release_id(held_id: int) -> UUID:
+    """`message_id` of the message that releases the held item `held_id`."""
+    return uuid5(NS_HELD, str(_int_id("held_id", held_id)))
+
+
+def held_cancelled_id(inbound_id: UUID) -> UUID:
+    """`message_id` of the notice that the held items were cancelled, sent for the
+    inbound message `inbound_id`."""
+    return uuid5(NS_HELD, f"cancelled:{UUID(_require('inbound_id', inbound_id))}")
+
+
+# Reminders (§10). Changing this value changes every derived id; never edit it.
+NS_REMINDER = UUID("173484b3-c5d5-4a5d-966b-be5f299ae04d")
+
+
+def reminder_message_id(reminder_id: int) -> UUID:
+    """`message_id` of the reminder `reminder_id`."""
+    return uuid5(NS_REMINDER, str(_int_id("reminder_id", reminder_id)))
+
+
+def org_order_ref(org_id: str, order_id: UUID) -> str:
+    """A short order reference shown in the owner app (§11): the first 8 base32 characters
+    of `sha256("<org_id>:<order_id>")`. Opaque, not secret."""
+    key = f"{_require('org_id', org_id)}:{UUID(_require('order_id', order_id))}"
+    return base64.b32encode(hashlib.sha256(key.encode()).digest())[:8].decode()
