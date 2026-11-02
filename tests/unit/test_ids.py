@@ -119,5 +119,13 @@ def test_timer_event_id_is_deterministic_per_timer() -> None:
         ids.timer_event_id("7")  # type: ignore[arg-type]
 
 
+def test_inbound_id_is_deterministic_per_channel_and_external_id() -> None:
+    expected = uuid5(ids.NS_INBOUND, "whatsapp|wamid.1")
+    assert ids.inbound_id("whatsapp", "wamid.1") == expected
+    assert ids.inbound_id("runs", "wamid.1") != expected
+    with pytest.raises(ValueError):
+        ids.inbound_id("whatsapp", "")
+
+
 def test_new_run_id_is_fresh() -> None:
     assert ids.new_run_id() != ids.new_run_id()

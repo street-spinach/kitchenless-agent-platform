@@ -104,6 +104,20 @@ def timer_event_id(timer_id: int) -> UUID:
     return uuid5(NS_TIMER, f"timer|{timer_id}")
 
 
+NS_INBOUND = UUID("1663a266-7392-4541-9021-c5940595acec")
+
+
+def inbound_id(channel: str, external_id: str) -> UUID:
+    """The source event id of an `inbound_messages` row (architecture items 10, 33).
+
+    It is `runs.trigger.inbound_id` and `user_message.inbound_id`; the messages `ingest`
+    sends use `message_id(inbound_id(...), ordinal)` (architecture §3).
+    """
+    return uuid5(
+        NS_INBOUND, f"{_require('channel', channel)}|{_require('external_id', external_id)}"
+    )
+
+
 def new_run_id() -> UUID:
     """A fresh `run_id` for `runs.start()` when the caller has none to derive it from.
 
