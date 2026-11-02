@@ -10,10 +10,12 @@ routed by its type and the order's phase:
     `get_household_rules`, snapshotted in state, agents §10) → `collect_constraints` (one
     `constraints_request` per member's consumer agent).
 *   `constraints` → `record_constraints` (allergens, diets and dislikes); once every
-    member has answered, `build_list` (pantry check, the model's list, then in code: item
-    names, the pantry and the AG5 dislike rule, agents §6) → `request_quotes`
-    (`directory.find`, one `quote_request` per seller, the 30 s `quote_round` timer, state
-    `quoting`). Dislikes are never sent to sellers.
+    member has answered, `build_list` (the model's list, then in code: item names, the
+    pantry skip on weekly grocery orders and the AG5 dislike rule, agents §6, pantry §5) →
+    `request_quotes` (`directory.find`, one `quote_request` per seller, the 30 s
+    `quote_round` timer, state `quoting`). Dislikes and pantry data are never sent to
+    sellers. When the pantry skip emptied the list, `nothing_needed` instead: the draft
+    order is cancelled and the run ends `completed`, reason `nothing_needed`.
 *   `offer` while quoting, or the reply to our counter → `record_offer`. Any other offer is
     late: ignored with a `decision` trace `late_offer` (agent-protocol §7 arrival table).
 *   `quote_round_closed` → `negotiate` (state `negotiating`; code only: at most one
@@ -89,7 +91,7 @@ from services.agents.common.model import (
 )
 from services.agents.household import stubs
 from services.agents.household.prompts import BUILD_LIST_PROMPT, EXPLAIN_PROMPT, NO_CODES
-from services.common import dislikes, ids, mcp_client
+from services.common import dislikes, ids, mcp_client, pantry
 from services.common.consumer import (
     Inbound,
     Outgoing,
@@ -192,6 +194,8 @@ DROP_SELLER_ON_REFUSAL = frozenset({"quote_request", "counter_offer"})
 END_RUN_ON_REFUSAL = frozenset({"accept", "cancel"})
 SUMMARY_TEMPLATE = "order_summary"
 NO_OFFERS_TEMPLATE = "no_offers"
+# Pantry §5, §6: the decision, the text and the run's reason when everything is at home.
+NOTHING_NEEDED = "nothing_needed"
 APPROVAL_CANCELLED_TEMPLATE = "approval_cancelled"
 SHORTFALL_RESULT_TEMPLATE = "shortfall_result"
 # The take-turns message from `finish` and its one button (agents §10).
@@ -268,6 +272,9 @@ class HouseholdState(TypedDict, total=False):
     explanation: str | None  # the latest explanation sentence (choose_offer)
     dropped_items: list[str]
     unavoidable_dislikes: list[str]
+    # Pantry §5 (agents §17, PT-A10): read with defaults, so `STATE_VERSION` stays 1.
+    pantry_skipped: list[str]  # list names the pantry skip dropped (weekly orders)
+    pantry_as_of: str | None  # `get_pantry`'s `as_of` for that skip
     # The inbound message of the current invocation.
     message_id: str
     message_type: str
@@ -301,6 +308,7 @@ Clock = Callable[[], datetime]
 Sleep = Callable[[float], Awaitable[None]]
 # The vendor label text of a seller card in a run (adapters §6): `(run_id, agent_id)`.
 LabelSeller = Callable[[UUID, str], Awaitable[str]]
+LoadVocabulary = Callable[[], pantry.Vocabulary]
 
 
 async def _agent_id_label(run_id: UUID, agent_id: str) -> str:
@@ -456,6 +464,9 @@ def _summary(delivered: str, state: Mapping[str, Any]) -> str:
         parts.append(
             f"Included, though someone dislikes it: {', '.join(kept)}; no other option fit."
         )
+    skipped = list(state.get("pantry_skipped") or [])
+    if skipped:
+        parts.append(f"Skipped, already at home: {', '.join(skipped)}.")
     # WhatsApp template parameters can't hold newlines, so the parts are joined by spaces.
     return " ".join(parts)
 
@@ -568,13 +579,15 @@ def build_graph(
     sleep: Sleep = asyncio.sleep,
     load_whatsapp_members: LoadMembers | None = None,
     label_seller: LabelSeller = _agent_id_label,
+    load_vocabulary: LoadVocabulary = pantry.load_vocabulary,
 ) -> StateGraph:
     """The household graph's nodes and edges, before `compile(checkpointer=...)`.
 
     `load_whatsapp_members` gives the members with a WhatsApp identity, the ones a
     shortfall is relayed to; without it nobody is asked (fails closed: every line drops).
     `label_seller` names a seller in member-facing text with its vendor label (adapters
-    §6), from the run's pinned modes.
+    §6), from the run's pinned modes. `load_vocabulary` gives the pantry vocabulary
+    (pantry §2); a failed load means nothing is skipped.
     """
 
     async def tool(
@@ -745,8 +758,19 @@ def build_graph(
         return {"constraints": {**(state.get("constraints") or {}), state["from_agent"]: codes}}
 
     async def build_list(state: HouseholdState) -> dict[str, Any]:
-        pantry = await tool(state, "get_pantry", {})
-        have = {str(p["item"]).lower() for p in pantry.get("items", [])}
+        # Pantry §5, §9: either failure means nothing is skipped (`pantry_unavailable`).
+        vocab: pantry.Vocabulary | None
+        try:
+            vocab = load_vocabulary()
+        except Exception:
+            log.warning("pantry vocabulary failed to load", exc_info=True)
+            vocab = None
+        found: dict[str, Any] | None
+        try:
+            found = await tool(state, "get_pantry", {})
+        except Exception:
+            log.warning("get_pantry failed", exc_info=True)
+            found = None
         constraints = dict(state.get("constraints") or {})
         members = dict(state.get("members") or {})
         solo = (state.get("scope") or HOUSEHOLD_SCOPE) == SOLO_SCOPE
@@ -760,13 +784,10 @@ def build_graph(
             diets=_codes(codes, "diets"),
             allergens=_codes([*codes, household], "allergens"),
             dislikes=_codes(codes, "dislikes"),
+            pantry_names=", ".join(sorted(vocab.names)) if vocab is not None else NO_CODES,
         )
-        answer = await complete(
-            state,
-            "build_list",
-            system,
-            {"kind": state["kind"], "pantry": pantry.get("items", [])},
-        )
+        # Only code skips (pantry PG3): the model sees no pantry data.
+        answer = await complete(state, "build_list", system, {"kind": state["kind"]})
         try:
             items = [RequestItem.model_validate(i) for i in answer.get("items") or []]
         except ValidationError:
@@ -777,10 +798,38 @@ def build_graph(
                 named.append(i)
             else:
                 await trace_decision(state, "build_list", "item_rejected")
-        # Code decides: what the pantry already holds is not ordered again.
-        items = [i for i in named if i.item.lower() not in have]
-        if not items:
+        if not named:
             raise InvalidOutput("build_list returned no items")
+        items = named
+        skipped: list[str] = []
+        as_of: str | None = None
+        weekly = (
+            state.get("kind") == "grocery"
+            and (state.get("scope") or HOUSEHOLD_SCOPE) == HOUSEHOLD_SCOPE
+        )
+        if weekly:
+            # Pantry §5: code drops trusted items, one decision row per list item.
+            estimates = None if found is None else list(found.get("estimates") or [])
+            enabled = found is not None and found.get("enabled") is True
+            as_of = None if found is None else found.get("as_of")
+            items = []
+            for i in named:
+                choice, _, facts = pantry.decide(
+                    vocab, estimates, i.item, as_of=as_of, enabled=enabled
+                )
+                await trace_decision(state, "build_list", choice, f"item={i.item}", facts)
+                if choice == "pantry_skipped":
+                    skipped.append(i.item)
+                else:
+                    items.append(i)
+            if not items:
+                # Everything is at home (PT-OD5): no quote request, the dislike rule is moot.
+                return {
+                    "items": [],
+                    "pantry_skipped": skipped,
+                    "pantry_as_of": as_of,
+                    "decision": NOTHING_NEEDED,
+                }
         # The AG5 dislike rule, with members named by user id (agents §6).
         owners = {
             members.get(agent, agent): _dislikes(c) for agent, c in sorted(constraints.items())
@@ -808,6 +857,34 @@ def build_graph(
             "dropped_items": outcome.dropped,
             "unavoidable_dislikes": sorted(unavoidable),
             "turn_holder": holder,
+            "pantry_skipped": skipped,
+            "pantry_as_of": as_of,
+        }
+
+    async def nothing_needed(state: HouseholdState) -> dict[str, Any]:
+        """Pantry §5 step 6: the skip emptied the list. The draft order is cancelled, no
+        `quote_request` is sent, and the run ends `completed`, reason `nothing_needed`."""
+        try:
+            await tool(
+                state,
+                "set_order_state",
+                {"order_id": state["order_id"], "expected": "draft", "new": "cancelled"},
+            )
+        except ToolRefused as refused:
+            return {"phase": DONE, "finish": {"status": "error", "reason": refused.reason}}
+        out = list(state.get("outgoing") or [])
+        if state.get("user_id"):
+            body = {
+                "user_id": state["user_id"],
+                "template": NOTHING_NEEDED,
+                "params": {"items": ", ".join(state.get("pantry_skipped") or [])},
+                "buttons": [],
+            }
+            _add(state, out, WHATSAPP, "whatsapp_out", body)
+        return {
+            "phase": DONE,
+            "outgoing": out,
+            "finish": {"status": "completed", "reason": NOTHING_NEEDED},
         }
 
     async def request_quotes(state: HouseholdState) -> dict[str, Any]:
@@ -1391,6 +1468,9 @@ def build_graph(
     def after_offer(state: HouseholdState) -> str:
         return "negotiate" if state.get("phase") == NEGOTIATING else "send"
 
+    def after_build_list(state: HouseholdState) -> str:
+        return NOTHING_NEEDED if state.get("decision") == NOTHING_NEEDED else "request_quotes"
+
     def after_negotiate(state: HouseholdState) -> str:
         return {"counter": "send", "choose": "choose_offer"}.get(
             state.get("decision") or "", "no_offers"
@@ -1432,6 +1512,7 @@ def build_graph(
         "record_constraints": record_constraints,
         "build_list": build_list,
         "request_quotes": request_quotes,
+        "nothing_needed": nothing_needed,
         "record_offer": record_offer,
         "negotiate": negotiate,
         "no_offers": no_offers,
@@ -1471,7 +1552,8 @@ def build_graph(
     g.add_edge("start_order", "collect_constraints")
     g.add_edge("collect_constraints", "send")
     g.add_conditional_edges("record_constraints", after_constraints, ["build_list", "send"])
-    g.add_edge("build_list", "request_quotes")
+    g.add_conditional_edges("build_list", after_build_list, ["request_quotes", NOTHING_NEEDED])
+    g.add_edge(NOTHING_NEEDED, "send")
     g.add_edge("request_quotes", "send")
     g.add_conditional_edges("record_offer", after_offer, ["negotiate", "send"])
     g.add_conditional_edges("negotiate", after_negotiate, ["send", "choose_offer", "no_offers"])
@@ -1560,6 +1642,7 @@ class HouseholdGraph:
         offer_ttl_seconds: int = OFFER_TTL_SECONDS,
         load_whatsapp_members: LoadMembers | None = None,
         label_seller: LabelSeller = _agent_id_label,
+        load_vocabulary: LoadVocabulary = pantry.load_vocabulary,
     ) -> None:
         self._load_run = load_run
         self._offer_ttl_seconds = offer_ttl_seconds
@@ -1574,6 +1657,7 @@ class HouseholdGraph:
             sleep,
             load_whatsapp_members,
             label_seller,
+            load_vocabulary,
         )
         self.graph = self.builder.compile(checkpointer=checkpointer)
 

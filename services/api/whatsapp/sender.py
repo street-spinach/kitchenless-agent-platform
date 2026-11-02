@@ -121,6 +121,8 @@ TEXTS: dict[str, str] = {
         "One person's dislike ({values}) was in tonight's dinner. Take turns is on; tap to stop it."
     ),
     "take_turns_saved": "Take turns is now {state}.",
+    # Pantry §6: a weekly order with everything at home (PT-OD5).
+    "nothing_needed": "Nothing to order this week. Already at home: {items}.",
 }
 
 

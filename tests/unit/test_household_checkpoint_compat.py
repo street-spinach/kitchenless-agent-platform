@@ -15,6 +15,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from services.agents.household import graph as hg
 from services.common import ids
+from services.common.consumer import RunFinish
 from services.identity import tokens
 from tests.unit.test_household_graph import (
     HOUSEHOLD,
@@ -102,3 +103,30 @@ def test_paused_approval_resumes_on_a_fresh_graph() -> None:
     assert approved.finish is None
     assert w.saved()["phase"] == hg.PLACING
     assert w.saved()["approval_id"] == str(ids.approval_id(uuid.UUID(w.order_id)))
+
+
+def test_checkpoint_without_pantry_fields_resumes_with_defaults() -> None:
+    # Pantry §5 (P5): a run checkpointed before `pantry_skipped` and `pantry_as_of` existed
+    # resumes, and both read as their defaults (no skip line in the summary).
+    w = World()
+    w.accepted()
+    config = {"configurable": {"thread_id": ids.thread_id(HOUSEHOLD, w.run_id)}}
+    saved = asyncio.run(w.agent.graph.aget_state(config)).values
+    assert saved["phase"] == hg.PLACING
+    assert saved["pantry_skipped"] == ["rice"]
+    old: dict[str, Any] = {
+        k: v for k, v in saved.items() if k not in ("pantry_skipped", "pantry_as_of")
+    }
+
+    w.checkpointer = InMemorySaver()
+    w.household = FakeHousehold()
+    w.agent = w.build()
+    asyncio.run(w.agent.graph.aupdate_state(config, old, as_node="send"))
+    assert "pantry_skipped" not in asyncio.run(w.agent.graph.aget_state(config)).values
+
+    w.order_update("order_confirm", "placed", "grocery:square-us")
+    done = w.order_update("order_status", "delivered", "system:api")
+    assert done.finish == RunFinish("completed")
+    [summary] = done.messages
+    assert "Skipped" not in summary.body["params"]["text"]
+    assert w.saved()["state_version"] == hg.STATE_VERSION == 1

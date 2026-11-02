@@ -119,6 +119,11 @@ def test_approval_reply_texts(template: str, params: dict[str, str], text: str) 
         ),
         ("take_turns_saved", {"state": "on"}, "Take turns is now on."),
         ("take_turns_saved", {"state": "off"}, "Take turns is now off."),
+        (
+            "nothing_needed",
+            {"items": "milk, eggs"},
+            "Nothing to order this week. Already at home: milk, eggs.",
+        ),
     ],
 )
 def test_agents_template_texts(template: str, params: dict[str, str], text: str) -> None:
@@ -138,6 +143,7 @@ def test_agents_template_texts(template: str, params: dict[str, str], text: str)
         "take_turns_offer",
         "take_turns_offer_off",
         "take_turns_saved",
+        "nothing_needed",
     ],
 )
 def test_agents_template_without_its_param_is_not_rendered(template: str) -> None:
