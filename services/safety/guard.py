@@ -6,11 +6,17 @@ Architecture item 49 and §5 "Guard steps". `run_guarded()` runs the steps in or
 1.  validate the caller's token (`sub`, `act`) and require `act` to be the calling agent;
 2.  check the OpenFGA relation;
 3.  check the limits;
-4.  claim the idempotency key (`services/safety/idempotency.py`);
+4.  claim the idempotency key (`services/safety/idempotency.py`). A same-request key that
+    is `in_progress` is taken over when the same run claimed it, whatever its age, so the
+    client's retry after an adapter failure reaches the vendor again (the vendor
+    deduplicates on the same vendor key). Held by another run, it is taken over only after
+    60 s; before that the call is refused with `idempotency_conflict`;
 5.  write the `tool_call` trace row; if that write fails, stop before the adapter;
 6.  call the adapter, which returns a minimal typed result;
 7.  in one transaction, store the result under the key, apply the tool's order-state
-    change and write the `tool_result` trace row.
+    change and write the `tool_result` trace row. First complete wins: the result is
+    stored only while the key is `in_progress`. If another call of the same run completed
+    the key first, `apply` is skipped and the stored result is traced and returned.
 
 A refusal at any step writes a `tool_result` row with `refused=true` and raises
 `GuardRefused(reason)`. `meta.tool_errors()` turns that into the wire result.
@@ -169,7 +175,11 @@ async def run_guarded(
     # Step 7: store the result, apply the state change and trace, in one transaction.
     async with pool.connection() as conn, conn.transaction():
         if key is not None:
-            await idempotency.complete(conn, key, result)
+            earlier = await idempotency.complete(conn, key, result)
+            if earlier is not None:
+                result = earlier.result
+                await trace("tool_result", result_row(result, False, None), conn=conn)
+                return result
         if apply is not None:
             await apply(conn, result)
         await trace("tool_result", result_row(result, False, None), conn=conn)

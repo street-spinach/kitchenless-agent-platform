@@ -15,6 +15,7 @@ from psycopg_pool import AsyncConnectionPool
 from services.common import ids
 from services.common.trace import TraceStore
 from services.identity import fga, tokens
+from services.mcp.meta import AdapterFailure
 from services.safety import guard
 from services.safety.guard import GuardRefused, run_guarded
 
@@ -319,3 +320,93 @@ def test_refusal_writes_tool_result(
         "reason": reason,
     }
     assert (rows[0]["agent_id"], rows[0]["on_behalf_of"]) == (SELLER, "org:mock")
+
+
+def _place_order(ctx: Ctx, call: guard.Call, apply: guard.Apply) -> Awaitable[Any]:
+    return run_guarded(
+        ctx,
+        tool="grocery.place_order",
+        relation=("member_of", "org:mock"),
+        limits=None,
+        key=KEY,
+        request=REQUEST,
+        call=call,
+        apply=apply,
+    )
+
+
+def test_retry_after_adapter_failure_reaches_adapter(
+    pg: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = _seed_run(pg)
+    calls: list[str] = []
+    applied: list[Any] = []
+    monkeypatch.setattr(fga, "check", lambda user, relation, object: True)
+
+    async def call() -> dict[str, Any]:
+        calls.append("adapter")
+        if len(calls) == 1:
+            raise AdapterFailure("adapter_timeout", retryable=True)
+        return RESULT
+
+    async def apply(conn: AsyncConnection, result: Any) -> None:
+        applied.append(result)
+
+    ctx = Ctx(run_id, SELLER, _token())
+
+    async def go() -> Any:
+        with pytest.raises(AdapterFailure):
+            await _place_order(ctx, call, apply)
+        # The client's single retry: same run, same key, same request, at once.
+        return await _place_order(ctx, call, apply)
+
+    result = _with_pool(pg, monkeypatch, go)
+
+    assert result == RESULT
+    assert calls == ["adapter", "adapter"]
+    assert applied == [RESULT]
+    rows = _traces(pg, run_id)
+    assert [r["kind"] for r in rows] == ["tool_call", "tool_call", "tool_result"]
+    assert rows[-1]["payload"]["refused"] is False
+    with psycopg.connect(pg) as conn:
+        stored = conn.execute(
+            "SELECT status, result FROM idempotency_keys WHERE key = %s", (KEY,)
+        ).fetchone()
+    assert stored == ("done", RESULT)
+
+
+def test_concurrent_same_run_calls_apply_once(pg: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    run_id = _seed_run(pg)
+    applied: list[Any] = []
+    monkeypatch.setattr(fga, "check", lambda user, relation, object: True)
+    ctx = Ctx(run_id, SELLER, _token())
+
+    async def go() -> list[Any]:
+        both_in_flight = asyncio.Barrier(2)
+        attempts: list[int] = []
+
+        async def call() -> dict[str, Any]:
+            # Both calls reach the adapter before either completes.
+            await asyncio.wait_for(both_in_flight.wait(), timeout=10)
+            attempts.append(len(attempts) + 1)
+            return RESULT | {"attempt": attempts[-1]}
+
+        async def apply(conn: AsyncConnection, result: Any) -> None:
+            applied.append(result)
+
+        return list(
+            await asyncio.gather(_place_order(ctx, call, apply), _place_order(ctx, call, apply))
+        )
+
+    first, second = _with_pool(pg, monkeypatch, go)
+
+    assert first == second
+    assert applied == [first]
+    with psycopg.connect(pg) as conn:
+        stored = conn.execute(
+            "SELECT status, result FROM idempotency_keys WHERE key = %s", (KEY,)
+        ).fetchone()
+    assert stored == ("done", first)
+    rows = _traces(pg, run_id)
+    results = [r["payload"]["result"] for r in rows if r["kind"] == "tool_result"]
+    assert results == [first, first]

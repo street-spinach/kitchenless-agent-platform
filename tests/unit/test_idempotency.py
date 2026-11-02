@@ -69,7 +69,7 @@ def test_stale_in_progress_reclaimable(pg: str) -> None:
 
     async def go(conn: psycopg.AsyncConnection) -> list[object]:
         first = await idempotency.claim(conn, KEY, run_id, "h1")
-        fresh = await idempotency.claim(conn, KEY, run_id, "h1")
+        fresh = await idempotency.claim(conn, KEY, retry_run, "h1")
         await conn.execute(
             "UPDATE idempotency_keys SET updated_at = now() - interval '61 seconds' WHERE key = %s",
             (KEY,),
@@ -90,9 +90,7 @@ def test_stale_in_progress_reclaimable(pg: str) -> None:
     assert row == (retry_run, "in_progress", True)
 
 
-def test_concurrent_claim_one_wins(pg: str) -> None:
-    run_id = _seed_run(pg)
-
+def _concurrent_claims(pg: str, run_a: uuid.UUID, run_b: uuid.UUID) -> list[object]:
     async def go() -> list[object]:
         async with (
             await psycopg.AsyncConnection.connect(pg) as a,
@@ -100,15 +98,95 @@ def test_concurrent_claim_one_wins(pg: str) -> None:
         ):
             return list(
                 await asyncio.gather(
-                    idempotency.claim(a, KEY, run_id, "h1"),
-                    idempotency.claim(b, KEY, run_id, "h1"),
+                    idempotency.claim(a, KEY, run_a, "h1"),
+                    idempotency.claim(b, KEY, run_b, "h1"),
                 )
             )
 
-    results = asyncio.run(go())
-    assert sorted(type(r).__name__ for r in results) == ["Conflict", "New"]
+    return asyncio.run(go())
+
+
+def _key_count(pg: str) -> tuple[int, ...] | None:
     with psycopg.connect(pg) as conn:
-        count = conn.execute(
+        return conn.execute(
             "SELECT count(*) FROM idempotency_keys WHERE key = %s", (KEY,)
         ).fetchone()
-    assert count == (1,)
+
+
+def test_concurrent_claim_one_wins(pg: str) -> None:
+    results = _concurrent_claims(pg, _seed_run(pg), _seed_run(pg))
+    assert sorted(type(r).__name__ for r in results) == ["Conflict", "New"]
+    assert _key_count(pg) == (1,)
+
+
+def test_same_run_in_progress_is_taken_over(pg: str) -> None:
+    run_id = _seed_run(pg)
+
+    async def go(conn: psycopg.AsyncConnection) -> list[object]:
+        first = await idempotency.claim(conn, KEY, run_id, "h1")
+        return [first, await idempotency.claim(conn, KEY, run_id, "h1")]
+
+    first, retry = _run(pg, go)
+    assert first == New()
+    assert retry == New()  # under 60 s, same run: the retry after an adapter failure
+    with psycopg.connect(pg) as conn:
+        row = conn.execute(
+            "SELECT run_id, status FROM idempotency_keys WHERE key = %s", (KEY,)
+        ).fetchone()
+    assert row == (run_id, "in_progress")
+
+
+def test_other_run_in_progress_conflicts(pg: str) -> None:
+    run_id = _seed_run(pg)
+    other_run = _seed_run(pg)
+
+    async def go(conn: psycopg.AsyncConnection) -> list[object]:
+        first = await idempotency.claim(conn, KEY, run_id, "h1")
+        return [first, await idempotency.claim(conn, KEY, other_run, "h1")]
+
+    first, other = _run(pg, go)
+    assert first == New()
+    assert other == Conflict()
+    with psycopg.connect(pg) as conn:
+        row = conn.execute("SELECT run_id FROM idempotency_keys WHERE key = %s", (KEY,)).fetchone()
+    assert row == (run_id,)
+
+
+def test_concurrent_claims_same_run_both_new(pg: str) -> None:
+    run_id = _seed_run(pg)
+    results = _concurrent_claims(pg, run_id, run_id)
+    assert results == [New(), New()]
+    assert _key_count(pg) == (1,)
+
+
+def test_second_complete_returns_first_result(pg: str) -> None:
+    run_id = _seed_run(pg)
+    first_result = {"vendor_order_id": "v-1", "state": "placed", "total_minor": 4200}
+    second_result = {"vendor_order_id": "v-1", "state": "placed", "total_minor": 9999}
+
+    async def go(conn: psycopg.AsyncConnection) -> list[object]:
+        await idempotency.claim(conn, KEY, run_id, "h1")
+        await idempotency.claim(conn, KEY, run_id, "h1")
+        async with conn.transaction():
+            first = await idempotency.complete(conn, KEY, first_result)
+        async with conn.transaction():
+            second = await idempotency.complete(conn, KEY, second_result)
+        return [first, second]
+
+    first, second = _run(pg, go)
+    assert first is None
+    assert second == Done(first_result)
+    with psycopg.connect(pg) as conn:
+        row = conn.execute(
+            "SELECT status, result FROM idempotency_keys WHERE key = %s", (KEY,)
+        ).fetchone()
+    assert row == ("done", first_result)
+
+
+def test_complete_unclaimed_key_raises(pg: str) -> None:
+    async def go(conn: psycopg.AsyncConnection) -> None:
+        async with conn.transaction():
+            await idempotency.complete(conn, KEY, {"state": "placed"})
+
+    with pytest.raises(RuntimeError, match="never claimed"):
+        _run(pg, go)
