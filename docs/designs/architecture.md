@@ -1472,9 +1472,6 @@ provisional shapes in §13 are enough to start every step in mock mode.
         others).
     *   `vendor_key(key: str) -> str` returns `str(uuid5(KEY_NAMESPACE, key))`.
         `KEY_NAMESPACE` is a fixed UUID constant in this file.
-*   **Amended 2026-11-02 (mock courier, #48).** `mock_batch_id(external_delivery_id: str)
-    -> UUID` returns `uuid5(UUID(external_delivery_id), "batch")`, the `batch_id` of a
-    mock booking that starts a new batch (item 46).
 *   **Amended 2026-11-02 (retry prompt, #36).** `retry_prompt_id(run_id: UUID) -> UUID`
     returns `uuid5(run_id, "retry_prompt")`, the `message_id` of a run's retry prompt
     (item 24).
@@ -2364,7 +2361,9 @@ and values; none of these may be renamed or dropped.
         only from rows with `state='booked'` and the same `env`, `agent_id` and
         `zone_id`, whose window overlaps its own. It takes the earliest such row's
         `batch_id`, and it keeps its own window and its own progression. If there is no
-        such row, `batch_id = ids.mock_batch_id(external_delivery_id)`.
+        such row, `batch_id = ids.mock_batch_id(external_delivery_id)`, a new helper in
+        `services/common/ids.py` (item 4) that returns `uuid5(UUID(external_delivery_id),
+        "batch")`.
     *   **`courier_delayed`.** `params: {delay_seconds: int > 0}`, matched on
         `target_agent_id = mock_deliveries.agent_id` and `env`. When several events are
         active, the largest `delay_seconds` applies. It is added to each step's

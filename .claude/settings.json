@@ -1,8 +1,6 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "permissions": {
-    "defaultMode": "acceptEdits",
-    "disableBypassPermissionsMode": "disable",
     "allow": [
       "Bash(cd *)",
       "Bash(ls *)",
@@ -90,7 +88,6 @@
       "Bash(git clean *)",
       "Bash(git rebase *)",
       "Bash(git commit --no-verify*)",
-
       "Bash(gh pr merge *)",
       "Bash(gh pr edit *)",
       "Bash(gh pr review *)",
@@ -120,7 +117,9 @@
       "Bash(docker volume rm *)",
       "Bash(curl * | sh*)",
       "Bash(curl * | bash*)"
-    ]
+    ],
+    "defaultMode": "acceptEdits",
+    "disableBypassPermissionsMode": "disable"
   },
   "hooks": {
     "PreToolUse": [
@@ -135,12 +134,15 @@
       }
     ]
   },
-  "extraKnownMarketplaces": {
-    "egm": {
-      "source": { "source": "github", "repo": "google/elephant-goldfish-model" }
-    }
-  },
   "enabledPlugins": {
     "egm@egm": true
+  },
+  "extraKnownMarketplaces": {
+    "egm": {
+      "source": {
+        "source": "github",
+        "repo": "google/elephant-goldfish-model"
+      }
+    }
   }
 }
