@@ -160,7 +160,8 @@ def test_model_sentence_passes_through_the_graph() -> None:
     [summary] = done.messages
     text = summary.body["params"]["text"]
     assert text.startswith(f"Your order {w.order_id[:8]} was delivered: 1 items, 2100 USD")
-    assert text.endswith(" " + expected)
+    # The explanation, then the pantry skip line: the fake pantry has rice (pantry §6).
+    assert text.endswith(" " + expected + " Skipped, already at home: rice.")
     assert "\n" not in text
 
 
@@ -190,7 +191,7 @@ def test_model_failure_uses_template() -> None:
     assert done.finish == RunFinish("completed")
     [summary] = done.messages
     assert summary.body["params"]["text"].endswith(
-        "Chose Square Grocery (simulated): 1 of 4 items for $21.00."
+        "Chose Square Grocery (simulated): 1 of 4 items for $21.00. Skipped, already at home: rice."
     )
 
 
