@@ -2,7 +2,9 @@
 
 `dispatch` looks up the member's phone and its `channel_mode`:
 
-*   `sim`: insert the message into `sim_outbound`. The Graph API is never called.
+*   `sim`: insert the message into `sim_outbound`, with the Graph payload it would send
+    under `graph`. The Graph API is never called. A body that breaks the Graph limits is
+    not inserted; a `decision` trace row records outcome `refused` (EX-I3).
 *   `real`: call `send_real`. `main.py` passes `GraphSender`, which calls the Graph API
     (issue #73): 3 attempts in total over about a minute, then `StepFailed`, so the row
     becomes `failed` and the run is unaffected (§9). A `Sender` built without `send_real`
@@ -20,22 +22,28 @@ from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
 import httpx
+from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from services.api.connect import Connect, pool_connect
 from services.common.config import Settings
 from services.common.consumer import Inbound, StepFailed, StepResult
+from services.common.trace import TraceStore
 
 __all__ = [
     "ATTEMPTS",
     "GRAPH_URL",
+    "MAX_BODY_CHARS",
     "MAX_BUTTONS",
+    "MAX_TITLE_CHARS",
+    "REFUSED",
     "RETRY_DELAYS_SECONDS",
     "SEND_FAILED",
     "TEXTS",
     "UNRENDERABLE",
     "WHERE",
+    "WINDOW_NODE",
     "GraphSender",
     "RealSendUnavailable",
     "Sender",
@@ -60,6 +68,10 @@ WHERE NOT EXISTS (SELECT 1 FROM sim_outbound
                     AND body->>'message_id' = %(message_id)s::text)
 """
 
+# `TraceStore.write(..., conn=...)` never touches the pool.
+_TRACES = TraceStore(None)  # type: ignore[arg-type]
+WHATSAPP = "channel:whatsapp"
+
 SendReal = Callable[[str, dict[str, Any]], Awaitable[None]]
 
 
@@ -82,8 +94,14 @@ UNRENDERABLE = "whatsapp_unrenderable"
 ATTEMPTS = 3
 RETRY_DELAYS_SECONDS: tuple[float, ...] = (20.0, 20.0)
 REQUEST_TIMEOUT_SECONDS = 8.0
-# WhatsApp reply buttons: at most 3 per message.
+# WhatsApp limits (experience §5 step 2): at most 3 reply buttons per message, each title
+# at most 20 characters, and a body of at most 1,024 characters.
 MAX_BUTTONS = 3
+MAX_TITLE_CHARS = 20
+MAX_BODY_CHARS = 1024
+# The `decision` trace row for a send's outcome (experience §5 and §15).
+WINDOW_NODE = "whatsapp_window"
+REFUSED = "refused"
 
 # The message catalog (experience §6). `{x}` is a `params` value; lists are passed already
 # joined, as one string param. A key that is not here is not sent (fails closed).
@@ -176,11 +194,13 @@ def _render(template: str, params: Any) -> str | None:
 
 def graph_payload(phone: str, body: dict[str, Any]) -> dict[str, Any] | None:
     """The Graph API `/messages` request for a `whatsapp_out` body, or `None` if its
-    template has no text here, a param it names is missing, or it has more buttons than
-    WhatsApp allows."""
+    template has no text here, a param it names is missing, or it breaks a WhatsApp limit
+    (more than 3 buttons, a title over 20 characters, a body over 1,024 characters)."""
     text = _render(body.get("template", ""), body.get("params"))
     buttons = body.get("buttons") or []
-    if text is None or len(buttons) > MAX_BUTTONS:
+    if text is None or len(text) > MAX_BODY_CHARS or len(buttons) > MAX_BUTTONS:
+        return None
+    if any(len(b["title"]) > MAX_TITLE_CHARS for b in buttons):
         return None
     base: dict[str, Any] = {
         "messaging_product": "whatsapp",
@@ -274,7 +294,11 @@ class Sender:
                 log.warning("whatsapp_out %s: the member has no phone", row.message_id)
                 return StepResult()
             if phone["channel_mode"] == "sim":
-                payload = {"message_id": str(row.message_id), **body}
+                graph = graph_payload(phone["phone_e164"], body)
+                if graph is None:
+                    await _refuse_unrenderable(conn, msg, body["user_id"])
+                    return StepResult()
+                payload = {"message_id": str(row.message_id), **body, "graph": graph}
                 async with conn.transaction():
                     await conn.execute(
                         _SIM_SQL,
@@ -288,3 +312,26 @@ class Sender:
                 return StepResult()
         await self._send_real(phone["phone_e164"], body)
         return StepResult()
+
+
+async def _refuse_unrenderable(conn: AsyncConnection, msg: Inbound, user_id: str) -> None:
+    """A sim send that breaks the Graph limits: no `sim_outbound` row, and one `decision`
+    trace row with outcome `refused` (EX-I3; the `whatsapp_sends` row comes with X9)."""
+    log.warning("whatsapp_out %s: %s", msg.row.message_id, UNRENDERABLE)
+    async with conn.transaction():
+        await _TRACES.write(
+            msg.row.run_id,
+            WHATSAPP,
+            "decision",
+            {
+                "node": WINDOW_NODE,
+                "choice": REFUSED,
+                "reason": UNRENDERABLE,
+                "explanation": "",
+                "ref": str(msg.row.message_id),
+            },
+            on_behalf_of=f"user:{user_id}",
+            conversation_id=msg.row.conversation_id,
+            message_id=msg.row.message_id,
+            conn=conn,
+        )
