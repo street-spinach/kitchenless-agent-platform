@@ -1,8 +1,11 @@
-"""Helpers for the seller contract tests (architecture item 69, mock mode).
+"""Helpers for the seller contract tests (architecture item 69; adapters §11).
 
 `seed_shop` (the `shop_db` fixture in `conftest.py`) seeds the mock store and mock
-restaurant cards, their items and `live` and `eval` stock into a fresh schema, and returns
-a `Shop` helper that runs coroutines with `db.get_pool()` pointing at that schema.
+restaurant cards, their items and `live` and `eval` stock into a fresh schema, and the two
+Square cards with the same items plus the two items of the Square recordings
+(`tests/contract/square.py`). Square cards get no `mock_stock` rows: their stock is the
+items table's `in_stock`. It returns a `Shop` helper that runs coroutines with
+`db.get_pool()` pointing at that schema.
 """
 
 import asyncio
@@ -22,7 +25,17 @@ from services.common.directory import AgentCard
 ZONE = "us-oh-45202"
 STORE = "grocery:mock-us"
 RESTAURANT = "restaurant:mock-us"
+SQUARE_STORE = "grocery:square-us"
+SQUARE_KITCHEN = "restaurant:square-us"
 STOCK = 100
+# The items in the Square recordings (`scripts/record_square.py`), with the same names and
+# prices, so a replayed order matches what the adapter sends.
+OAT_MILK = "MOCK-OAT-MILK"
+SOURDOUGH = "MOCK-SOURDOUGH"
+_RECORDED_ITEMS = [
+    (OAT_MILK, "Oat milk 1L", [], [], 399),
+    (SOURDOUGH, "Sourdough loaf", ["gluten"], [], 550),
+]
 
 ITEMS: dict[str, tuple[str, list[tuple[str, str, list[str], list[str], int]]]] = {
     STORE: (
@@ -41,19 +54,25 @@ ITEMS: dict[str, tuple[str, list[tuple[str, str, list[str], list[str], int]]]] =
         ],
     ),
 }
+ITEMS[SQUARE_STORE] = ("catalog_items", ITEMS[STORE][1] + _RECORDED_ITEMS)
+ITEMS[SQUARE_KITCHEN] = ("menu_items", ITEMS[RESTAURANT][1] + _RECORDED_ITEMS)
 
 
-def card(agent_id: str) -> AgentCard:
+def vendor(agent_id: str) -> str:
+    return "square" if ":square-" in agent_id else "mock"
+
+
+def card(agent_id: str, currency: str = "USD") -> AgentCard:
     cls = agent_id.partition(":")[0]
     return AgentCard(
         agent_id=agent_id,
         agent_class=cls,
-        owner_ref=f"org:mock-{cls}-us",
+        owner_ref=f"org:{vendor(agent_id)}-{cls}-us",
         region="us",
         zone_ids=(ZONE,),
-        currency="USD",
+        currency=currency,
         host_process="agents",
-        vendor="mock",
+        vendor=vendor(agent_id),
     )
 
 
@@ -100,8 +119,8 @@ def seed_shop(pg: str, monkeypatch: pytest.MonkeyPatch) -> Shop:
             conn.execute(
                 "INSERT INTO agent_cards (agent_id, class, owner_ref, region, zone_ids,"
                 " currency, host_process, vendor) VALUES (%s, %s, %s, 'us', %s, 'USD',"
-                " 'agents', 'mock')",
-                (agent_id, c.agent_class, c.owner_ref, list(c.zone_ids)),
+                " 'agents', %s)",
+                (agent_id, c.agent_class, c.owner_ref, list(c.zone_ids), c.vendor),
             )
             for sku, name, allergens, diets, price in items:
                 conn.execute(
@@ -109,6 +128,8 @@ def seed_shop(pg: str, monkeypatch: pytest.MonkeyPatch) -> Shop:
                     " price_minor, currency) VALUES (%s, %s, %s, %s, %s, %s, %s, 'USD')",
                     (agent_id, sku, name, name.lower(), allergens, diets, price),
                 )
+                if c.vendor != "mock":
+                    continue
                 for env in ("live", "eval"):
                     conn.execute(
                         "INSERT INTO mock_stock (env, agent_id, sku, qty) VALUES (%s, %s, %s, %s)",

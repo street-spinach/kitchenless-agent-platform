@@ -51,8 +51,7 @@ NOT_CONFIGURED = "adapter_not_configured"
 _MOCK_STORE = "services.mcp.grocery.adapters.mock_store:MockStoreAdapter"
 _MOCK_RESTAURANT = "services.mcp.restaurant.adapters.mock_restaurant:MockRestaurantAdapter"
 _MOCK_COURIER = "services.mcp.delivery.adapters.mock_courier:MockCourierAdapter"
-# The Square classes (adapters §2 and file 26). Their modules land in adapters build step 6;
-# until then `adapter_for` raises `adapter_not_configured` for them.
+# The Square classes (adapters §2 and files 26-27), on the Square sandbox.
 _SQUARE_RETAIL = "services.mcp.grocery.adapters.square:SquareRetailAdapter"
 _SQUARE_RESTAURANT = "services.mcp.restaurant.adapters.square:SquareRestaurantAdapter"
 # Adapter classes by vendor and mode, as `module:Class`, imported on use so this module

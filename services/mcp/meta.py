@@ -61,13 +61,26 @@ class AdapterFailure(Exception):
     """An adapter call failed.
 
     `adapter_timeout` and `adapter_5xx` are `retryable=True`; `adapter_4xx` is
-    `retryable=False`.
+    `retryable=False`. A real vendor's adapter also sets `vendor` and, when known, the
+    vendor's `http_status` and error code (`vendor_code`); `tool_errors()` copies the ones
+    that are set into the `error` trace row (adapters §11).
     """
 
-    def __init__(self, reason: str, retryable: bool) -> None:
+    def __init__(
+        self,
+        reason: str,
+        retryable: bool,
+        *,
+        vendor: str | None = None,
+        http_status: int | None = None,
+        vendor_code: str | None = None,
+    ) -> None:
         super().__init__(reason)
         self.reason = reason
         self.retryable = retryable
+        self.vendor = vendor
+        self.http_status = http_status
+        self.vendor_code = vendor_code
 
 
 @dataclass
@@ -168,11 +181,20 @@ async def tool_errors(ctx: CallContext, server: str, tool: str) -> AsyncIterator
     except GuardRefused as e:
         err.result = tool_error("refused", e.reason)
     except AdapterFailure as e:
+        payload: dict[str, Any] = {
+            "where": f"{server}.{tool}",
+            "reason": e.reason,
+            "attempt": ctx.attempt,
+        }
+        for name in ("vendor", "http_status", "vendor_code"):
+            value = getattr(e, name)
+            if value is not None:
+                payload[name] = value
         await TraceStore(db.get_pool()).write(
             ctx.run_id,
             ctx.agent_id,
             "error",
-            {"where": f"{server}.{tool}", "reason": e.reason, "attempt": ctx.attempt},
+            payload,
             on_behalf_of=ctx.on_behalf_of,
             conversation_id=ctx.conversation_id,
         )
