@@ -107,6 +107,8 @@ DISLIKE_REPLIES: Mapping[str, tuple[str, str]] = {
 DISLIKE_VALUE_TEMPLATES = frozenset({"dislike_saved", "dislike_removed"})
 DISLIKE_NOT_SAVED_TEMPLATE = "dislike_not_saved"
 DISLIKE_REFUSED = "dislike_refused"
+# `dislike_not_saved` names the admin; a household without one gets this instead.
+ADMIN_FALLBACK = "your household admin"
 DISLIKE_ACTIONS = frozenset({"add", "remove"})
 CHAT_REPLY_MAX_CHARS = 1000
 WHATSAPP = "channel:whatsapp"
@@ -164,6 +166,8 @@ class ConsumerState(TypedDict, total=False):
     body: dict[str, Any]
     household_id: str | None
     text: str
+    # The household's first admin, named in `dislike_not_saved` (experience EX-I2).
+    admin_name: str
     # Decisions and the step's result.
     intent: str | None
     outgoing: list[dict[str, Any]]
@@ -173,10 +177,12 @@ class ConsumerState(TypedDict, total=False):
 
 @dataclass(frozen=True)
 class RunInfo:
-    """What the graph reads from the `runs` row: the household and the member's text."""
+    """What the graph reads from the `runs` row: the household, the member's text and the
+    display name of the household's first admin by `household_members.created_at`."""
 
     household_id: str | None
     text: str
+    admin_name: str | None = None
 
 
 LoadRun = Callable[[UUID], Awaitable[RunInfo]]
@@ -334,7 +340,8 @@ def build_graph(
 
         async def not_saved(reason: str) -> dict[str, Any]:
             await trace_decision(state, "learn_dislike", DISLIKE_REFUSED, reason)
-            out = whatsapp(state, DISLIKE_NOT_SAVED_TEMPLATE, {})
+            admin = state.get("admin_name") or ADMIN_FALLBACK
+            out = whatsapp(state, DISLIKE_NOT_SAVED_TEMPLATE, {"admin": admin})
             return {"outgoing": [out], "finish": "completed"}
 
         try:
@@ -535,6 +542,7 @@ class ConsumerGraph:
                 body=body,
                 household_id=run.household_id,
                 text=run.text,
+                admin_name=run.admin_name or ADMIN_FALLBACK,
                 intent=None,
                 outgoing=[],
                 finish=None,
@@ -565,7 +573,13 @@ class ConsumerGraph:
 
 # The host's handler. Built on first use, after the host has opened the pool.
 
-_RUN_SQL = "SELECT household_id, trigger->>'text' FROM runs WHERE run_id = %s"
+_RUN_SQL = """
+SELECT r.household_id, r.trigger->>'text',
+       (SELECT u.display_name FROM household_members m JOIN users u ON u.user_id = m.user_id
+        WHERE m.household_id = r.household_id AND m.role = 'admin'
+        ORDER BY m.created_at, m.user_id LIMIT 1)
+FROM runs r WHERE r.run_id = %s
+"""
 _default: ConsumerGraph | None = None
 
 
@@ -585,7 +599,7 @@ def _build_default() -> ConsumerGraph:
             row = await cur.fetchone()
         if row is None:
             raise LookupError(f"run {run_id} does not exist")
-        return RunInfo(household_id=row[0], text=row[1] or "")
+        return RunInfo(household_id=row[0], text=row[1] or "", admin_name=row[2])
 
     return ConsumerGraph(
         model=ModelClient(traces, PgRunState(pool)),

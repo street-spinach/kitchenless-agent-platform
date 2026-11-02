@@ -3,6 +3,7 @@
 import asyncio
 import uuid
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import psycopg
 import pytest
@@ -282,7 +283,18 @@ def test_request_approval_prompts_approver_and_pauses_run_timeout(
     assert (prompt["from_agent"], prompt["to_agent"]) == (HOUSEHOLD_AGENT, w.WHATSAPP)
     assert prompt["body"]["user_id"] == str(w.ADMIN)
     assert prompt["body"]["template"] == "approval_request"
-    assert prompt["body"]["params"] == {"amount": "$76.00"}
+    # Experience EX-I2: `reply_by` is the expiry timer's `due_at` in the household's zone.
+    [timer] = w.query(
+        world,
+        "SELECT t.due_at, t.created_at, h.timezone FROM timers t, households h"
+        " WHERE t.run_id = %s AND t.kind = 'approval_expiry' AND h.household_id = %s",
+        run_id,
+        w.HOUSEHOLD_ID,
+    )
+    reply_by = household.format_reply_by(
+        timer["due_at"], timer["created_at"], ZoneInfo(timer["timezone"])
+    )
+    assert prompt["body"]["params"] == {"amount": "$76.00", "reply_by": reply_by}
     assert [b["payload"] for b in prompt["body"]["buttons"]] == [
         f"ap:{approval_id}:approved",
         f"ap:{approval_id}:rejected",
@@ -551,8 +563,11 @@ def test_tt_tap_unchanged_sends_nothing(world: str, monkeypatch: pytest.MonkeyPa
     assert _messages(world, tap_run) == []
 
 
-def test_tt_tap_by_non_approver_sends_nothing(world: str, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_tt_tap_by_non_approver_replies(world: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Experience EX-I2: a `wrong_approver` refusal names the approver; nothing changes.
     order_id = _completed_dinner(world)
+    with psycopg.connect(world) as conn:
+        conn.execute("UPDATE users SET display_name = 'Asha' WHERE user_id = %s", (w.ADMIN,))
     button = ids.take_turns_button(order_id, True)
     tap_run = _tt_tap(world, monkeypatch, "wamid.other", button, phone=w.MEMBER_PHONE)
     assert tap_run is not None
@@ -561,7 +576,20 @@ def test_tt_tap_by_non_approver_sends_nothing(world: str, monkeypatch: pytest.Mo
     assert refusal["payload"]["refused"] is True
     assert refusal["payload"]["reason"] == "wrong_approver"
     assert _take_turns_row(world) == []
-    assert _messages(world, tap_run) == []
+    inbound = ids.inbound_id(CHANNEL, "wamid.other")
+    [reply] = _messages(world, tap_run)
+    assert reply["message_id"] == ids.message_id(inbound, 0)
+    assert (reply["from_agent"], reply["to_agent"], reply["type"]) == (
+        API_AGENT,
+        w.WHATSAPP,
+        "whatsapp_out",
+    )
+    assert reply["body"] == {
+        "user_id": str(w.MEMBER),
+        "template": "take_turns_not_approver",
+        "params": {"approver": "Asha"},
+        "buttons": [],
+    }
 
 
 def test_tt_tap_unknown_order_sends_nothing(world: str, monkeypatch: pytest.MonkeyPatch) -> None:

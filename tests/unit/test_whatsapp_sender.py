@@ -50,12 +50,12 @@ def test_approval_prompt_renders_amount_and_buttons() -> None:
         {"payload": f"ap:{approval}:approved", "title": "Approve"},
         {"payload": f"ap:{approval}:rejected", "title": "Reject"},
     ]
-    params = {"amount": "$76.00"}
+    params = {"amount": "$76.00", "reply_by": "6:30 pm"}
     body = {**RETRY, "template": "approval_request", "params": params, "buttons": buttons}
     asyncio.run(graph.sender()(PHONE, body))
     sent = json.loads(graph.requests[0].content)
     assert sent["interactive"]["body"]["text"] == (
-        "Your agent wants to spend $76.00 and needs your approval. Approve?"
+        "Your agent wants to spend $76.00 and needs your approval. Reply by 6:30 pm."
     )
     titles = [b["reply"]["title"] for b in sent["interactive"]["action"]["buttons"]]
     assert titles == ["Approve", "Reject"]
@@ -64,9 +64,9 @@ def test_approval_prompt_renders_amount_and_buttons() -> None:
 @pytest.mark.parametrize(
     ("template", "params", "text"),
     [
-        ("approval_expired", {}, "This approval has already expired."),
+        ("approval_expired", {}, "This approval has expired, so the order was cancelled."),
         ("approval_not_approver", {"approver": "Asha"}, "Only Asha can approve this."),
-        ("approval_cancelled", {}, "Order cancelled: no approval."),
+        ("approval_cancelled", {}, "Order cancelled: it wasn't approved."),
     ],
 )
 def test_approval_reply_texts(template: str, params: dict[str, str], text: str) -> None:
@@ -81,44 +81,51 @@ def test_approval_reply_texts(template: str, params: dict[str, str], text: str) 
     [
         ("chat_reply", {"text": "Try a lentil soup."}, "Try a lentil soup."),
         ("order_summary", {"text": "Delivered."}, "Delivered."),
-        ("no_offers", {}, "No store could fill this order right now."),
+        (
+            "no_offers",
+            {},
+            "No store could fill this order right now. Reply *retry* to try again.",
+        ),
         (
             "off_topic_reply",
             {},
-            "I can only help with food: planning meals, groceries and dinner orders.",
+            "I can only help with food: meals, groceries and dinner orders.",
         ),
         (
             "dislike_saved",
             {"value": "olives"},
-            "Saved: you dislike olives. This is a dislike, not an allergy; "
-            "your household admin sets allergies.",
+            "Saved: you don't like olives. I'll avoid it when I can. "
+            "Allergies are set by your household admin.",
         ),
-        ("dislike_removed", {"value": "olives"}, "Done: olives is no longer on your dislikes."),
+        ("dislike_removed", {"value": "olives"}, "Done: olives is off your dislikes."),
         (
             "dislike_not_removed",
             {},
-            "I can only forget dislikes you told me. "
-            "Ask your household admin to change the others.",
+            "I can only forget dislikes you told me. Your household admin can change the others.",
         ),
         (
             "dislike_not_saved",
-            {},
-            "I can't save that. Allergies and diets are set by your household admin.",
+            {"admin": "Asha"},
+            "Allergies and diets are saved by Asha. Ask them to tell me.",
         ),
         (
             "take_turns_offer",
             {"values": "olives, mushrooms"},
-            "One person's dislike (olives, mushrooms) was in tonight's dinner. "
-            "Want me to take turns on whose dislikes come first for household dinners?",
+            "Tonight's dinner had something one person doesn't like (olives, mushrooms). "
+            "Want me to take turns on whose dislikes come first?",
         ),
         (
             "take_turns_offer_off",
             {"values": "olives"},
-            "One person's dislike (olives) was in tonight's dinner. "
-            "Take turns is on; tap to stop it.",
+            "Tonight's dinner had something one person doesn't like (olives). Take turns is on.",
         ),
         ("take_turns_saved", {"state": "on"}, "Take turns is now on."),
         ("take_turns_saved", {"state": "off"}, "Take turns is now off."),
+        (
+            "take_turns_not_approver",
+            {"approver": "Asha"},
+            "Only Asha can change take turns.",
+        ),
         (
             "nothing_needed",
             {"items": "milk, eggs"},
@@ -143,6 +150,8 @@ def test_agents_template_texts(template: str, params: dict[str, str], text: str)
         "take_turns_offer",
         "take_turns_offer_off",
         "take_turns_saved",
+        "take_turns_not_approver",
+        "dislike_not_saved",
         "nothing_needed",
     ],
 )
