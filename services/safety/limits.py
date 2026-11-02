@@ -4,8 +4,8 @@ Architecture item 51 (amended 2026-11-02, #44) and agent-protocol P28 (the
 `authorize_spend` part). Every limit is enforced in code and raises a `GuardRefused`
 subclass with a fixed wire reason, so a broken limit fails closed through the guard.
 
-`authorize_spend()` runs the `authorize_spend` limits in the §5 order: allergens, budget,
-currency, `a2a_demo`.
+`authorize_spend()` runs the `authorize_spend` limits in the §5 order (amended by agents
+AG-A8, #186): allergens, budget, child requester, currency, `a2a_demo`.
 
 `authorize_amendment()` and `check_amend_order()` are the shortfall amendment limits
 (agent-protocol §10 "Applying" and "Amending", P28, #67).
@@ -47,6 +47,7 @@ __all__ = [
     "check_allergens",
     "check_approver",
     "check_budget",
+    "check_child_requester",
     "check_coverage",
     "check_currency",
     "check_window",
@@ -169,12 +170,42 @@ async def check_budget(
         raise CurrencyMismatch() from None
     if not over:
         return
+    if not await _approval_covers(conn, household_id, order_id, total):
+        raise NeedsApproval()
+
+
+async def _approval_covers(
+    conn: AsyncConnection, household_id: str, order_id: uuid.UUID, total: Money
+) -> bool:
+    """True when the order has an `approved` approval of at least `total`, same currency."""
     cur = await conn.execute(
         "SELECT 1 FROM approvals WHERE order_id = %s AND household_id = %s"
         " AND status = 'approved' AND amount_minor >= %s AND currency = %s LIMIT 1",
         (order_id, household_id, total.amount_minor, total.currency),
     )
-    if await cur.fetchone() is None:
+    return await cur.fetchone() is not None
+
+
+async def check_child_requester(
+    conn: AsyncConnection, household_id: str, order_id: uuid.UUID, total: Money
+) -> None:
+    """Raise `NeedsApproval` when a `child` member started the order's run (agents §9).
+
+    The requester is the run's `trigger.user_id`. It applies to every order a child
+    starts, whatever its total or kind, unless an `approved` approval for the order covers
+    `total` (the same rule as `check_budget`).
+    """
+    cur = await conn.execute(
+        "SELECT hm.role FROM orders o JOIN runs r ON r.run_id = o.run_id"
+        " JOIN household_members hm ON hm.household_id = o.household_id"
+        " AND hm.user_id::text = r.trigger->>'user_id'"
+        " WHERE o.order_id = %s",
+        (order_id,),
+    )
+    row = await cur.fetchone()
+    if row is None or row[0] != "child":
+        return
+    if not await _approval_covers(conn, household_id, order_id, total):
         raise NeedsApproval()
 
 
@@ -261,9 +292,10 @@ async def authorize_spend(
     member_allergens: Mapping[Any, Iterable[str]],
     knowledge: Knowledge,
 ) -> None:
-    """The `authorize_spend` limits, in the §5 order: allergens, budget, currency, `a2a_demo`."""
+    """The `authorize_spend` limits, in order: allergens, budget, child, currency, `a2a_demo`."""
     await check_allergens(items, member_allergens, knowledge)
     await check_budget(conn, household_id, order_id, total)
+    await check_child_requester(conn, household_id, order_id, total)
     await check_currency(conn, order_id, total)
     await check_a2a_demo(conn, order_id)
 

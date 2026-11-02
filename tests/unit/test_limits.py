@@ -7,9 +7,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import psycopg
 import pytest
+from psycopg.types.json import Jsonb
 
-from services.common import orders
+from services.common import ids, orders
 from services.common.directory import AgentCard
 from services.common.money import Money
 from services.common.protocol.schemas import Window
@@ -39,6 +41,7 @@ class FakeConn:
     approver: uuid.UUID | None = APPROVER
     order_currency: str | None = "USD"
     run_kind: str | None = "weekly"
+    requester_role: str | None = "admin"
     queries: list[str] = field(default_factory=list)
 
     async def execute(self, query: str, params: Sequence[Any]) -> _Cursor:
@@ -56,6 +59,9 @@ class FakeConn:
             return _Cursor((1,) if covered else None)
         if "FROM approval_rules" in query:
             return _Cursor(None if self.approver is None else (self.approver,))
+        if "JOIN household_members" in query:
+            role = self.requester_role
+            return _Cursor(None if role is None else (role,))
         if "JOIN runs" in query:
             return _Cursor(None if self.run_kind is None else (self.run_kind,))
         if "SELECT currency FROM orders" in query:
@@ -261,3 +267,92 @@ def test_every_limit_exception_is_guard_refused() -> None:
     assert names
     for name in names:
         assert issubclass(getattr(limits, name), GuardRefused), name
+
+
+def test_child_requester_needs_approval(remaining: list[Money]) -> None:
+    # Under the remaining budget: only the child rule asks for approval.
+    conn = FakeConn(requester_role="child", approvals=[_approval(4_000)])
+    with pytest.raises(limits.NeedsApproval) as e:
+        _authorize(conn, Money(4_200, "USD"))
+    assert e.value.reason == "needs_approval"
+    # It runs after the budget check and before currency and `a2a_demo`.
+    assert ["approvals" in q for q in conn.queries] == [False, True]
+    with pytest.raises(limits.NeedsApproval):
+        _authorize(FakeConn(requester_role="child", run_kind="a2a_demo"), Money(4_200, "USD"))
+
+
+def test_child_requester_covered_by_approval(remaining: list[Money]) -> None:
+    conn = FakeConn(requester_role="child", approvals=[_approval(4_200)])
+    _authorize(conn, Money(4_200, "USD"))
+    _authorize(conn, Money(4_100, "USD"))  # a re-quote below the approved total
+    # Over the budget too: one approval covering the total covers both rules.
+    remaining[0] = Money(1_000, "USD")
+    _authorize(conn, Money(4_200, "USD"))
+    pending = FakeConn(requester_role="child", approvals=[_approval(4_200, status="pending")])
+    with pytest.raises(limits.NeedsApproval):
+        _authorize(pending, Money(4_200, "USD"))
+
+
+@pytest.mark.parametrize("role", ["admin", "member", None])
+def test_adult_requester_unaffected(remaining: list[Money], role: str | None) -> None:
+    conn = FakeConn(requester_role=role)
+    _authorize(conn, Money(4_200, "USD"))
+    asyncio.run(limits.check_child_requester(conn, HOUSEHOLD, ORDER_ID, Money(4_200, "USD")))  # type: ignore[arg-type]
+    assert not any("FROM approvals" in q for q in conn.queries)
+    with pytest.raises(limits.NeedsApproval):
+        _authorize(FakeConn(requester_role=role), Money(10_001, "USD"))  # the budget rule
+
+
+@pytest.mark.db
+def test_child_requester_query_db(pg: str) -> None:
+    """The role query against the real schema: `trigger.user_id` joined to the member."""
+    child, adult = ids.seed_user_id("us-1-child"), ids.seed_user_id("us-1-adult")
+    total = Money(4_200, "USD")
+
+    async def go() -> None:
+        async with await psycopg.AsyncConnection.connect(pg, autocommit=True) as conn:
+            await conn.execute(
+                "INSERT INTO households (household_id, name, region, zone_id, timezone, currency)"
+                " VALUES (%s, 'Test', 'us', 'us-oh-45202', 'America/New_York', 'USD')",
+                (HOUSEHOLD,),
+            )
+            await conn.execute(
+                "INSERT INTO household_addresses"
+                " (address_ref, household_id, line1, city, region, postal_code, country)"
+                " VALUES (%s, %s, '1 Main St', 'Cincinnati', 'OH', '45202', 'US')",
+                (ids.seed_address_ref(HOUSEHOLD), HOUSEHOLD),
+            )
+            order_ids, run_ids = {}, {}
+            for user, role in ((child, "child"), (adult, "admin")):
+                await conn.execute(
+                    "INSERT INTO users (user_id, display_name) VALUES (%s, %s)", (user, role)
+                )
+                await conn.execute(
+                    "INSERT INTO household_members (household_id, user_id, role)"
+                    " VALUES (%s, %s, %s)",
+                    (HOUSEHOLD, user, role),
+                )
+                run_id, order_id = uuid.uuid4(), uuid.uuid4()
+                await conn.execute(
+                    "INSERT INTO runs (run_id, household_id, kind, trigger, modes)"
+                    " VALUES (%s, %s, 'dinner', %s, '{}')",
+                    (run_id, HOUSEHOLD, Jsonb({"user_id": str(user)})),
+                )
+                await conn.execute(
+                    "INSERT INTO orders (order_id, run_id, household_id, kind, state, currency,"
+                    " address_ref) VALUES (%s, %s, %s, 'dinner', 'negotiating', 'USD', %s)",
+                    (order_id, run_id, HOUSEHOLD, ids.seed_address_ref(HOUSEHOLD)),
+                )
+                order_ids[role], run_ids[role] = order_id, run_id
+
+            await limits.check_child_requester(conn, HOUSEHOLD, order_ids["admin"], total)
+            with pytest.raises(limits.NeedsApproval):
+                await limits.check_child_requester(conn, HOUSEHOLD, order_ids["child"], total)
+            await conn.execute(
+                "INSERT INTO approvals (approval_id, run_id, household_id, order_id,"
+                " amount_minor, currency, status) VALUES (%s, %s, %s, %s, 4200, 'USD', 'approved')",
+                (uuid.uuid4(), run_ids["child"], HOUSEHOLD, order_ids["child"]),
+            )
+            await limits.check_child_requester(conn, HOUSEHOLD, order_ids["child"], total)
+
+    asyncio.run(go())
