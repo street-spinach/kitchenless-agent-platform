@@ -47,6 +47,11 @@ def test_idempotency_key_scope_appended() -> None:
         ids.idempotency_key(ORDER, "authorize_spend", "household:h1", scope="")  # type: ignore[arg-type]
 
 
+def test_approval_id_one_per_order() -> None:
+    assert ids.approval_id(ORDER) == ids.approval_id(ORDER) == uuid5(ORDER, "approval")
+    assert ids.approval_id(ORDER) != ids.approval_id(uuid4())
+
+
 def test_vendor_key_fits_square_limit() -> None:
     key = ids.idempotency_key(ORDER, "place_order", "grocery:square-us", scope=uuid4())
     vk = ids.vendor_key(key)

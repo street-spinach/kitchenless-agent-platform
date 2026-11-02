@@ -125,3 +125,25 @@ def test_traced_refuses_ended_run(pg: str, monkeypatch: pytest.MonkeyPatch) -> N
         "refused": True,
         "reason": "run_ended",
     }
+
+
+def test_traced_traces_refusal_from_body(pg: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    run_id = _seed_run(pg)
+
+    @traced("household")
+    async def set_order_state(ctx: CallContext, **args: Any) -> dict[str, Any]:
+        raise GuardRefused("state_not_allowed")
+
+    with pytest.raises(GuardRefused) as e:
+        _with_pool(pg, monkeypatch, lambda: set_order_state(_ctx(run_id), new="placed"))
+
+    assert e.value.reason == "state_not_allowed"
+    rows = _traces(pg, run_id)
+    assert [r["kind"] for r in rows] == ["tool_call", "tool_result"]
+    assert rows[1]["payload"] == {
+        "server": "household",
+        "tool": "set_order_state",
+        "result": None,
+        "refused": True,
+        "reason": "state_not_allowed",
+    }
