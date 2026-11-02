@@ -244,6 +244,8 @@ Every goal names the test or check that verifies it. Unit tests run with `MODE=m
 *   **No parallel runner.** Attempts run one at a time; the budget is sized to that.
 *   **No pantry eval cases.** pantry.md, when written, adds its own.
 
+*Amended 2026-11-02 (pantry, #251):* pantry.md adds its cases (pantry.md §8, PT-A11).
+
 ## Open Questions
 
 *   **E-Q1. Q2's numbers.** The tokens and seconds of one real weekly-order, dinner and
@@ -407,6 +409,8 @@ location, written in build step 1.
 ```
 
 ### 4. The case format and eval fixtures
+
+*Amended 2026-11-02 (pantry, #251):* the setup-key registry gains `pantry` (vocabulary name → list of `{kind, age_hours}`, no-op `undo`); `evals/checks.py` gains `pantry_decisions_traced` and `no_quote_requests`; two task cases and their `evals/coverage.yaml` entries are added (pantry.md §8, PT-A11).
 
 One YAML file per case at `evals/cases/<category>/<id>.yaml`. The runner rejects a file
 with any field not listed here.

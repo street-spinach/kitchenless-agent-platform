@@ -856,6 +856,8 @@ raises `AuthzUnavailable` with reason `authz_unavailable`, not a refusal (I-G9).
     example `apply_delivery_status`, `/panel/reset`, the ingest lookup) marks its query
     `unscoped(conn, "<reason>")`, and the test's allowlist names each such place. SQL built
     from a table-name variable fails the test.
+
+*Amended 2026-11-02 (pantry, #251):* pantry.md adds no household-scoped table. The `pantry` setup key writes eval `pantry_events` inside `/panel/reset`, which is already an `unscoped` allowlist entry (pantry.md PT-A12).
 *   The identity modules and other callers without a household are classified as
     `unscoped(conn, reason)` up front: `grants` (load and refresh by agent and user),
     `links.use`, `tokens.validate`, `audit.record`, `fga.reconcile`, the seed,
