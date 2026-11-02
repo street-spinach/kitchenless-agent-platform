@@ -3,13 +3,13 @@
 # and `consumer:<member_id>`. Business cards are shared by the live and eval households.
 
 organizations:
-  - {org_id: kroger-us, name: Kroger (US)}
-  - {org_id: square-grocery-us, name: Square Sandbox Grocery}
-  - {org_id: mock-grocery-us, name: Mock Grocery US}
-  - {org_id: square-restaurant-us, name: Square Sandbox Kitchen}
-  - {org_id: mock-restaurant-us, name: Mock Kitchen US}
-  - {org_id: doordash-us, name: DoorDash Drive (US)}
-  - {org_id: mock-courier-us, name: Mock Courier US}
+  - {org_id: kroger-us, name: Hillcrest Market (simulated)}
+  - {org_id: square-grocery-us, name: Square Grocery}
+  - {org_id: mock-grocery-us, name: Mock Grocery US (simulated)}
+  - {org_id: square-restaurant-us, name: Square Kitchen}
+  - {org_id: mock-restaurant-us, name: Mock Kitchen US (simulated)}
+  - {org_id: doordash-us, name: DoorDash Drive (simulated)}
+  - {org_id: mock-courier-us, name: Uber Direct (simulated)}
 
 # One seeded owner per organization (identity-authz §3, §10): a Keycloak user with a fixed
 # id, username `owner.<org_id>` and the shared OWNER_DEMO_PASSWORD. The realm file
@@ -29,13 +29,14 @@ business:
   - agent_id: grocery:kroger-us
     owner: kroger-us
     vendor: kroger
-    description: Kroger grocery store. Real catalog, mock ordering.
-    # config.location_id is read from KROGER_LOCATION_ID at seed time.
-    location_id_from_env: KROGER_LOCATION_ID
+    description: >-
+      Simulated grocery store. Catalog modelled on Kroger's public product data.
+      Not affiliated with Kroger.
   - agent_id: grocery:square-us
     owner: square-grocery-us
     vendor: square
-    description: Grocery store on the Square sandbox.
+    description: >-
+      Grocery store on the Square sandbox. Simulated when the platform runs in mock mode.
   - agent_id: grocery:mock-us
     owner: mock-grocery-us
     vendor: mock
@@ -43,7 +44,8 @@ business:
   - agent_id: restaurant:square-us
     owner: square-restaurant-us
     vendor: square
-    description: Restaurant on the Square sandbox.
+    description: >-
+      Restaurant on the Square sandbox. Simulated when the platform runs in mock mode.
   - agent_id: restaurant:mock-us
     owner: mock-restaurant-us
     vendor: mock
@@ -51,11 +53,15 @@ business:
   - agent_id: delivery:doordash-us
     owner: doordash-us
     vendor: doordash
-    description: Courier on the DoorDash Drive sandbox.
+    description: >-
+      Simulated courier. Shows where a DoorDash Drive connection plugs in.
+      Not affiliated with DoorDash.
   - agent_id: delivery:mock-us
     owner: mock-courier-us
     vendor: mock
-    description: Mock courier for demos and evals.
+    description: >-
+      Simulated courier. Shows where an Uber Direct connection plugs in.
+      Not affiliated with Uber.
 
 business_defaults:
   region: us

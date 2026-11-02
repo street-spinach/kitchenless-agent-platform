@@ -12,7 +12,6 @@ identity-authz I27.
 """
 
 import argparse
-import asyncio
 import json
 import re
 import sys
@@ -24,7 +23,8 @@ import psycopg
 import yaml
 from psycopg.types.json import Jsonb
 
-from services.common import ids
+from services.common import ids, vendors
+from services.common.directory import AgentCard
 from services.seed import DATA_DIR, mock_stock_rows
 
 ENVS = ("live", "eval", "all")
@@ -32,6 +32,13 @@ CARD_VERSION_DEFAULT = "1.0.0"
 E164 = re.compile(r"^\+[1-9][0-9]{7,14}$")
 # Fictional numbers only (555-01xx). Real numbers come from the environment.
 FICTIONAL_PHONE = re.compile(r"^\+1555010[0-9]{4}$")
+# One tool per business class for the vendor-key check. Every tool of a card maps to the
+# same key (adapters §5), so one lookup tells whether the card's vendor has an entry.
+_KEY_CHECK_TOOL = {
+    "grocery": "search_items",
+    "restaurant": "search_items",
+    "delivery": "quote_delivery",
+}
 
 
 class SeedError(RuntimeError):
@@ -82,6 +89,8 @@ def _validate(data: dict[str, Any]) -> None:
                 raise SeedError(f"ingredient {ing['name']!r} has two allergen lists")
 
     business = {c["agent_id"] for c in data["agents"]["business"]}
+    for card in data["agents"]["business"]:
+        _check_vendor_key(card)
     for agent_id, items in [*data["catalogs"].items(), *data["menus"].items()]:
         if agent_id not in business:
             raise SeedError(f"items for unknown card {agent_id}")
@@ -109,6 +118,34 @@ def _validate(data: dict[str, Any]) -> None:
             phone = m.get("phone")
             if phone is not None and not FICTIONAL_PHONE.match(phone):
                 raise SeedError(f"{m['member_id']}: repository phones must be 555-01xx")
+
+
+def _check_vendor_key(card: dict[str, Any]) -> None:
+    """A business card whose `vendor` is not `mock` needs a `vendors.card_vendor_key` entry
+    (adapters §5)."""
+    from services.mcp.meta import AdapterFailure
+
+    agent_id, vendor = card["agent_id"], card["vendor"]
+    if vendor == vendors.MOCK_VENDOR:
+        return
+    area = ids.parse_agent_id(agent_id)[0]
+    tool = _KEY_CHECK_TOOL.get(area)
+    if tool is None:
+        raise SeedError(f"{agent_id}: no vendor-key check for class {area!r}")
+    stub = AgentCard(
+        agent_id=agent_id,
+        agent_class=area,
+        owner_ref=f"org:{card['owner']}",
+        region="",
+        zone_ids=(),
+        currency=None,
+        host_process="agents",
+        vendor=vendor,
+    )
+    try:
+        vendors.card_vendor_key(area, stub, tool)
+    except AdapterFailure as exc:
+        raise SeedError(f"{agent_id}: vendor {vendor!r} has no vendor-key mapping") from exc
 
 
 def parse_us1_phones(raw: str | None) -> list[str] | None:
@@ -143,9 +180,7 @@ def _floor_minor(price_minor: int, pct: int) -> int:
     return -(-price_minor * pct // 100)  # rounded up, so the floor is never below pct
 
 
-def _seed_business(
-    conn: psycopg.Connection, data: dict[str, Any], kroger_location_id: str | None
-) -> None:
+def _seed_business(conn: psycopg.Connection, data: dict[str, Any]) -> None:
     agents = data["agents"]
     for org in agents["organizations"]:
         _upsert(conn, "organizations", ["org_id"], {**org, "region": "us"})
@@ -155,8 +190,6 @@ def _seed_business(
             "description": card["description"],
             "card_version": card.get("card_version", d.get("card_version", CARD_VERSION_DEFAULT)),
         }
-        if card.get("location_id_from_env"):
-            config["location_id"] = kroger_location_id
         _upsert(
             conn,
             "agent_cards",
@@ -372,7 +405,6 @@ def seed(
     env: str = "all",
     *,
     us1_phones: list[str] | None = None,
-    kroger_location_id: str | None = None,
     data: dict[str, Any] | None = None,
 ) -> None:
     """Write the seed rows for `env` in one transaction on `conn`."""
@@ -381,7 +413,7 @@ def seed(
     data = load_data() if data is None else data
     envs = ("live", "eval") if env == "all" else (env,)
     with conn.transaction():
-        _seed_business(conn, data, kroger_location_id)
+        _seed_business(conn, data)
         for hh in data["households"]:
             if hh["env"] in envs:
                 _seed_household(conn, hh, us1_phones)
@@ -424,13 +456,6 @@ def load_graph(uri: str, user: str, password: str, products: list[dict[str, Any]
 # --- Entry point ----------------------------------------------------------------------------
 
 
-async def _kroger_catalog_mode(dsn: str) -> str:
-    from services.common.modes import resolve_modes
-
-    async with await psycopg.AsyncConnection.connect(dsn) as conn:
-        return (await resolve_modes(conn))["kroger_catalog"]
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     from services.common.config import get_settings
 
@@ -444,19 +469,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         data = load_data()
         envs = ("live", "eval") if args.env == "all" else (args.env,)
         us1_phones = parse_us1_phones(settings.seed_us1_phones) if "live" in envs else None
-        if asyncio.run(_kroger_catalog_mode(settings.database_url)) == "real":
-            # The Kroger catalog sync needs the Kroger adapter (build step 7).
-            raise SeedError("MODE_KROGER_CATALOG=real, but the Kroger catalog sync is not built")
         if not (settings.neo4j_uri and settings.neo4j_user and settings.neo4j_password):
             raise SeedError("NEO4J_URI, NEO4J_USER and NEO4J_PASSWORD are required")
         with psycopg.connect(settings.database_url) as conn:
-            seed(
-                conn,
-                args.env,
-                us1_phones=us1_phones,
-                kroger_location_id=settings.kroger_location_id or None,
-                data=data,
-            )
+            seed(conn, args.env, us1_phones=us1_phones, data=data)
         load_graph(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password, data["off"])
     except Exception as exc:  # noqa: BLE001 - any failure must exit non-zero (§9)
         print(f"seed failed: {type(exc).__name__}: {exc}", file=sys.stderr)

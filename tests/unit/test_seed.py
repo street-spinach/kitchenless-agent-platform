@@ -6,7 +6,7 @@ import re
 import psycopg
 import pytest
 
-from services.common import directory, ids
+from services.common import directory, ids, modes, vendors
 from services.seed import __main__ as seed_mod
 
 # Seeded tables, with the columns that vary between runs left out.
@@ -51,7 +51,7 @@ def _snapshot(conn: psycopg.Connection) -> dict[str, list[tuple]]:
 
 
 def _seed(conn: psycopg.Connection) -> None:
-    seed_mod.seed(conn, "all", us1_phones=US1_PHONES, kroger_location_id="01400943")
+    seed_mod.seed(conn, "all", us1_phones=US1_PHONES)
 
 
 @pytest.mark.db
@@ -106,7 +106,8 @@ def test_seed_twice_same_rows(pg: str) -> None:
     assert child_allergy == [("tree_nuts",)]
     # 95% of list, rounded up: 429 -> 408 (407.55).
     assert floors is not None and floors[0]["MOCK-MILK-WHOLE"] == 408
-    assert kroger is not None and kroger[0]["location_id"] == "01400943"
+    # The Kroger card seeds from the mock catalog: no location id (adapters §5, file 20).
+    assert kroger is not None and "location_id" not in kroger[0]
     # Courier cards get a `delivery` rule and no floors (item 55, amended for #48).
     rule = {"fee_minor": 599, "slot_minutes": 60, "slot_capacity": 2}
     assert courier_rules == [
@@ -124,6 +125,49 @@ def test_no_real_phone_in_repo_data() -> None:
             found.append(phone)
             assert seed_mod.FICTIONAL_PHONE.match(phone), f"{path.name}: {match!r}"
     assert found  # the scan sees the simulated numbers, so it would see a real one too
+
+
+def test_seed_fails_on_unmapped_vendor() -> None:
+    data = seed_mod.load_data()
+    card = next(c for c in data["agents"]["business"] if c["agent_id"] == "delivery:mock-us")
+    card["vendor"] = "uber"  # no `vendors.card_vendor_key` entry
+
+    with pytest.raises(seed_mod.SeedError, match="delivery:mock-us"):
+        seed_mod._validate(data)
+
+    # `mock` needs no entry, and every seeded vendor has one.
+    card["vendor"] = vendors.MOCK_VENDOR
+    seed_mod._validate(data)
+
+
+def test_display_names_carry_simulated() -> None:
+    agents = seed_mod.load_data()["agents"]
+    names = {o["org_id"]: o["name"] for o in agents["organizations"]}
+    simulated = []
+    for card in agents["business"]:
+        area = ids.parse_agent_id(card["agent_id"])[0]
+        if card["vendor"] != vendors.MOCK_VENDOR:
+            stub = directory.AgentCard(
+                agent_id=card["agent_id"],
+                agent_class=area,
+                owner_ref=f"org:{card['owner']}",
+                region="us",
+                zone_ids=(),
+                currency=None,
+                host_process="agents",
+                vendor=card["vendor"],
+            )
+            key = vendors.card_vendor_key(area, stub, seed_mod._KEY_CHECK_TOOL[area])
+            if key not in modes.ALWAYS_MOCK:
+                continue
+        simulated.append(card["agent_id"])
+        assert names[card["owner"]].endswith("(simulated)"), card["agent_id"]
+
+    # Kroger and DoorDash have no real class; the three mock cards are always simulated.
+    assert sorted(simulated) == [
+        "delivery:doordash-us", "delivery:mock-us", "grocery:kroger-us",
+        "grocery:mock-us", "restaurant:mock-us",
+    ]  # fmt: skip
 
 
 @pytest.mark.db

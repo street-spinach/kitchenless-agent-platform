@@ -179,7 +179,7 @@ def _add_mock_rows(conn: psycopg.Connection, env: str) -> None:
 @pytest.fixture
 def world(pg: str) -> dict[str, Any]:
     with psycopg.connect(pg) as conn:
-        seed_mod.seed(conn, "all", us1_phones=US1_PHONES, kroger_location_id="01400943")
+        seed_mod.seed(conn, "all", us1_phones=US1_PHONES)
         live = _add_run(conn, LIVE)
         eval_run = _add_run(conn, EVAL)
         demo = _add_run(conn, "a2a-demo", shortfall=False)
