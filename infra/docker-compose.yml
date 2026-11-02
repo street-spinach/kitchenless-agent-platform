@@ -54,8 +54,21 @@ x-env-graph: &env-graph # mcp, testrunner
   KROGER_CLIENT_SECRET: ${KROGER_CLIENT_SECRET:-}
   KROGER_LOCATION_ID: ${KROGER_LOCATION_ID:-}
 
-x-env-keycloak: &env-keycloak # api, mcp
+# Identity (docs/designs/identity-authz.md §13). Empty values count as unset, and each
+# service refuses to start without the ones it needs for the active TOKEN_SOURCE.
+x-env-identity: &env-identity # agents, api, mcp, testrunner
+  TOKEN_SOURCE: ${TOKEN_SOURCE:-}
+  ISSUER_URL: ${ISSUER_URL:-}
+  DOMAIN: ${DOMAIN:-localhost}
+  MOCK_SIGNING_KEY: ${MOCK_SIGNING_KEY:-}
+
+x-env-keycloak: &env-keycloak # agents, api, mcp (required live)
   KEYCLOAK_URL: ${KEYCLOAK_URL:-http://keycloak:8080/auth}
+
+x-env-grants: &env-grants # agents, api (required live)
+  AGENT_SIGNING_KEY: ${AGENT_SIGNING_KEY:-}
+  GRANT_ENCRYPTION_KEY: ${GRANT_ENCRYPTION_KEY:-}
+  GRANT_KEY_VERSION: ${GRANT_KEY_VERSION:-}
 
 x-env-shortfall: &env-shortfall # agents, api, mcp (agent-protocol §13)
   SHORTFALL_REPLY_SECONDS: ${SHORTFALL_REPLY_SECONDS:-900}
@@ -186,9 +199,13 @@ services:
     command: ["python", "-m", "services.api.main"]
     stop_grace_period: 30s
     environment:
-      <<: [*env-base, *env-app, *env-modes, *env-keycloak, *env-shortfall]
+      <<: [*env-base, *env-app, *env-identity, *env-keycloak, *env-grants, *env-modes, *env-shortfall]
       SERVICE_NAME: api
       PORT: "8000"
+      AGENT_SIGNING_CERT: ${AGENT_SIGNING_CERT:-}
+      TOKEN_SERVICE_KEY: ${TOKEN_SERVICE_KEY:-}
+      KC_ONBOARDING_SECRET: ${KC_ONBOARDING_SECRET:-}
+      SESSION_SECRET: ${SESSION_SECRET:-}
       WHATSAPP_TOKEN: ${WHATSAPP_TOKEN:-}
       WHATSAPP_APP_SECRET: ${WHATSAPP_APP_SECRET:-}
       WHATSAPP_PHONE_NUMBER_ID: ${WHATSAPP_PHONE_NUMBER_ID:-}
@@ -206,7 +223,7 @@ services:
     command: ["python", "-m", "services.mcp.app"]
     stop_grace_period: 30s
     environment:
-      <<: [*env-base, *env-app, *env-graph, *env-keycloak, *env-shortfall]
+      <<: [*env-base, *env-app, *env-identity, *env-keycloak, *env-graph, *env-shortfall]
       SERVICE_NAME: mcp
       PORT: "8002"
       DOORDASH_DEVELOPER_ID: ${DOORDASH_DEVELOPER_ID:-}
@@ -230,7 +247,7 @@ services:
     command: ["python", "-m", "services.agents.host"]
     stop_grace_period: 30s
     environment:
-      <<: [*env-base, *env-app, *env-model, *env-shortfall]
+      <<: [*env-base, *env-app, *env-identity, *env-keycloak, *env-grants, *env-model, *env-shortfall]
       SERVICE_NAME: agents
       PORT: "8003"
       OFFER_TTL_SECONDS: ${OFFER_TTL_SECONDS:-600}
@@ -281,13 +298,13 @@ services:
     profiles: ["tools"]
     command: ["python", "-c", "print('testrunner: pass a command')"]
     environment:
-      <<: [*env-base, *env-app, *env-modes, *env-model, *env-graph]
+      # DOMAIN (from env-identity) is also used by the smoke tests (Caddy SNI) and the eval
+      # runner (POST /hello/run on api).
+      <<: [*env-base, *env-app, *env-identity, *env-modes, *env-model, *env-graph]
       SERVICE_NAME: testrunner
       A2A_DEMO_TOKEN: ${A2A_DEMO_TOKEN}
       AGENTS_URL: ${AGENTS_URL:-http://agents:8003}
       SEED_US1_PHONES: ${SEED_US1_PHONES:-}
-      # Used by the smoke tests (Caddy SNI) and the eval runner (POST /hello/run on api).
-      DOMAIN: ${DOMAIN:-localhost}
       ORCHESTRATOR_URL: http://api:8000
 
   # The ci profile is reserved for CI-only helpers (for example a stub token issuer).
