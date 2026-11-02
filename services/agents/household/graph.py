@@ -13,9 +13,11 @@ routed by its type and the order's phase:
     `quote_request` per seller, the 30 s `quote_round` timer, state `quoting`).
 *   `offer` while quoting, or the reply to our counter → `record_offer`. Any other offer is
     late: ignored with a `decision` trace `late_offer` (agent-protocol §7 arrival table).
-*   `quote_round_closed` → `negotiate` (state `negotiating`; at most 2 counter rounds) →
-    `choose_offer` (the cheapest valid offer) → `request_approval` when the total is over
-    the remaining weekly budget, else `authorize` (`authorize_spend`, then `accept`).
+*   `quote_round_closed` → `negotiate` (state `negotiating`; code only: at most one
+    counter, under the six rules of agents §7) → `choose_offer` (the first offer of
+    `compare_offers`, picked in code, and one explanation call under a 15 s timeout with a
+    template fallback, agents §11) → `request_approval` when the total is over the
+    remaining weekly budget, else `authorize` (`authorize_spend`, then `accept`).
 *   `request_approval` calls the tool (which sends the approver's buttons, creates the
     `approval_expiry` timer and pauses `run_timeout`) and leaves the thread in the
     checkpointed `awaiting_approval` phase: the run waits there, across restarts, until an
@@ -35,7 +37,7 @@ routed by its type and the order's phase:
     a `decision` trace.
 *   `order_confirm`, `delivery_booked`, `order_status` → `track_order`; on `delivered`,
     `record_delivery` (weekly orders only) → `finish` (`completed` and a summary
-    `whatsapp_out`).
+    `whatsapp_out`: the delivered line, then the explanation, agents §11).
 *   The shortfall (agent-protocol §10, P21): `shortfall_notice` → `handle_shortfall`
     (`open_shortfall`, the `shortfall_expiry` timer at the notice's `reply_by`, one
     `shortfall_relay` per member with a WhatsApp identity) → `wait_shortfall`.
@@ -71,8 +73,16 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from pydantic import ValidationError
 
-from services.agents.common.model import InvalidOutput, ModelClient, TraceSink
+from services.agents.common.model import (
+    InvalidOutput,
+    ModelClient,
+    ModelUnavailable,
+    TokenBudgetExceeded,
+    TraceSink,
+    check_rationale,
+)
 from services.agents.household import stubs
+from services.agents.household.prompts import BUILD_LIST_PROMPT, EXPLAIN_PROMPT, NO_CODES
 from services.common import ids, mcp_client
 from services.common.consumer import (
     Inbound,
@@ -83,12 +93,16 @@ from services.common.consumer import (
 )
 from services.common.directory import AgentCard
 from services.common.mcp_client import ToolRefused
+from services.common.money import Money
+from services.common.money import format as money_format
 from services.common.protocol.schemas import RequestItem
 from services.common.run_context import RunContext
 from services.identity.tokens import MockIssuer
 
 __all__ = [
+    "EXPLAIN_TIMEOUT_SECONDS",
     "HANDLED_TYPES",
+    "HOUSEHOLD_MAX_COUNTERS",
     "MAX_COUNTER_ROUNDS",
     "OFFER_TTL_SECONDS",
     "QUOTE_ROUND_SECONDS",
@@ -99,7 +113,10 @@ __all__ = [
     "RunInfo",
     "UnsupportedMessage",
     "build_graph",
+    "compare_offers",
+    "explanation_template",
     "handle",
+    "seller_label",
     "strip_rationale",
 ]
 
@@ -107,7 +124,11 @@ log = logging.getLogger(__name__)
 
 STATE_VERSION = 1
 QUOTE_ROUND_SECONDS = 30
-MAX_COUNTER_ROUNDS = 2
+MAX_COUNTER_ROUNDS = 2  # the protocol's limit (agent-protocol §5)
+HOUSEHOLD_MAX_COUNTERS = 1  # the household counters at most once per run (agents AG-A3)
+EXPLAIN_TIMEOUT_SECONDS = 15  # the explanation call in `choose_offer` (agents §11)
+LOCALE = "en"  # money in WhatsApp text, as the household MCP server formats it
+HOUSEHOLD_SCOPE = "household"
 OFFER_TTL_SECONDS = 600  # agent-protocol §13; the run override `OFFER_TTL_SECONDS` wins
 MAX_REQUOTES = 1
 # The delivery window asked for in `quote_request`, relative to the request.
@@ -172,19 +193,6 @@ AWAITING_APPROVAL = "awaiting_approval"
 PLACING = "placing"
 DONE = "done"
 
-BUILD_LIST_PROMPT = (
-    "Plan this household's order. Answer with one JSON object "
-    '{"items": [{"item": <name>, "qty": <int>, "unit": <unit>}]}. '
-    "Skip what the pantry already has."
-)
-NEGOTIATE_PROMPT = (
-    "Decide whether to counter one offer or to choose. Answer with one JSON object: "
-    '{"action": "choose"} or {"action": "counter", "quote_id": <id>, "total_minor": <int>}.'
-)
-CHOOSE_PROMPT = (
-    'Choose one offer. Answer with one JSON object {"quote_id": <id>, "explanation": <text>}.'
-)
-
 
 class UnsupportedMessage(ValueError):
     """The household graph has no path for this message type."""
@@ -225,6 +233,12 @@ class HouseholdState(TypedDict, total=False):
     # The order's shortfall (agent-protocol §10): id, seller, lines, picks, status, the
     # members it was relayed to, the refused lines and the amended order.
     shortfall: dict[str, Any] | None
+    # Agents §17. Each is read with its default, so `STATE_VERSION` stays 1.
+    scope: str  # "household" (default) or "solo"
+    counter: dict[str, Any] | None  # {seller, from_minor, to_minor} of our one counter
+    explanation: str | None  # the latest explanation sentence (choose_offer)
+    dropped_items: list[str]
+    unavoidable_dislikes: list[str]
     # The inbound message of the current invocation.
     message_id: str
     message_type: str
@@ -256,6 +270,13 @@ CallTool = Callable[..., Awaitable[dict[str, Any]]]
 IssueToken = Callable[[str, str, Sequence[str]], str]
 Clock = Callable[[], datetime]
 Sleep = Callable[[float], Awaitable[None]]
+# The vendor label text of a seller card in a run (adapters §6): `(run_id, agent_id)`.
+LabelSeller = Callable[[UUID, str], Awaitable[str]]
+
+
+async def _agent_id_label(run_id: UUID, agent_id: str) -> str:
+    # Without a label source the seller is named by its agent id, with no badge.
+    return agent_id
 
 
 def _mock_token(sub: str, act: str, scopes: Sequence[str]) -> str:
@@ -359,8 +380,61 @@ def _sent_message(state: HouseholdState, message_id: str) -> dict[str, Any] | No
     return None
 
 
-def _cheapest(offers: Sequence[Mapping[str, Any]]) -> Mapping[str, Any] | None:
-    return min(offers, key=lambda o: (o["total_minor"], o["seller"]), default=None)
+def _covered(offer: Mapping[str, Any]) -> int:
+    return sum(1 for line in offer.get("lines") or [] if line.get("offered_sku"))
+
+
+def _substitutions(offer: Mapping[str, Any]) -> int:
+    return sum(1 for line in offer.get("lines") or [] if line.get("substituted_for"))
+
+
+def compare_offers(offers: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """The offers best first (agents §7): most lines with an `offered_sku`, then the lowest
+    `total_minor`, then the fewest substitutions, then the seller id. A pure function."""
+    return sorted(
+        (dict(o) for o in offers),
+        key=lambda o: (-_covered(o), o["total_minor"], _substitutions(o), o["seller"]),
+    )
+
+
+def _money(amount_minor: int | None, currency: str) -> str | None:
+    if amount_minor is None:
+        return None
+    return money_format(Money(int(amount_minor), currency), LOCALE)
+
+
+def explanation_template(facts: Mapping[str, Any]) -> str:
+    """The template sentence used when the model's explanation can't be (agents §11)."""
+    text = (
+        f"Chose {facts['seller']}: {facts['items_covered']} of {facts['items_requested']} "
+        f"items for {facts['total']}"
+    )
+    if facts.get("counter_from") is not None:
+        text += f", after a counter from {facts['counter_from']}"
+    return text + "."
+
+
+def _summary(delivered: str, state: Mapping[str, Any]) -> str:
+    """The order summary (agents §11), one line per part, joined into one parameter."""
+    parts = [delivered]
+    if state.get("explanation"):
+        parts.append(str(state["explanation"]))
+    dropped = list(state.get("dropped_items") or [])
+    if dropped:
+        parts.append(f"Left out because of a dislike: {', '.join(dropped)}.")
+    kept = list(state.get("unavoidable_dislikes") or [])
+    if kept:
+        parts.append(
+            f"Included, though someone dislikes it: {', '.join(kept)}; no other option fit."
+        )
+    # WhatsApp template parameters can't hold newlines, so the parts are joined by spaces.
+    return " ".join(parts)
+
+
+def _codes(constraints: Sequence[Mapping[str, Any]], key: str) -> str:
+    """The union of one kind of code across members, for a prompt."""
+    values = sorted({str(v) for codes in constraints for v in codes.get(key) or []})
+    return ", ".join(values) or NO_CODES
 
 
 def _json(text: str | None) -> dict[str, Any]:
@@ -390,11 +464,14 @@ def build_graph(
     clock: Clock = _now,
     sleep: Sleep = asyncio.sleep,
     load_whatsapp_members: LoadMembers | None = None,
+    label_seller: LabelSeller = _agent_id_label,
 ) -> StateGraph:
     """The household graph's nodes and edges, before `compile(checkpointer=...)`.
 
     `load_whatsapp_members` gives the members with a WhatsApp identity, the ones a
     shortfall is relayed to; without it nobody is asked (fails closed: every line drops).
+    `label_seller` names a seller in member-facing text with its vendor label (adapters
+    §6), from the run's pinned modes.
     """
 
     async def tool(
@@ -409,12 +486,27 @@ def build_graph(
             HOUSEHOLD_SERVER, name, args, ctx=_ctx(state, conversation_id), token=token
         )
 
-    async def trace_decision(state: HouseholdState, node: str, choice: str) -> None:
+    async def trace_decision(
+        state: HouseholdState,
+        node: str,
+        choice: str,
+        explanation: str = "",
+        facts: Mapping[str, Any] | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "node": node,
+            "choice": choice,
+            "explanation": explanation,
+            "ref": state["message_id"],
+        }
+        if facts is not None:
+            # The explanation's facts object (agents §15, amended by evals E-A12).
+            payload["facts"] = dict(facts)
         await traces.write(
             UUID(state["run_id"]),
             state["agent_id"],
             "decision",
-            {"node": node, "choice": choice, "explanation": "", "ref": state["message_id"]},
+            payload,
             on_behalf_of=f"household:{state['household_id']}",
             conversation_id=_ctx(state).conversation_id,
         )
@@ -428,6 +520,59 @@ def build_graph(
             _ctx(state), messages, None, node, state={**data, "messages": messages}
         )
         return _json(result.text)
+
+    async def complete_text(
+        state: HouseholdState, node: str, system: str, data: dict[str, Any]
+    ) -> str:
+        """One model step whose answer is plain text, not JSON (agents §11)."""
+        messages = [{"role": "system", "content": system}]
+        result = await model.complete(
+            _ctx(state), messages, None, node, state={**data, "messages": messages}
+        )
+        if not isinstance(result.text, str):
+            raise InvalidOutput("the model's answer is not text")
+        return result.text
+
+    async def explain(state: HouseholdState, facts: dict[str, Any]) -> tuple[str, str]:
+        """The explanation sentence and its trace choice: the model's sentence when it
+        arrives within `EXPLAIN_TIMEOUT_SECONDS` and passes `check_rationale`, else the
+        template."""
+        system = EXPLAIN_PROMPT.format(facts=json.dumps(facts, sort_keys=True))
+        try:
+            async with asyncio.timeout(EXPLAIN_TIMEOUT_SECONDS):
+                text = await complete_text(state, "choose_offer", system, {"facts": facts})
+        except (TimeoutError, ModelUnavailable, InvalidOutput, TokenBudgetExceeded):
+            text = None
+        checked = check_rationale(text, [facts]) if text is not None else None
+        if checked is None:
+            return explanation_template(facts), "explanation_template"
+        return checked, "explanation_model"
+
+    async def offer_facts(
+        state: HouseholdState, pick: Mapping[str, Any], runner_up: Mapping[str, Any] | None
+    ) -> dict[str, Any]:
+        """The facts the explanation may use (agents §11). Sellers are named by their
+        vendor label (adapters §6)."""
+        run_id = UUID(state["run_id"])
+        currency = pick["currency"]
+        counter = state.get("counter") or {}
+        requested = len(state.get("items") or []) or len(pick.get("lines") or [])
+        return {
+            "seller": await label_seller(run_id, pick["seller"]),
+            "total": _money(pick["total_minor"], currency),
+            "items_covered": _covered(pick),
+            "items_requested": requested,
+            "substitutions": _substitutions(pick),
+            "runner_up": None
+            if runner_up is None
+            else await label_seller(run_id, runner_up["seller"]),
+            "runner_up_total": None
+            if runner_up is None
+            else _money(runner_up["total_minor"], currency),
+            "remaining": _money(state.get("remaining_minor"), currency),
+            "counter_from": _money(counter.get("from_minor"), currency) if counter else None,
+            "counter_to": _money(counter.get("to_minor"), currency) if counter else None,
+        }
 
     # Nodes ------------------------------------------------------------------------------
 
@@ -468,10 +613,18 @@ def build_graph(
     async def build_list(state: HouseholdState) -> dict[str, Any]:
         pantry = await tool(state, "get_pantry", {})
         have = {str(p["item"]).lower() for p in pantry.get("items", [])}
+        codes = list((state.get("constraints") or {}).values())
+        system = BUILD_LIST_PROMPT.format(
+            kind=state["kind"],
+            people=len(state.get("members") or {}) or 1,
+            diets=_codes(codes, "diets"),
+            allergens=_codes(codes, "allergens"),
+            dislikes=_codes(codes, "dislikes"),
+        )
         answer = await complete(
             state,
             "build_list",
-            BUILD_LIST_PROMPT,
+            system,
             {"kind": state["kind"], "pantry": pantry.get("items", [])},
         )
         try:
@@ -555,44 +708,47 @@ def build_graph(
         budget = await tool(state, "get_budget", {})
         remaining = int(budget["remaining"]["amount_minor"])
         counters = int(state.get("counters") or 0)
-        answer = await complete(
-            state,
-            "negotiate",
-            NEGOTIATE_PROMPT,
-            {"offers": offers, "remaining_minor": remaining, "counters": counters},
-        )
         update["remaining_minor"] = remaining
-        # Code decides whether the proposed counter is allowed.
-        target = next((o for o in offers if o["quote_id"] == answer.get("quote_id")), None)
-        total = answer.get("total_minor")
+        # Code only (agents §7): one counter, at the remaining budget, to the best offer.
+        ranked = compare_offers(offers)
+        best = ranked[0]
+        runner_up = ranked[1] if len(ranked) > 1 else None
         if (
-            answer.get("action") == "counter"
-            and counters < MAX_COUNTER_ROUNDS
-            and target is not None
-            and not target.get("final")
-            and isinstance(total, int)
-            and not isinstance(total, bool)
-            and 0 < total < target["total_minor"]
+            (state.get("scope") or HOUSEHOLD_SCOPE) == HOUSEHOLD_SCOPE
+            and counters < HOUSEHOLD_MAX_COUNTERS
+            and not best.get("final")
+            and remaining > 0
+            and best["total_minor"] > remaining
+            and runner_up is not None
+            and _covered(runner_up) == _covered(best)
         ):
-            seller = target["seller"]
+            seller = best["seller"]
             body = {
                 "order_id": state["order_id"],
-                "quote_id": target["quote_id"],
-                "round": target["round"],
-                "lines": target["lines"],
-                "total_minor": total,
-                "currency": target["currency"],
+                "quote_id": best["quote_id"],
+                "round": best["round"],
+                "lines": best["lines"],
+                "total_minor": remaining,
+                "currency": best["currency"],
             }
             out = list(state.get("outgoing") or [])
             conversation = (state.get("conversations") or {}).get(seller)
             _add(state, out, seller, "counter_offer", body, conversation_id=conversation)
+            text = f"best={best['total_minor']} remaining={remaining} counter={remaining}"
+            await trace_decision(state, "negotiate", "counter", text)
             return {
                 **update,
                 "decision": "counter",
                 "counters": counters + 1,
+                "counter": {
+                    "seller": seller,
+                    "from_minor": best["total_minor"],
+                    "to_minor": remaining,
+                },
                 "awaiting_counter": seller,
                 "outgoing": out,
             }
+        await trace_decision(state, "negotiate", "choose")
         return {**update, "decision": "choose"}
 
     async def no_offers(state: HouseholdState) -> dict[str, Any]:
@@ -612,27 +768,27 @@ def build_graph(
         }
 
     async def choose_offer(state: HouseholdState) -> dict[str, Any]:
-        offers = valid_offers(state, clock())
-        answer = await complete(
-            state,
-            "choose_offer",
-            CHOOSE_PROMPT,
-            {"offers": offers, "remaining_minor": state.get("remaining_minor")},
-        )
-        # Code decides: a pick outside the valid offers gives the cheapest valid offer.
-        pick = next((o for o in offers if o["quote_id"] == answer.get("quote_id")), None)
-        pick = pick or _cheapest(offers)
-        if pick is None:
+        # Code picks (agents §7); the model only writes the explanation (§11).
+        ranked = compare_offers(valid_offers(state, clock()))
+        if not ranked:
             return {"decision": "no_offers"}
+        pick = ranked[0]
+        runner_up = ranked[1] if len(ranked) > 1 else None
         remaining = state.get("remaining_minor")
         over = remaining is None or pick["total_minor"] > remaining
         approved = state.get("approved_minor")
         if over and approved is not None and pick["total_minor"] <= approved:
             # A re-quoted offer at or below the approved total uses that approval (§7).
             over = False
+        decision = "request_approval" if over else "authorize"
+        await trace_decision(state, "choose_offer", "request_approval" if over else "chosen")
+        facts = await offer_facts(state, pick, runner_up)
+        explanation, choice = await explain(state, facts)
+        await trace_decision(state, "choose_offer", choice, explanation, facts)
         return {
             "chosen_quote_id": pick["quote_id"],
-            "decision": "request_approval" if over else "authorize",
+            "decision": decision,
+            "explanation": explanation,
         }
 
     async def request_approval(state: HouseholdState) -> dict[str, Any]:
@@ -943,14 +1099,14 @@ def build_graph(
                 # The order the shortfall left (§10): the final lines and total.
                 count, total = len(amended["lines"]), amended["total_minor"]
                 currency = amended["currency"] or currency
-            text = (
+            delivered = (
                 f"Your order {state['order_id'][:8]} was delivered: "
                 f"{count} items, {total} {currency} minor units."
             )
             body = {
                 "user_id": state["user_id"],
                 "template": SUMMARY_TEMPLATE,
-                "params": {"text": text},
+                "params": {"text": _summary(delivered, state)},
                 "buttons": [],
             }
             _add(state, out, WHATSAPP, "whatsapp_out", body)
@@ -1181,6 +1337,7 @@ class HouseholdGraph:
         sleep: Sleep = asyncio.sleep,
         offer_ttl_seconds: int = OFFER_TTL_SECONDS,
         load_whatsapp_members: LoadMembers | None = None,
+        label_seller: LabelSeller = _agent_id_label,
     ) -> None:
         self._load_run = load_run
         self._offer_ttl_seconds = offer_ttl_seconds
@@ -1194,6 +1351,7 @@ class HouseholdGraph:
             clock,
             sleep,
             load_whatsapp_members,
+            label_seller,
         )
         self.graph = self.builder.compile(checkpointer=checkpointer)
 
@@ -1316,7 +1474,25 @@ WHERE m.household_id = %s
   AND EXISTS (SELECT 1 FROM channel_identities ci WHERE ci.user_id = m.user_id)
 ORDER BY c.agent_id
 """
+_RUN_MODES_SQL = "SELECT modes FROM runs WHERE run_id = %s"
+_ORG_NAME_SQL = "SELECT name FROM organizations WHERE 'org:' || org_id = %s"
 _default: HouseholdGraph | None = None
+
+
+async def seller_label(conn: Any, run_id: UUID, agent_id: str) -> str:
+    """`vendors.vendor_label(area, card, org_name, runs.modes).text` for seller card
+    `agent_id` in run `run_id`, from the run's pinned modes (adapters §6). A run with no
+    pinned modes labels every card `simulated`."""
+    from services.common import directory, vendors
+
+    card = await directory.card(conn, agent_id)
+    cur = await conn.execute(_ORG_NAME_SQL, (card.owner_ref,))
+    org = await cur.fetchone()
+    cur = await conn.execute(_RUN_MODES_SQL, (run_id,))
+    run = await cur.fetchone()
+    run_modes = run[0] if run and isinstance(run[0], dict) else {}
+    org_name = org[0] if org else card.owner_ref
+    return vendors.vendor_label(card.agent_class, card, org_name, run_modes).text
 
 
 def _build_default() -> HouseholdGraph:
@@ -1354,6 +1530,10 @@ def _build_default() -> HouseholdGraph:
             cards = await directory.find(conn, cls, region, zone_id, currency)
         return [c.agent_id for c in cards]
 
+    async def label_seller(run_id: UUID, agent_id: str) -> str:
+        async with pool.connection() as conn:
+            return await seller_label(conn, run_id, agent_id)
+
     return HouseholdGraph(
         model=ModelClient(traces, PgRunState(pool)),
         traces=traces,
@@ -1363,6 +1543,7 @@ def _build_default() -> HouseholdGraph:
         find_sellers=find_sellers,
         offer_ttl_seconds=get_settings().offer_ttl_seconds,
         load_whatsapp_members=load_whatsapp_members,
+        label_seller=label_seller,
     )
 
 
