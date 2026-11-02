@@ -8,7 +8,11 @@ others use `@traced`. Every tool body runs inside `meta.tool_errors()`.
 *   `create_order(order_id, kind)` *guarded*: a `draft` order for the run's household.
 *   `set_order_state(order_id, expected, new)`: only to `quoting`, `negotiating` or
     `cancelled`.
-*   `get_pantry()`, `get_budget()`.
+*   `get_pantry()`: `items` (the sum of pantry events per item and unit), `enabled` (the
+    run's household has `env = 'eval'`), `as_of` (the database's `now()`, ISO-8601 UTC) and
+    `estimates` (pantry design §4; one per vocabulary item with an event when `enabled`,
+    else `[]`).
+*   `get_budget()`.
 *   `authorize_spend(order_id, quote_id, items, total)` *guarded*: key scoped by
     `quote_id`; sets `authorized`, `orders.seller_agent_id` (from the quote), the total,
     the items hash and `order_items`.
@@ -17,7 +21,8 @@ others use `@traced`. Every tool body runs inside `meta.tool_errors()`.
     `approval_expiry` timer, pauses `run_timeout` and sends the approver the
     `approval_request` WhatsApp prompt with Approve and Reject buttons (§8, #63).
 *   `decide_approval(approval_id, decision, user_id)` *guarded*, `api` service token.
-*   `record_delivery(order_id)` *guarded*: one pantry event per SKU of a delivered order.
+*   `record_delivery(order_id)` *guarded*: one pantry event per SKU of a delivered order,
+    with `pantry_item` from `catalog_items` (the seller's SKU), `kind 'add'` and `run_id`.
 
 The agents tools (agents design §9, §10; AG-A5):
 
@@ -44,7 +49,8 @@ The household is always the run's household (`runs.household_id`), never an argu
 import json
 import uuid
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from dataclasses import asdict
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Literal
 
@@ -55,7 +61,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, ValidationError
 
-from services.common import db, dislikes, ids, orders, outbox, runs
+from services.common import db, dislikes, ids, orders, outbox, pantry, runs
 from services.common.config import get_settings
 from services.common.money import Money
 from services.common.money import format as money_format
@@ -607,11 +613,16 @@ async def record_delivery(ctx: CallContext, *, order_id: uuid.UUID) -> dict[str,
     async def call() -> dict[str, Any]:
         async with db.get_pool().connection() as conn, conn.transaction():
             cur = await conn.execute(
-                "INSERT INTO pantry_events (household_id, item, delta, unit, source, order_id)"
-                " SELECT %s, sku, sum(qty), 'each', 'delivery', order_id FROM order_items"
-                " WHERE order_id = %s GROUP BY order_id, sku"
+                "INSERT INTO pantry_events"
+                " (household_id, item, pantry_item, kind, delta, unit, source, order_id, run_id)"
+                " SELECT %s, oi.sku, ci.pantry_item, 'add', sum(oi.qty), 'each', 'delivery',"
+                " oi.order_id, %s FROM order_items oi"
+                " JOIN orders o ON o.order_id = oi.order_id"
+                " LEFT JOIN catalog_items ci"
+                " ON ci.agent_id = o.seller_agent_id AND ci.sku = oi.sku"
+                " WHERE oi.order_id = %s GROUP BY oi.order_id, oi.sku, ci.pantry_item"
                 " ON CONFLICT (order_id, item) WHERE order_id IS NOT NULL DO NOTHING",
-                (household, order_id),
+                (household, ctx.run_id, order_id),
             )
         return {"order_id": str(order_id), "recorded": cur.rowcount}
 
@@ -1047,18 +1058,53 @@ async def set_order_state(
 
 @traced(AREA)
 async def get_pantry(ctx: CallContext) -> dict[str, Any]:
-    """What the run's household has: the sum of its pantry events per item and unit."""
+    """What the run's household has: the sum of its pantry events per item and unit, and,
+    on eval households only, the estimate per vocabulary item (pantry design §4).
+
+    `enabled` is computed here and nowhere else. When it is set and the vocabulary fails to
+    load, this raises, and the agent records `pantry_unavailable`.
+    """
     household = _require_household(await _run_household(ctx))
+    enabled = ctx.env == "eval"
+    vocab = pantry.load_vocabulary() if enabled else None
     async with db.get_pool().connection() as conn:
         cur = await conn.execute(
             "SELECT item, unit, sum(delta) FROM pantry_events WHERE household_id = %s"
-            " GROUP BY item, unit HAVING sum(delta) > 0 ORDER BY item, unit",
+            # COLLATE "C": the order is byte order on every database, whatever its locale.
+            " GROUP BY item, unit HAVING sum(delta) > 0"
+            ' ORDER BY item COLLATE "C", unit COLLATE "C"',
             (household,),
         )
         rows = await cur.fetchall()
+        cur = await conn.execute("SELECT now()")
+        row = await cur.fetchone()
+        assert row is not None
+        as_of: datetime = row[0]
+        latest: list[dict[str, Any]] = []
+        if vocab is not None:
+            async with conn.cursor(row_factory=dict_row) as dcur:
+                await dcur.execute(
+                    "SELECT DISTINCT ON (pantry_item) pantry_item, event_id, kind, ts"
+                    " FROM pantry_events WHERE household_id = %s AND pantry_item IS NOT NULL"
+                    " ORDER BY pantry_item, event_id DESC",
+                    (household,),
+                )
+                latest = await dcur.fetchall()
+    estimates = (
+        [
+            asdict(pantry.estimate(event, vocab.window_days[event["pantry_item"]], as_of))
+            for event in latest
+            if event["pantry_item"] in vocab.window_days
+        ]
+        if vocab is not None
+        else []
+    )
     return {
         "household_id": household,
         "items": [{"item": item, "qty": _qty(qty), "unit": unit} for item, unit, qty in rows],
+        "enabled": enabled,
+        "as_of": as_of.astimezone(UTC).isoformat(),
+        "estimates": estimates,
     }
 
 
