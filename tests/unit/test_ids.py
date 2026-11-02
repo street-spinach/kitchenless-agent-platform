@@ -60,6 +60,14 @@ def test_vendor_key_fits_square_limit() -> None:
     assert UUID(vk) == uuid5(ids.KEY_NAMESPACE, key)
 
 
+def test_mock_batch_id_derives_from_external_delivery_id() -> None:
+    edi = ids.vendor_key(ids.idempotency_key(ORDER, "book_delivery", "delivery:mock-us"))
+    assert ids.mock_batch_id(edi) == ids.mock_batch_id(edi) == uuid5(UUID(edi), "batch")
+    assert ids.mock_batch_id(edi) != ids.mock_batch_id(str(uuid4()))
+    with pytest.raises(ValueError):
+        ids.mock_batch_id("")
+
+
 def test_message_id_same_cause_same_ordinal_same_id() -> None:
     cause = uuid4()
     assert ids.message_id(cause, 0) == ids.message_id(cause, 0) == uuid5(cause, "0")

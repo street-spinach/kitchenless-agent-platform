@@ -39,14 +39,16 @@ NOT_CONFIGURED = "adapter_not_configured"
 
 _MOCK_STORE = "services.mcp.grocery.adapters.mock_store:MockStoreAdapter"
 _MOCK_RESTAURANT = "services.mcp.restaurant.adapters.mock_restaurant:MockRestaurantAdapter"
+_MOCK_COURIER = "services.mcp.delivery.adapters.mock_courier:MockCourierAdapter"
 # Adapter classes by vendor and mode, as `module:Class`, imported on use so this module
-# does not depend on the MCP servers. The real adapters are added in build step 7, and
-# the mock courier by its own issue; until then those entries are missing.
+# does not depend on the MCP servers. The real adapters are added in build step 7; until
+# then those entries are missing.
 _ADAPTERS: dict[tuple[str, Mode], str] = {
     ("kroger_catalog", "mock"): _MOCK_STORE,
     ("kroger_ordering", "mock"): _MOCK_STORE,
     ("square_retail", "mock"): _MOCK_STORE,
     ("square_restaurant", "mock"): _MOCK_RESTAURANT,
+    ("doordash", "mock"): _MOCK_COURIER,
 }
 
 

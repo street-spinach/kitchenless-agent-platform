@@ -83,6 +83,10 @@ def test_seed_twice_same_rows(pg: str) -> None:
         kroger = conn.execute(
             "SELECT config FROM agent_cards WHERE agent_id = 'grocery:kroger-us'"
         ).fetchone()
+        courier_rules = conn.execute(
+            "SELECT agent_id, kind, value FROM business_rules"
+            " WHERE agent_id LIKE 'delivery:%' ORDER BY agent_id, kind"
+        ).fetchall()
 
     # The launch roster (§3): 14 live agents plus 7 eval copies, and the A2A caller.
     assert cards == {
@@ -103,6 +107,12 @@ def test_seed_twice_same_rows(pg: str) -> None:
     # 95% of list, rounded up: 429 -> 408 (407.55).
     assert floors is not None and floors[0]["MOCK-MILK-WHOLE"] == 408
     assert kroger is not None and kroger[0]["location_id"] == "01400943"
+    # Courier cards get a `delivery` rule and no floors (item 55, amended for #48).
+    rule = {"fee_minor": 599, "slot_minutes": 60, "slot_capacity": 2}
+    assert courier_rules == [
+        ("delivery:doordash-us", "delivery", rule),
+        ("delivery:mock-us", "delivery", rule),
+    ]
 
 
 def test_no_real_phone_in_repo_data() -> None:

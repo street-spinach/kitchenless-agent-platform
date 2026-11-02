@@ -216,6 +216,15 @@ def _seed_business(
                 )
 
     for agent_id, rules in data["rules"].items():
+        if "delivery" in rules:
+            _upsert(
+                conn,
+                "business_rules",
+                ["agent_id", "kind"],
+                {"agent_id": agent_id, "kind": "delivery", "value": dict(rules["delivery"])},
+            )
+        if "floor_pct" not in rules:
+            continue
         prices = _seeded_prices(data, agent_id)
         floors = {sku: _floor_minor(p, rules["floor_pct"]) for sku, p in sorted(prices.items())}
         _upsert(

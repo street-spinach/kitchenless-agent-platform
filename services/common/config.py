@@ -92,6 +92,8 @@ class Settings:
     kroger_location_id: str | None = _var({"mcp", "testrunner"})
 
     mock_courier_step_seconds: int = _var({"mcp"}, 20)
+    # Where the mock courier posts `/internal/delivery-status` (architecture item 46).
+    api_url: str = _var({"mcp"}, "http://api:8000")
 
     # Agent-protocol §13.
     offer_ttl_seconds: int = _var({"agents"}, 600)

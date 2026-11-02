@@ -9,6 +9,7 @@ import pytest
 from services.common import modes
 from services.common.config import Settings
 from services.common.modes import VENDORS
+from services.mcp.delivery.adapters.mock_courier import MockCourierAdapter
 from services.mcp.grocery.adapters.mock_store import MockStoreAdapter
 from services.mcp.meta import AdapterFailure
 from services.mcp.restaurant.adapters.mock_restaurant import MockRestaurantAdapter
@@ -102,6 +103,7 @@ def test_adapter_for_real_without_adapter_not_configured() -> None:
     assert modes.adapter_for("kroger_catalog", mock) is MockStoreAdapter
     assert modes.adapter_for("kroger_ordering", mock) is MockStoreAdapter
     assert modes.adapter_for("square_restaurant", mock) is MockRestaurantAdapter
+    assert modes.adapter_for("doordash", mock) is MockCourierAdapter
 
     # No real adapter exists yet (build step 7): `real` raises and never falls back to mock.
     for vendor in VENDORS - {"kroger_ordering"}:
