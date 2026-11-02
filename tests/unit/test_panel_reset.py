@@ -427,3 +427,40 @@ def test_mock_stock_rows_cover_seeded_items() -> None:
         assert {(e, q) for e, _, _, q in rows} == {(env, MOCK_STOCK_QTY)}
     with pytest.raises(ValueError):
         mock_stock_rows("all")
+
+
+@pytest.mark.db
+def test_reset_eval_deletes_learned_dislikes_and_household_rules(world: dict[str, Any]) -> None:
+    """Agents §9, §10 (AG-A12): eval households' learned dislikes and `household_rules`
+    rows are deleted; a live household's, and seeded rows, are kept."""
+    pg = world["pg"]
+    eval_user = ids.seed_user_id("us-1-a-eval")
+    live_user = ids.seed_user_id("us-1-a")
+    with psycopg.connect(pg) as conn:
+        for user in (eval_user, live_user):
+            conn.execute(
+                "INSERT INTO member_constraints (user_id, kind, value, source)"
+                " VALUES (%s, 'dislike', 'okra', 'learned')",
+                (user,),
+            )
+        for household in (EVAL, LIVE):
+            conn.execute(
+                "INSERT INTO household_rules (household_id, take_turns, turn_index)"
+                " VALUES (%s, true, 2)",
+                (household,),
+            )
+        seeded = _count(conn, "SELECT count(*) FROM member_constraints WHERE source <> 'learned'")
+
+    deleted = _reset(pg, "eval")
+
+    assert deleted["member_constraints"] == 1
+    assert deleted["household_rules"] == 1
+    with psycopg.connect(pg) as conn:
+        learned = conn.execute(
+            "SELECT user_id FROM member_constraints WHERE source = 'learned'"
+        ).fetchall()
+        assert [r[0] for r in learned] == [live_user]
+        rules = conn.execute("SELECT household_id FROM household_rules").fetchall()
+        assert [r[0] for r in rules] == [LIVE]
+        after = _count(conn, "SELECT count(*) FROM member_constraints WHERE source <> 'learned'")
+        assert after == seeded

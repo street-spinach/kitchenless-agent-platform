@@ -19,6 +19,15 @@ others use `@traced`. Every tool body runs inside `meta.tool_errors()`.
 *   `decide_approval(approval_id, decision, user_id)` *guarded*, `api` service token.
 *   `record_delivery(order_id)` *guarded*: one pantry event per SKU of a delivered order.
 
+The agents tools (agents design §9, §10; AG-A5):
+
+*   `get_household_allergens()` *guarded*: the union of every member's allergen codes.
+*   `record_dislike(user_id, value, action)` *guarded*: add or remove a learned dislike;
+    seeded rows are never deleted.
+*   `get_household_rules()` *guarded*: take-turns, the turn index and the approver.
+*   `advance_turn(order_id)` *guarded*: once per delivered dinner, while take-turns is on.
+*   `set_take_turns(order_id, on, user_id)` *guarded*, `api` service token, approver only.
+
 The shortfall tools (agent-protocol §10 and P25, #68):
 
 *   `open_shortfall(shortfall_id, order_id, seller, lines, due_at)` and
@@ -46,7 +55,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, ValidationError
 
-from services.common import db, ids, orders, outbox, runs
+from services.common import db, dislikes, ids, orders, outbox, runs
 from services.common.config import get_settings
 from services.common.money import Money
 from services.common.money import format as money_format
@@ -62,6 +71,7 @@ from services.safety.guard import GuardRefused, run_guarded
 __all__ = [
     "SETTABLE_STATES",
     "MoneyArg",
+    "advance_turn",
     "authorize_amendment",
     "authorize_spend",
     "choose_shortfall_option",
@@ -69,13 +79,17 @@ __all__ = [
     "decide_approval",
     "get_budget",
     "get_constraints",
+    "get_household_allergens",
+    "get_household_rules",
     "get_pantry",
     "get_shortfall",
     "open_shortfall",
     "record_delivery",
+    "record_dislike",
     "request_approval",
     "server",
     "set_order_state",
+    "set_take_turns",
 ]
 
 AREA = "household"
@@ -101,6 +115,11 @@ INVALID_DECISION = "invalid_decision"
 NO_APPROVER = "no_approver"
 # `open_shortfall`: the id is not the order's shortfall, or the lines or `due_at` are invalid.
 INVALID_SHORTFALL = "invalid_shortfall"
+# `record_dislike`: the value fails `dislikes.check_value` (agents §9).
+INVALID_VALUE = "invalid_value"
+# `advance_turn`: the order is not the household's delivered dinner (agents §10).
+WRONG_ORDER_STATE = "wrong_order_state"
+_DISLIKE_ACTIONS = frozenset({"add", "remove"})
 
 server = MCPServer(name=AREA)
 
@@ -608,6 +627,224 @@ async def record_delivery(ctx: CallContext, *, order_id: uuid.UUID) -> dict[str,
     )
 
 
+async def get_household_allergens(ctx: CallContext) -> dict[str, Any]:
+    """The sorted union of every member's allergen codes and nothing else (agents §6, §9).
+
+    Relation `agent acts_for household:<run household>`; read only.
+    """
+    household = await _run_household(ctx)
+
+    async def check(conn: AsyncConnection) -> None:
+        _require_household(household)
+
+    async def call() -> dict[str, Any]:
+        async with db.get_pool().connection() as conn:
+            by_member = await _member_allergens(conn, _require_household(household))
+        return {"allergens": sorted({code for codes in by_member.values() for code in codes})}
+
+    return await run_guarded(
+        ctx,
+        tool=f"{AREA}.get_household_allergens",
+        relation=_household_relation("acts_for", household),
+        limits=check,
+        key=None,
+        request={},
+        call=call,
+        apply=None,
+    )
+
+
+async def record_dislike(
+    ctx: CallContext, *, user_id: uuid.UUID, value: str, action: str
+) -> dict[str, Any]:
+    """Add or remove the person's learned dislike (agents §9).
+
+    Relation `agent acts_for user:<user_id>`. The value is checked again with
+    `dislikes.check_value`; a bad one is refused with `invalid_value`. `add` returns
+    `already_present` when any dislike row with the value exists, whatever its source,
+    else `added`. `remove` deletes only the `learned` row: `removed`, or `not_learned`.
+    Both branches are safe to repeat, so there is no key.
+    """
+    normalized = dislikes.check_value(value)
+
+    async def check(conn: AsyncConnection) -> None:
+        if normalized is None or action not in _DISLIKE_ACTIONS:
+            raise GuardRefused(INVALID_VALUE)
+
+    async def call() -> dict[str, Any]:
+        async with db.get_pool().connection() as conn, conn.transaction():
+            if action == "add":
+                cur = await conn.execute(
+                    "SELECT 1 FROM member_constraints"
+                    " WHERE user_id = %s AND kind = 'dislike' AND lower(value) = %s",
+                    (user_id, normalized),
+                )
+                if await cur.fetchone() is not None:
+                    outcome = "already_present"
+                else:
+                    cur = await conn.execute(
+                        "INSERT INTO member_constraints (user_id, kind, value, source)"
+                        " VALUES (%s, 'dislike', %s, 'learned')"
+                        " ON CONFLICT (user_id, value) WHERE source = 'learned' DO NOTHING",
+                        (user_id, normalized),
+                    )
+                    outcome = "added" if cur.rowcount == 1 else "already_present"
+            else:
+                cur = await conn.execute(
+                    "DELETE FROM member_constraints"
+                    " WHERE user_id = %s AND value = %s AND source = 'learned'",
+                    (user_id, normalized),
+                )
+                outcome = "removed" if cur.rowcount > 0 else "not_learned"
+        return {"user_id": str(user_id), "value": normalized, "outcome": outcome}
+
+    return await run_guarded(
+        ctx,
+        tool=f"{AREA}.record_dislike",
+        relation=("acts_for", f"user:{user_id}"),
+        limits=check,
+        key=None,
+        request={"user_id": str(user_id), "value": value, "action": action},
+        call=call,
+        apply=None,
+    )
+
+
+async def get_household_rules(ctx: CallContext) -> dict[str, Any]:
+    """Take-turns, the turn index and the approver (agents §10).
+
+    Relation `agent acts_for household:<run household>`; read only. With no
+    `household_rules` row, take-turns is off and the index is 0.
+    """
+    household = await _run_household(ctx)
+
+    async def check(conn: AsyncConnection) -> None:
+        _require_household(household)
+
+    async def call() -> dict[str, Any]:
+        async with db.get_pool().connection() as conn:
+            cur = await conn.execute(
+                "SELECT take_turns, turn_index FROM household_rules WHERE household_id = %s",
+                (household,),
+            )
+            rules = await cur.fetchone()
+            cur = await conn.execute(
+                "SELECT approver_user_id FROM approval_rules WHERE household_id = %s",
+                (household,),
+            )
+            approver = await cur.fetchone()
+        take_turns, turn_index = rules if rules is not None else (False, 0)
+        return {
+            "take_turns": bool(take_turns),
+            "turn_index": int(turn_index),
+            "approver_user_id": None if approver is None else str(approver[0]),
+        }
+
+    return await run_guarded(
+        ctx,
+        tool=f"{AREA}.get_household_rules",
+        relation=_household_relation("acts_for", household),
+        limits=check,
+        key=None,
+        request={},
+        call=call,
+        apply=None,
+    )
+
+
+async def advance_turn(ctx: CallContext, *, order_id: uuid.UUID) -> dict[str, Any]:
+    """Move the turn on once for a delivered household dinner (agents §10).
+
+    Relation `agent acts_for household:<run household>`. The order must be the
+    household's `delivered` `dinner`, else `wrong_order_state`. One conditional update
+    advances only while take-turns is on and only once per order, so a replay changes
+    nothing and there is no key.
+    """
+    household = await _run_household(ctx)
+
+    async def check(conn: AsyncConnection) -> None:
+        h = _require_household(household)
+        cur = await conn.execute(
+            "SELECT household_id, kind, state FROM orders WHERE order_id = %s", (order_id,)
+        )
+        row = await cur.fetchone()
+        if row is None or tuple(row) != (h, "dinner", "delivered"):
+            raise GuardRefused(WRONG_ORDER_STATE)
+
+    async def call() -> dict[str, Any]:
+        async with db.get_pool().connection() as conn, conn.transaction():
+            cur = await conn.execute(
+                "UPDATE household_rules SET turn_index = turn_index + 1,"
+                " last_turn_order_id = %s, updated_at = now()"
+                " WHERE household_id = %s AND take_turns"
+                " AND last_turn_order_id IS DISTINCT FROM %s",
+                (order_id, household, order_id),
+            )
+        return {"advanced": cur.rowcount == 1}
+
+    return await run_guarded(
+        ctx,
+        tool=f"{AREA}.advance_turn",
+        relation=_household_relation("acts_for", household),
+        limits=check,
+        key=None,
+        request={"order_id": str(order_id)},
+        call=call,
+        apply=None,
+    )
+
+
+async def set_take_turns(
+    ctx: CallContext, *, order_id: uuid.UUID, on: bool, user_id: uuid.UUID
+) -> dict[str, Any]:
+    """The approver's take-turns tap, from `api` with its service token (agents §10).
+
+    Built like `decide_approval`: no relation; the caller must be `system:api`, the
+    order must exist (else `authz_denied`) and `user_id` must be its household's
+    approver (else `wrong_approver`). `changed` says whether take-turns changed; writing
+    the same value again is harmless, so there is no key.
+    """
+    household: list[str] = []
+
+    async def check(conn: AsyncConnection) -> None:
+        if ctx.agent_id != API_AGENT:
+            raise GuardRefused(AUTHZ_DENIED)
+        cur = await conn.execute("SELECT household_id FROM orders WHERE order_id = %s", (order_id,))
+        row = await cur.fetchone()
+        if row is None:
+            raise GuardRefused(AUTHZ_DENIED)
+        await limits.check_approver(conn, row[0], user_id)
+        household.append(row[0])
+
+    async def call() -> dict[str, Any]:
+        async with db.get_pool().connection() as conn, conn.transaction():
+            cur = await conn.execute(
+                "SELECT take_turns FROM household_rules WHERE household_id = %s FOR UPDATE",
+                (household[0],),
+            )
+            before = await cur.fetchone()
+            await conn.execute(
+                "INSERT INTO household_rules (household_id, take_turns, set_by)"
+                " VALUES (%s, %s, %s) ON CONFLICT (household_id) DO UPDATE"
+                " SET take_turns = EXCLUDED.take_turns, set_by = EXCLUDED.set_by,"
+                " updated_at = now()",
+                (household[0], on, user_id),
+            )
+        was_on = False if before is None else bool(before[0])
+        return {"changed": was_on != on, "take_turns": on}
+
+    return await run_guarded(
+        ctx,
+        tool=f"{AREA}.set_take_turns",
+        relation=None,
+        limits=check,
+        key=None,
+        request={"order_id": str(order_id), "on": on, "user_id": str(user_id)},
+        call=call,
+        apply=None,
+    )
+
+
 def _notice_pick_allowed(lines: Sequence[Any], line: int, pick: str) -> bool:
     """Whether `pick` is `drop` or one of `line`'s substitute SKUs in the notice."""
     for notice in lines or []:
@@ -1032,6 +1269,35 @@ async def _decide_approval_tool(
 @server.tool(name="record_delivery")
 async def _record_delivery_tool(order_id: uuid.UUID, ctx: Context) -> CallToolResult:
     return await _serve(ctx, record_delivery, order_id=order_id)
+
+
+@server.tool(name="get_household_allergens")
+async def _get_household_allergens_tool(ctx: Context) -> CallToolResult:
+    return await _serve(ctx, get_household_allergens)
+
+
+@server.tool(name="record_dislike")
+async def _record_dislike_tool(
+    user_id: uuid.UUID, value: str, action: Literal["add", "remove"], ctx: Context
+) -> CallToolResult:
+    return await _serve(ctx, record_dislike, user_id=user_id, value=value, action=action)
+
+
+@server.tool(name="get_household_rules")
+async def _get_household_rules_tool(ctx: Context) -> CallToolResult:
+    return await _serve(ctx, get_household_rules)
+
+
+@server.tool(name="advance_turn")
+async def _advance_turn_tool(order_id: uuid.UUID, ctx: Context) -> CallToolResult:
+    return await _serve(ctx, advance_turn, order_id=order_id)
+
+
+@server.tool(name="set_take_turns")
+async def _set_take_turns_tool(
+    order_id: uuid.UUID, on: bool, user_id: uuid.UUID, ctx: Context
+) -> CallToolResult:
+    return await _serve(ctx, set_take_turns, order_id=order_id, on=on, user_id=user_id)
 
 
 @server.tool(name="open_shortfall")
