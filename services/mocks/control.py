@@ -1,0 +1,206 @@
+"""Mock control functions behind `/panel/*` (architecture item 47 and §7, agent-protocol P33).
+
+*   `reset(conn, env)`: deletes the rows of `eval` runs and the `eval` mock state in one
+    transaction, children first, then re-inserts `services.seed.mock_stock_rows("eval")`
+    (§7 reset scope, amended 2026-11-02). It refuses any other `env`.
+*   `inject_event(...)`: writes a `mock_events` row and returns its id. A `shortfall`
+    event needs `params = {order_id, skus}`, with 1 to `SHORTFALL_MAX_LINES` SKUs, each a
+    line of the order (agent-protocol §10).
+*   `set_mode(...)`: writes the control-panel override in `adapter_modes`.
+*   `expire_approval(...)`: makes the approval's pending `approval_expiry` timer due now,
+    so the sweeper expires it.
+
+The route checks that belong to `/panel/events` (the order is `courier_booked` and has no
+shortfall, then `shortfall_detected`) are agent-protocol P31 and live in the route.
+"""
+
+from collections.abc import Mapping
+from typing import Any
+from uuid import UUID
+
+from psycopg import AsyncConnection
+from psycopg.types.json import Jsonb
+
+from services.common.config import get_settings
+from services.common.modes import ALWAYS_MOCK, VENDORS
+from services.seed import mock_stock_rows
+
+__all__ = [
+    "EVENT_KINDS",
+    "ControlRefused",
+    "expire_approval",
+    "inject_event",
+    "reset",
+    "set_mode",
+]
+
+ENVS = frozenset({"live", "eval"})
+EVENT_KINDS = frozenset(
+    {"out_of_stock", "kitchen_overloaded", "courier_delayed", "adapter_down", "shortfall"}
+)
+MODES = frozenset({"real", "mock"})
+
+
+class ControlRefused(ValueError):
+    """The control request is invalid or not allowed. Nothing was written."""
+
+
+# --- reset ----------------------------------------------------------------------------------
+
+_EVAL_RUNS_SQL = """
+SELECT r.run_id FROM runs r JOIN households h ON h.household_id = r.household_id
+WHERE h.env = 'eval'
+"""
+
+# Children first (§7, amended 2026-11-02). %(runs)s is the eval run ids.
+_RESET_SQL: tuple[tuple[str, str], ...] = (
+    ("agent_messages", "DELETE FROM agent_messages WHERE run_id = ANY(%(runs)s)"),
+    ("idempotency_keys", "DELETE FROM idempotency_keys WHERE run_id = ANY(%(runs)s)"),
+    ("timers", "DELETE FROM timers WHERE run_id = ANY(%(runs)s)"),
+    ("approvals", "DELETE FROM approvals WHERE run_id = ANY(%(runs)s)"),
+    ("quotes", "DELETE FROM quotes WHERE run_id = ANY(%(runs)s)"),
+    ("shortfalls", "DELETE FROM shortfalls WHERE run_id = ANY(%(runs)s)"),
+    (
+        "order_items",
+        "DELETE FROM order_items WHERE order_id IN"
+        " (SELECT order_id FROM orders WHERE run_id = ANY(%(runs)s))",
+    ),
+    (
+        "pantry_events",
+        "DELETE FROM pantry_events WHERE household_id IN"
+        " (SELECT household_id FROM households WHERE env = 'eval')",
+    ),
+    ("orders", "DELETE FROM orders WHERE run_id = ANY(%(runs)s)"),
+    ("runs", "DELETE FROM runs WHERE run_id = ANY(%(runs)s)"),
+    (
+        "sim_outbound",
+        "DELETE FROM sim_outbound WHERE run_id = ANY(%(runs)s) OR phone_e164 IN"
+        " (SELECT ci.phone_e164 FROM channel_identities ci"
+        "  JOIN household_members hm ON hm.user_id = ci.user_id"
+        "  JOIN households h ON h.household_id = hm.household_id"
+        "  WHERE h.env = 'eval')",
+    ),
+    ("mock_stock", "DELETE FROM mock_stock WHERE env = 'eval'"),
+    ("mock_orders", "DELETE FROM mock_orders WHERE env = 'eval'"),
+    ("mock_deliveries", "DELETE FROM mock_deliveries WHERE env = 'eval'"),
+    ("mock_events", "DELETE FROM mock_events WHERE env = 'eval'"),
+)
+
+
+async def reset(conn: AsyncConnection, env: str) -> dict[str, int]:
+    """Delete `eval` run rows and `eval` mock state, then re-seed `eval` mock stock.
+
+    One transaction. Returns the number of rows deleted per table. Raises `ControlRefused`
+    unless `env == "eval"`.
+    """
+    if env != "eval":
+        raise ControlRefused(f"reset is allowed for env 'eval' only, got {env!r}")
+    stock = mock_stock_rows("eval")
+    deleted: dict[str, int] = {}
+    async with conn.transaction():
+        cur = await conn.execute(_EVAL_RUNS_SQL)
+        params = {"runs": [row[0] for row in await cur.fetchall()]}
+        for table, sql in _RESET_SQL:
+            cur = await conn.execute(sql, params)
+            deleted[table] = cur.rowcount
+        async with conn.cursor() as cur:
+            await cur.executemany(
+                "INSERT INTO mock_stock (env, agent_id, sku, qty) VALUES (%s, %s, %s, %s)",
+                stock,
+            )
+    return deleted
+
+
+# --- inject_event ---------------------------------------------------------------------------
+
+
+async def _validate_shortfall(conn: AsyncConnection, params: Mapping[str, Any]) -> dict[str, Any]:
+    if set(params) != {"order_id", "skus"}:
+        raise ControlRefused("shortfall params must be exactly {order_id, skus}")
+    try:
+        order_id = UUID(str(params["order_id"]))
+    except ValueError:
+        raise ControlRefused("shortfall params.order_id must be a uuid") from None
+    skus = params["skus"]
+    max_lines = get_settings().shortfall_max_lines
+    if (
+        not isinstance(skus, list)
+        or not all(isinstance(s, str) and s for s in skus)
+        or not 1 <= len(skus) <= max_lines
+        or len(set(skus)) != len(skus)
+    ):
+        raise ControlRefused(f"shortfall params.skus must be 1 to {max_lines} distinct SKUs")
+    cur = await conn.execute("SELECT sku FROM order_items WHERE order_id = %s", (order_id,))
+    lines = {row[0] for row in await cur.fetchall()}
+    missing = [s for s in skus if s not in lines]
+    if missing:
+        raise ControlRefused(f"shortfall SKUs are not lines of order {order_id}: {missing}")
+    return {"order_id": str(order_id), "skus": skus}
+
+
+async def inject_event(
+    conn: AsyncConnection,
+    *,
+    env: str,
+    kind: str,
+    target_agent_id: str,
+    params: Mapping[str, Any] | None = None,
+) -> int:
+    """Write an active `mock_events` row and return its id (agent-protocol P33).
+
+    Raises `ControlRefused` for an unknown `env` or `kind`, or invalid `shortfall` params.
+    """
+    if env not in ENVS:
+        raise ControlRefused(f"env must be one of {sorted(ENVS)}, got {env!r}")
+    if kind not in EVENT_KINDS:
+        raise ControlRefused(f"kind must be one of {sorted(EVENT_KINDS)}, got {kind!r}")
+    if not target_agent_id:
+        raise ControlRefused("target_agent_id is required")
+    body: dict[str, Any] = dict(params or {})
+    if kind == "shortfall":
+        body = await _validate_shortfall(conn, body)
+    cur = await conn.execute(
+        "INSERT INTO mock_events (env, kind, target_agent_id, params)"
+        " VALUES (%s, %s, %s, %s) RETURNING id",
+        (env, kind, target_agent_id, Jsonb(body)),
+    )
+    row = await cur.fetchone()
+    assert row is not None
+    return int(row[0])
+
+
+# --- set_mode and expire_approval -----------------------------------------------------------
+
+
+async def set_mode(conn: AsyncConnection, vendor: str, mode: str, *, set_by: str = "panel") -> None:
+    """Upsert the `adapter_modes` override for `vendor`.
+
+    Raises `ControlRefused` for an unknown vendor or mode, or `real` for an always-mock
+    vendor.
+    """
+    if vendor not in VENDORS:
+        raise ControlRefused(f"vendor must be one of {sorted(VENDORS)}, got {vendor!r}")
+    if mode not in MODES:
+        raise ControlRefused(f"mode must be 'real' or 'mock', got {mode!r}")
+    if vendor in ALWAYS_MOCK and mode != "mock":
+        raise ControlRefused(f"{vendor} is always mock")
+    await conn.execute(
+        "INSERT INTO adapter_modes (vendor, mode, set_by) VALUES (%s, %s, %s)"
+        " ON CONFLICT (vendor) DO UPDATE SET mode = EXCLUDED.mode,"
+        " set_by = EXCLUDED.set_by, set_at = now()",
+        (vendor, mode, set_by),
+    )
+
+
+async def expire_approval(conn: AsyncConnection, approval_id: UUID) -> None:
+    """Set the approval's pending `approval_expiry` timer due now (architecture item 39).
+
+    Raises `LookupError` if the approval has no pending expiry timer.
+    """
+    cur = await conn.execute(
+        "UPDATE timers SET due_at = now()"
+        " WHERE kind = 'approval_expiry' AND status = 'pending' AND ref->>'approval_id' = %s",
+        (str(approval_id),),
+    )
+    if cur.rowcount == 0:
+        raise LookupError(f"approval {approval_id} has no pending expiry timer")
