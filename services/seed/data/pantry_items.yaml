@@ -1,0 +1,17 @@
+# Pantry vocabulary (pantry design §2). Each item has a name, its aliases (plurals and common
+# variants, listed explicitly) and a trust window in days. No allergen or diet data lives
+# here. `almond milk` is its own item, never an alias of `milk`. catalog_mock.yaml links SKUs
+# to these names (`pantry_item`); the seed refuses a link to a name not listed here.
+
+pantry_items:
+  - {name: milk, aliases: [whole milk, 2% milk, reduced fat milk], window_days: 3}
+  - {name: almond milk, aliases: [], window_days: 7}
+  - {name: eggs, aliases: [egg, large eggs], window_days: 7}
+  - {name: bread, aliases: [wheat bread, white bread, sandwich bread], window_days: 3}
+  - {name: bananas, aliases: [banana], window_days: 4}
+  - {name: apples, aliases: [apple], window_days: 10}
+  - {name: chicken breast, aliases: [chicken], window_days: 2}
+  - {name: rice, aliases: [white rice], window_days: 14}
+  - {name: pasta, aliases: [penne], window_days: 14}
+  - {name: granola, aliases: [], window_days: 14}
+  - {name: almonds, aliases: [almond], window_days: 14}

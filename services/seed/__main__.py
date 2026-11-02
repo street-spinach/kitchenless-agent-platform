@@ -23,7 +23,7 @@ import psycopg
 import yaml
 from psycopg.types.json import Jsonb
 
-from services.common import ids, vendors
+from services.common import ids, pantry, vendors
 from services.common.directory import AgentCard
 from services.seed import DATA_DIR, mock_stock_rows
 
@@ -71,6 +71,7 @@ def load_data(data_dir: Path = DATA_DIR) -> dict[str, Any]:
         "catalogs": _yaml(data_dir, "catalog_mock.yaml")["catalogs"],
         "shortfall_fixture": _yaml(data_dir, "catalog_mock.yaml")["shortfall_fixture"],
         "menus": _yaml(data_dir, "menu_mock.yaml")["menus"],
+        "pantry_items": _yaml(data_dir, "pantry_items.yaml")["pantry_items"],
     }
     with (data_dir / "off_subset.json").open() as f:
         data["off"] = json.load(f)["products"]
@@ -103,6 +104,18 @@ def _validate(data: dict[str, Any]) -> None:
     for agent_id in data["rules"]:
         if agent_id not in business:
             raise SeedError(f"rules for unknown card {agent_id}")
+
+    # Pantry vocabulary (pantry design §2, PT-A6): no duplicate name or alias, and every
+    # catalog `pantry_item` is a vocabulary name.
+    try:
+        vocab = pantry.Vocabulary.from_entries(data["pantry_items"], version="")
+    except ValueError as exc:
+        raise SeedError(f"pantry_items.yaml: {exc}") from exc
+    for items in data["catalogs"].values():
+        for item in items:
+            name = item.get("pantry_item")
+            if name is not None and name not in vocab.window_days:
+                raise SeedError(f"{item['sku']}: pantry_item {name!r} is not in the vocabulary")
 
     fx = data["shortfall_fixture"]
     catalog = {i["sku"]: i for i in data["catalogs"][fx["agent_id"]]}
@@ -230,23 +243,21 @@ def _seed_business(conn: psycopg.Connection, data: dict[str, Any]) -> None:
     for table, groups in (("catalog_items", data["catalogs"]), ("menu_items", data["menus"])):
         for agent_id, items in groups.items():
             for item in items:
-                _upsert(
-                    conn,
-                    table,
-                    ["agent_id", "sku"],
-                    {
-                        "agent_id": agent_id,
-                        "sku": item["sku"],
-                        "name": item["name"],
-                        "brand": item.get("brand"),
-                        "ingredients": item.get("ingredients", ""),
-                        "allergens": item["allergens"],
-                        "diets": item["diets"],
-                        "price_minor": item["price_minor"],
-                        "currency": currency,
-                        "in_stock": True,
-                    },
-                )
+                row = {
+                    "agent_id": agent_id,
+                    "sku": item["sku"],
+                    "name": item["name"],
+                    "brand": item.get("brand"),
+                    "ingredients": item.get("ingredients", ""),
+                    "allergens": item["allergens"],
+                    "diets": item["diets"],
+                    "price_minor": item["price_minor"],
+                    "currency": currency,
+                    "in_stock": True,
+                }
+                if table == "catalog_items":  # menu_items has no pantry_item (pantry P3)
+                    row["pantry_item"] = item.get("pantry_item")
+                _upsert(conn, table, ["agent_id", "sku"], row)
 
     for agent_id, rules in data["rules"].items():
         if "delivery" in rules:
