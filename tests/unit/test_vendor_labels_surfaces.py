@@ -1,16 +1,19 @@
 """Vendor labels on the surfaces that name a run's seller or courier (adapters §6, file 33;
 issue #169).
 
-The run view (`GET /runs/{run_id}`) is the surface on main that names them. The labels come
-from the run's pinned `runs.modes`, never from the current modes.
+The run view (`GET /runs/{run_id}`) names them, and so does the household's WhatsApp order
+text: the `choose_offer` explanation and the order summary (agents §11, issue #202). The
+labels come from the run's pinned `runs.modes`, never from the current modes.
 """
 
+import asyncio
 import uuid
 
 import psycopg
 import pytest
 from psycopg.types.json import Jsonb
 
+from services.agents.household import graph as hg
 from services.common import ids
 from tests.unit import api_world as w
 
@@ -125,3 +128,47 @@ def test_run_view_without_an_order_names_no_one(world: str) -> None:
         )
     got = _view(world, run_id)
     assert (got["seller"], got["courier"]) == (None, None)
+
+
+# WhatsApp order text: the explanation and the order summary (agents §11) -----------------
+
+
+def _seller_label(pg: str, run_id: uuid.UUID) -> str:
+    async def go() -> str:
+        async with await psycopg.AsyncConnection.connect(pg) as conn:
+            return await hg.seller_label(conn, run_id, SELLER)
+
+    return asyncio.run(go())
+
+
+def _order_text(label: str) -> str:
+    """The template sentence the household puts in the WhatsApp order summary."""
+    facts = {"seller": label, "items_covered": 4, "items_requested": 4, "total": "$12.07"}
+    return hg.explanation_template(facts)
+
+
+@db
+def test_whatsapp_order_text_real_square_is_sandbox(world: str) -> None:
+    run_id = _run(world, {"square_retail": "real", "doordash": "mock"})
+    label = _seller_label(world, run_id)
+    assert label == "Square Grocery (sandbox)"
+    assert _order_text(label) == "Chose Square Grocery (sandbox): 4 of 4 items for $12.07."
+
+
+@db
+def test_whatsapp_order_text_mock_square_is_simulated(world: str) -> None:
+    run_id = _run(world, {"square_retail": "mock", "doordash": "mock"})
+    label = _seller_label(world, run_id)
+    assert label == "Square Grocery (simulated)"
+    assert _order_text(label) == "Chose Square Grocery (simulated): 4 of 4 items for $12.07."
+
+
+@db
+def test_whatsapp_order_text_uses_the_runs_pinned_modes(world: str) -> None:
+    run_id = _run(world, {"square_retail": "mock"})
+    with psycopg.connect(world) as conn:
+        conn.execute(
+            "INSERT INTO adapter_modes (vendor, mode, set_by)"
+            " VALUES ('square_retail', 'real', 'panel')"
+        )
+    assert _seller_label(world, run_id) == "Square Grocery (simulated)"

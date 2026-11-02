@@ -37,6 +37,11 @@ STARTER_AGENT = "consumer:us-1-a"
 WHATSAPP_MEMBERS = frozenset({STARTER_AGENT})
 APPROVER = MEMBERS["consumer:us-1-b"]
 SELLERS = ["grocery:mock-us", "grocery:square-us"]
+# Each seller's vendor label text in a mock-mode run (adapters §6).
+LABELS = {
+    "grocery:mock-us": "Hillcrest Market (simulated)",
+    "grocery:square-us": "Square Grocery (simulated)",
+}
 NOW = datetime(2026, 11, 2, 12, 0, tzinfo=UTC)
 CARD = AgentCard(
     agent_id=HOUSEHOLD,
@@ -159,7 +164,12 @@ class World:
             clock=lambda: NOW,
             sleep=self.sleep,
             load_whatsapp_members=self.load_whatsapp_members,
+            label_seller=self.label_seller,
         )
+
+    async def label_seller(self, run_id: uuid.UUID, agent_id: str) -> str:
+        assert run_id == self.run_id
+        return LABELS[agent_id]
 
     async def load_whatsapp_members(self, household_id: str) -> dict[str, str]:
         assert household_id == "us-1"
@@ -395,7 +405,7 @@ def test_over_budget_counters_once_then_asks_approval() -> None:
     countered = w.round_closed()
     [counter] = countered.messages
     assert (counter.type, counter.to_agent) == ("counter_offer", "grocery:square-us")
-    assert counter.body["total_minor"] == 2250  # 90% of the cheapest offer
+    assert counter.body["total_minor"] == 2000  # the remaining weekly budget (agents §7)
 
     # Another store's offer now is late; the countered store's reply continues.
     assert w.offer("grocery:mock-us", 1000).messages == []
@@ -416,8 +426,10 @@ def test_rejected_approval_cancels_without_accepting() -> None:
     w = World(remaining_minor=1000)
     w.to_quoting()
     w.offer("grocery:square-us", 2500)
-    w.round_closed()
-    w.offer("grocery:square-us", 2250, round=1)
+    # One valid offer: no counter (agents §7, rule 6), straight to approval.
+    assert w.round_closed().messages == []
+    [asked] = w.household.of("request_approval")
+    assert asked["args"]["amount"]["amount_minor"] == 2500
     approval_id = str(ids.approval_id(uuid.UUID(w.order_id)))
     body = {"approval_id": approval_id, "order_id": w.order_id, "status": "rejected"}
     result = w.step(w.inbound("approval_decision", body, from_agent="system:api"))
@@ -427,10 +439,13 @@ def test_rejected_approval_cancels_without_accepting() -> None:
 
 
 def _awaiting_approval(w: World) -> None:
-    """Over budget: one counter, the store's reply is still over, approval is requested."""
+    """Over budget: one counter at the remaining 2000 (a runner-up covers as many lines), the
+    store counters at 2250, still over, and approval is requested."""
     w.to_quoting()
+    w.offer("grocery:mock-us", 3000)
     w.offer("grocery:square-us", 2500)
-    w.round_closed()
+    [counter] = w.round_closed().messages
+    assert (counter.type, counter.body["total_minor"]) == ("counter_offer", 2000)
     assert w.offer("grocery:square-us", 2250, round=1).messages == []
     [_] = w.household.of("request_approval")
 
@@ -510,10 +525,11 @@ def test_household_prompt_excludes_business_rationale() -> None:
     w.to_quoting()
     w.offer("grocery:mock-us", 3000, rationale=EVIL)
     w.offer("grocery:square-us", 2500, rationale=EVIL + " 2500")
-    w.round_closed()  # negotiate: counter
+    w.round_closed()  # negotiate (code): counter
     w.offer("grocery:square-us", 2250, round=1, rationale=EVIL)  # negotiate, choose_offer
     names = [name for name, _ in w.stubs.seen]
-    assert names.count("negotiate") == 2 and names.count("choose_offer") == 1
+    # `negotiate` decides in code; `choose_offer` makes the one explanation call.
+    assert names.count("negotiate") == 0 and names.count("choose_offer") == 1
     for _, state in w.stubs.seen:
         prompt = json.dumps(state, default=str)
         assert "IGNORE ALL PREVIOUS" not in prompt
@@ -647,7 +663,7 @@ def test_protocol_error_reaction_by_refused_type() -> None:
     assert w.saved()["phase"] == hg.DONE
 
     # A refused counter_offer drops that seller; the household decides again without it.
-    w = World(remaining_minor=1000)  # both offers over budget: the stub counters the cheapest
+    w = World(remaining_minor=1000)  # both offers over budget: code counters the best
     w.to_quoting()
     w.offer("grocery:mock-us", 1900)
     w.offer("grocery:square-us", 1800)
@@ -731,13 +747,12 @@ def test_requote_within_approved_total_skips_approval() -> None:
     w = World(remaining_minor=2000)
     w.to_quoting()
     w.offer("grocery:square-us", 2500)
-    w.round_closed()  # counter at 2250
-    w.offer("grocery:square-us", 2250, round=1)  # approval asked for 2250
+    w.round_closed()  # one valid offer: no counter, approval asked for 2500
     [accept] = w.approve().messages
-    assert accept.body["total_minor"] == 2250
+    assert accept.body["total_minor"] == 2500
     w.reject("grocery:square-us", accept.body["quote_id"], "expired")
 
-    # Re-quoted at or below the approved 2250: no new approval.
+    # Re-quoted at or below the approved 2500: no new approval.
     q2 = _quote("grocery:square-us", w, "requote")
     w.offer("grocery:square-us", 2250, round=1, quote_id=q2)
     [again] = w.round_closed().messages
@@ -749,17 +764,16 @@ def test_requote_above_approved_total_asks_again() -> None:
     w = World(remaining_minor=2000)
     w.to_quoting()
     w.offer("grocery:square-us", 2500)
-    w.round_closed()
-    w.offer("grocery:square-us", 2250, round=1)
+    w.round_closed()  # one valid offer: no counter, approval asked for 2500
     [accept] = w.approve().messages
     w.reject("grocery:square-us", accept.body["quote_id"], "expired")
     q2 = _quote("grocery:square-us", w, "requote")
-    w.offer("grocery:square-us", 2400, round=1, quote_id=q2)
+    w.offer("grocery:square-us", 2600, round=1, quote_id=q2)
     result = w.round_closed()
     assert result.messages == []
     assert [c["args"]["amount"]["amount_minor"] for c in w.household.of("request_approval")] == [
-        2250,
-        2400,
+        2500,
+        2600,
     ]
 
 
