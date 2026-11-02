@@ -98,6 +98,30 @@ def test_empty_vendor_env_uses_global_mode(monkeypatch: pytest.MonkeyPatch) -> N
     assert resolved == {v: "mock" for v in VENDORS}
 
 
+def test_empty_vendor_mode_uses_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    _use_env(monkeypatch, MODE="mock", MODE_DOORDASH="")
+
+    resolved = _resolve(_FakeConn())
+
+    assert resolved["doordash"] == "mock"
+
+
+def test_blank_vendor_mode_uses_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Issue #155: a whitespace-only MODE_<VENDOR> raised instead of falling through to MODE.
+    _use_env(monkeypatch, MODE="mock", MODE_DOORDASH="  ")
+
+    resolved = _resolve(_FakeConn())
+
+    assert resolved["doordash"] == "mock"
+
+
+def test_invalid_vendor_mode_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    _use_env(monkeypatch, MODE="mock", MODE_DOORDASH="fake")
+
+    with pytest.raises(ValueError, match="MODE_DOORDASH"):
+        _resolve(_FakeConn())
+
+
 def test_kroger_ordering_always_mock(monkeypatch: pytest.MonkeyPatch) -> None:
     _use_env(monkeypatch, MODE="real", MODE_KROGER_ORDERING="real")
 

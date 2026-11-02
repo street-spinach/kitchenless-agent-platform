@@ -5,7 +5,7 @@ Precedence, highest first:
 
 1. `MODE_FORCE_MOCK=1` (set in CI) makes every vendor mock.
 2. A control-panel override row in `adapter_modes`.
-3. `MODE_<VENDOR>` from the container environment, when set and not empty.
+3. `MODE_<VENDOR>` from the container environment, when set and not blank.
 4. `MODE`, which defaults to `mock`.
 
 `kroger_ordering` is always mock.
@@ -76,8 +76,9 @@ async def resolve_modes(conn: AsyncConnection) -> dict[str, Mode]:
             modes[vendor] = "mock"
         elif vendor in overrides:
             modes[vendor] = _check(f"adapter_modes[{vendor}]", overrides[vendor])
-        # Empty means "use MODE" (.env.example): Compose passes unset ones as "".
-        elif env := getattr(settings, f"mode_{vendor}"):
+        # Empty or blank means "use MODE" (.env.example): Compose passes unset ones as "".
+        # A non-blank value is checked as given, so an invalid one still raises.
+        elif (env := getattr(settings, f"mode_{vendor}")) and env.strip():
             modes[vendor] = _check(f"MODE_{vendor.upper()}", env)
         else:
             modes[vendor] = default
