@@ -515,6 +515,32 @@ def test_tt_tap_after_order_completed_sets_rule(
     assert _take_turns_row(world) == [{"take_turns": False, "set_by": w.ADMIN}]
 
 
+def test_tt_tap_replay_calls_tool_once(world: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A redelivered webhook (same `external_id`) is dropped by the inbound dedupe, even
+    # though the tap commits its run before the tool call.
+    order_id = _completed_dinner(world)
+    button = ids.take_turns_button(order_id, True)
+    runs_before = len(w.query(world, "SELECT run_id FROM runs"))
+    tap_run = _tt_tap(world, monkeypatch, "wamid.replay", button)
+    assert tap_run is not None
+    assert _tt_tap(world, monkeypatch, "wamid.replay", button) is None
+    # One new run, one `set_take_turns` call, one `take_turns_saved` reply.
+    assert len(w.query(world, "SELECT run_id FROM runs")) == runs_before + 1
+    [call] = w.query(
+        world,
+        "SELECT run_id, payload FROM agent_traces WHERE kind = 'tool_result'"
+        " AND payload->>'tool' = 'set_take_turns'",
+    )
+    assert call["run_id"] == tap_run
+    assert call["payload"]["refused"] is False
+    [reply] = w.query(world, "SELECT * FROM agent_messages WHERE type = 'whatsapp_out'")
+    assert reply["run_id"] == tap_run
+    assert reply["body"]["template"] == TAKE_TURNS_SAVED
+    assert _take_turns_row(world) == [{"take_turns": True, "set_by": w.ADMIN}]
+    [inbound_row] = w.query(world, "SELECT run_id FROM inbound_messages")
+    assert inbound_row["run_id"] == tap_run
+
+
 def test_tt_tap_unchanged_sends_nothing(world: str, monkeypatch: pytest.MonkeyPatch) -> None:
     order_id = _completed_dinner(world)
     # Take-turns is off already (no row).
