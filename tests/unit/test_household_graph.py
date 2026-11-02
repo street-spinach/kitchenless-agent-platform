@@ -67,6 +67,12 @@ class FakeHousehold:
         # turns into drops.
         self.shortfall: dict[str, Any] = {}
         self.refuse_lines: list[int] = []
+        # What `get_household_rules` returns (agents §10).
+        self.rules: dict[str, Any] = {
+            "take_turns": False,
+            "turn_index": 0,
+            "approver_user_id": APPROVER,
+        }
 
     def of(self, tool: str) -> list[dict[str, Any]]:
         return [c for c in self.calls if c["tool"] == tool]
@@ -78,6 +84,8 @@ class FakeHousehold:
             raise ToolRefused(self.refuse[tool])
         if tool == "create_order":
             return {"order_id": args["order_id"], "kind": args["kind"], "state": "draft"}
+        if tool == "get_household_rules":
+            return dict(self.rules)
         if tool == "get_pantry":
             return {"household_id": "us-1", "items": [{"item": "rice", "qty": 2, "unit": "each"}]}
         if tool == "set_order_state":
