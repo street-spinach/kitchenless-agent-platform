@@ -7,7 +7,8 @@ x-app: &app
   build:
     context: ..
     dockerfile: infra/Dockerfile
-  image: spinach-app:local
+  # The VM pulls the tag deploy.sh sets (architecture item 56); `make up` builds `:local`.
+  image: ${APP_IMAGE:-ghcr.io/street-spinach/kitchenless-app}:${APP_TAG:-local}
   restart: unless-stopped
 
 # Environment matrix (docs/designs/architecture.md, "Environment matrix"). One block per
