@@ -859,6 +859,24 @@ check.
     `runs`, `orders`, `order_items`, `quotes`, `approvals`, `timers`, `agent_messages`,
     `idempotency_keys`, `pantry_events` and `sim_outbound`, plus `mock_*` rows with
     `env='eval'`. It then re-seeds the `eval` mock state. It refuses `env: live`.
+*   **Amended 2026-11-02 (reset scope, #50).** The list above left out `shortfalls`, whose
+    `run_id` and `order_id` foreign keys made the reset fail after any shortfall case. The
+    full rule:
+    *   **Eval runs** are runs whose `household_id` is a household with `env='eval'`.
+        That includes `a2a-demo`. Runs with no household are never deleted.
+    *   **Order of deletion,** in one transaction, children first: `agent_messages`,
+        `idempotency_keys`, `timers`, `approvals`, `quotes`, `shortfalls` (by eval
+        `run_id`), `order_items` (by eval orders), `pantry_events` (by eval
+        `household_id`; the seed writes none), `orders`, then `runs`. After those,
+        `sim_outbound` rows whose `run_id` is an eval run or whose `phone_e164` belongs to
+        a member of an eval household (`channel_identities` → `household_members`). Then
+        `mock_stock`, `mock_orders`, `mock_deliveries` and `mock_events` with
+        `env='eval'`.
+    *   **Kept:** `agent_traces`, which evals read by `run_id`, and `inbound_messages`,
+        which have no foreign keys.
+    *   **Re-seed:** `mock_stock` for `env='eval'` is rewritten by the seed's stock writer
+        (item 55, exposed as `services.seed.seed_mock_stock(conn, env)`), in the same
+        transaction. identity-authz step 9 widens this to the seed's whole eval part.
 *   The deploy scenario test also uses `eval` households. The nightly eval run does nothing
     while `/opt/app/DEPLOY_FREEZE` exists.
 
@@ -2381,6 +2399,8 @@ and values; none of these may be renamed or dropped.
     `reset(conn, env)`, `inject_event(...)`, `set_mode(vendor, mode)`,
     `expire_approval(approval_id)`. `reset` re-seeds `eval` mock stock from the seed data
     files.
+*   **Amended 2026-11-02 (reset scope, #50).** `reset` follows the §7 rule (deletion order,
+    `shortfalls`, `sim_outbound` by eval phone, and `seed_mock_stock(conn, "eval")`).
 
 ##### 48. `services/mocks/panel.py` (Keep)
 
@@ -2886,6 +2906,7 @@ and values; none of these may be renamed or dropped.
 *   `test_panel_reset.py` (*db*):
     *   `test_reset_eval_leaves_live_rows`
     *   `test_reset_live_refused`
+    *   `test_reset_eval_after_shortfall_succeeds` (amended 2026-11-02, #50)
 *   `test_directory.py` (*db*):
     *   `test_find_filters_zone_region_currency`
     *   `test_disabled_cards_excluded`
