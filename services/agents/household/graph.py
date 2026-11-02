@@ -6,11 +6,14 @@ A household agent is a LangGraph graph checkpointed under
 routed by its type and the order's phase:
 
 *   `start_weekly_order` / `start_dinner` → `start_order` (the deterministic
-    `ids.order_id(run_id)` is in the checkpoint before `create_order` uses it) →
-    `collect_constraints` (one `constraints_request` per member's consumer agent).
-*   `constraints` → `record_constraints`; once every member has answered, `build_list`
-    (pantry check, then the model's list) → `request_quotes` (`directory.find`, one
-    `quote_request` per seller, the 30 s `quote_round` timer, state `quoting`).
+    `ids.order_id(run_id)` is in the checkpoint before `create_order` uses it; then
+    `get_household_rules`, snapshotted in state, agents §10) → `collect_constraints` (one
+    `constraints_request` per member's consumer agent).
+*   `constraints` → `record_constraints` (allergens, diets and dislikes); once every
+    member has answered, `build_list` (pantry check, the model's list, then in code: item
+    names, the pantry and the AG5 dislike rule, agents §6) → `request_quotes`
+    (`directory.find`, one `quote_request` per seller, the 30 s `quote_round` timer, state
+    `quoting`). Dislikes are never sent to sellers.
 *   `offer` while quoting, or the reply to our counter → `record_offer`. Any other offer is
     late: ignored with a `decision` trace `late_offer` (agent-protocol §7 arrival table).
 *   `quote_round_closed` → `negotiate` (state `negotiating`; code only: at most one
@@ -63,6 +66,7 @@ model prompt can contain it (architecture item 29).
 import asyncio
 import json
 import logging
+import unicodedata
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -83,7 +87,7 @@ from services.agents.common.model import (
 )
 from services.agents.household import stubs
 from services.agents.household.prompts import BUILD_LIST_PROMPT, EXPLAIN_PROMPT, NO_CODES
-from services.common import ids, mcp_client
+from services.common import dislikes, ids, mcp_client
 from services.common.consumer import (
     Inbound,
     Outgoing,
@@ -111,13 +115,17 @@ __all__ = [
     "HouseholdState",
     "Members",
     "RunInfo",
+    "DislikeOutcome",
     "UnsupportedMessage",
+    "apply_dislike_rule",
     "build_graph",
     "compare_offers",
     "explanation_template",
     "handle",
+    "item_name_ok",
     "seller_label",
     "strip_rationale",
+    "turn_holder",
 ]
 
 log = logging.getLogger(__name__)
@@ -129,6 +137,10 @@ HOUSEHOLD_MAX_COUNTERS = 1  # the household counters at most once per run (agent
 EXPLAIN_TIMEOUT_SECONDS = 15  # the explanation call in `choose_offer` (agents §11)
 LOCALE = "en"  # money in WhatsApp text, as the household MCP server formats it
 HOUSEHOLD_SCOPE = "household"
+SOLO_SCOPE = "solo"
+ITEM_NAME_MAX_CHARS = 60  # agents §12, "Item names"
+# Characters an item name may not contain (agents §12): markup and template braces.
+ITEM_NAME_FORBIDDEN = frozenset("<>{}")
 OFFER_TTL_SECONDS = 600  # agent-protocol §13; the run override `OFFER_TTL_SECONDS` wins
 MAX_REQUOTES = 1
 # The delivery window asked for in `quote_request`, relative to the request.
@@ -146,6 +158,7 @@ SCOPES: Mapping[str, tuple[str, ...]] = {
     "record_delivery": ("pantry:write",),
     "get_pantry": ("pantry:read",),
     "get_budget": (),
+    "get_household_rules": (),  # agents §10: no scope
     "set_order_state": ("orders:place",),
     "open_shortfall": (),
     "get_shortfall": (),
@@ -216,7 +229,8 @@ class HouseholdState(TypedDict, total=False):
     currency: str
     phase: str
     members: dict[str, str]  # consumer agent id -> user id
-    constraints: dict[str, dict[str, list[str]]]  # consumer agent id -> codes
+    # consumer agent id -> allergens, diets and dislikes (an old entry has no dislikes)
+    constraints: dict[str, dict[str, list[str]]]
     items: list[dict[str, Any]]
     conversations: dict[str, str]  # seller agent id -> conversation id
     counters: int
@@ -235,6 +249,10 @@ class HouseholdState(TypedDict, total=False):
     shortfall: dict[str, Any] | None
     # Agents §17. Each is read with its default, so `STATE_VERSION` stays 1.
     scope: str  # "household" (default) or "solo"
+    take_turns: bool  # `get_household_rules`, snapshotted by `start_order`
+    turn_index: int
+    household_allergens: list[str]  # every member's allergens, for a solo order
+    turn_holder: str | None  # the user id whose dislikes come first this run
     counter: dict[str, Any] | None  # {seller, from_minor, to_minor} of our one counter
     explanation: str | None  # the latest explanation sentence (choose_offer)
     dropped_items: list[str]
@@ -437,6 +455,80 @@ def _codes(constraints: Sequence[Mapping[str, Any]], key: str) -> str:
     return ", ".join(values) or NO_CODES
 
 
+def _dislikes(codes: Mapping[str, Any]) -> list[str]:
+    """One member's dislike values; an entry from an old checkpoint has none (agents §6)."""
+    return [str(v) for v in codes.get("dislikes") or []]
+
+
+def item_name_ok(name: str) -> bool:
+    """Agents §12, "Item names": not empty after trimming, at most 60 characters, and no
+    control character or `<`, `>`, `{`, `}`."""
+    trimmed = name.strip()
+    if not trimmed or len(trimmed) > ITEM_NAME_MAX_CHARS:
+        return False
+    return not any(ch in ITEM_NAME_FORBIDDEN or unicodedata.category(ch) == "Cc" for ch in trimmed)
+
+
+def turn_holder(
+    constraints: Mapping[str, Mapping[str, Any]], members: Mapping[str, str], turn_index: int
+) -> str | None:
+    """The user id whose turn it is (agents §6): among the collected members with at least
+    one dislike, sorted by user id, the one at `turn_index` mod their count."""
+    users = sorted(
+        members[agent]
+        for agent, codes in constraints.items()
+        if agent in members and _dislikes(codes)
+    )
+    if not users:
+        return None
+    return users[turn_index % len(users)]
+
+
+@dataclass(frozen=True)
+class DislikeOutcome:
+    """What the AG5 rule did to a list: the items kept, and for each item that matched a
+    dislike, whether it was dropped or kept."""
+
+    items: list[dict[str, Any]]
+    dropped: list[str]  # item names
+    kept: list[tuple[str, list[str]]]  # (item name, the dislike values it matches)
+
+
+def apply_dislike_rule(
+    items: Sequence[Mapping[str, Any]],
+    owners: Mapping[str, Sequence[str]],
+    removable_owners: frozenset[str],
+) -> DislikeOutcome:
+    """The AG5 dislike rule. `owners` maps each collected member to their dislikes.
+
+    An item that matches a dislike is dropped when a member in `removable_owners` (the solo
+    requester, or the turn holder) has a matching dislike, or when every member in the run
+    has one. The last item is never dropped. Every other match is kept and reported.
+    """
+    kept_items: list[dict[str, Any]] = []
+    dropped: list[str] = []
+    kept: list[tuple[str, list[str]]] = []
+    for index, item in enumerate(items):
+        name = str(item["item"])
+        matching = {
+            owner: [d for d in values if dislikes.matches(name, d)]
+            for owner, values in owners.items()
+        }
+        matching = {owner: values for owner, values in matching.items() if values}
+        if not matching:
+            kept_items.append(dict(item))
+            continue
+        removable = bool(removable_owners & set(matching)) or set(matching) >= set(owners)
+        # Never the last item: nothing kept so far and nothing left after this one.
+        last = not kept_items and index == len(items) - 1
+        if removable and not last:
+            dropped.append(name)
+            continue
+        kept_items.append(dict(item))
+        kept.append((name, sorted({d for values in matching.values() for d in values})))
+    return DislikeOutcome(items=kept_items, dropped=dropped, kept=kept)
+
+
 def _json(text: str | None) -> dict[str, Any]:
     try:
         answer = json.loads(text or "")
@@ -593,7 +685,16 @@ def build_graph(
         kind = START_KIND[state["message_type"]]
         order_id = state.get("order_id") or str(ids.order_id(UUID(state["run_id"])))
         await tool(state, "create_order", {"order_id": order_id, "kind": kind})
-        return {"order_id": order_id, "kind": kind}
+        # Every run snapshots the household's rules (agents §10).
+        rules = await tool(state, "get_household_rules", {})
+        approver = rules.get("approver_user_id")
+        return {
+            "order_id": order_id,
+            "kind": kind,
+            "take_turns": bool(rules.get("take_turns")),
+            "turn_index": _int(rules.get("turn_index"), 0),
+            "approver_user_id": str(approver) if approver else None,
+        }
 
     async def collect_constraints(state: HouseholdState) -> dict[str, Any]:
         members = dict(await load_members(state["household_id"]))
@@ -607,18 +708,28 @@ def build_graph(
 
     async def record_constraints(state: HouseholdState) -> dict[str, Any]:
         body = state["body"]
-        codes = {"allergens": list(body["allergens"]), "diets": list(body["diets"])}
+        codes = {
+            "allergens": list(body["allergens"]),
+            "diets": list(body["diets"]),
+            "dislikes": [str(d) for d in body.get("dislikes") or []],
+        }
         return {"constraints": {**(state.get("constraints") or {}), state["from_agent"]: codes}}
 
     async def build_list(state: HouseholdState) -> dict[str, Any]:
         pantry = await tool(state, "get_pantry", {})
         have = {str(p["item"]).lower() for p in pantry.get("items", [])}
-        codes = list((state.get("constraints") or {}).values())
+        constraints = dict(state.get("constraints") or {})
+        members = dict(state.get("members") or {})
+        solo = (state.get("scope") or HOUSEHOLD_SCOPE) == SOLO_SCOPE
+        codes = list(constraints.values())
+        # Every member's allergens; a solo order adds the household's (agents §6).
+        household = {"allergens": list(state.get("household_allergens") or [])}
+        # Dislike values only, never tied to a member.
         system = BUILD_LIST_PROMPT.format(
             kind=state["kind"],
-            people=len(state.get("members") or {}) or 1,
+            people=1 if solo else (len(members) or 1),
             diets=_codes(codes, "diets"),
-            allergens=_codes(codes, "allergens"),
+            allergens=_codes([*codes, household], "allergens"),
             dislikes=_codes(codes, "dislikes"),
         )
         answer = await complete(
@@ -631,11 +742,44 @@ def build_graph(
             items = [RequestItem.model_validate(i) for i in answer.get("items") or []]
         except ValidationError:
             raise InvalidOutput("build_list returned an invalid item") from None
+        named = []
+        for i in items:
+            if item_name_ok(i.item):
+                named.append(i)
+            else:
+                await trace_decision(state, "build_list", "item_rejected")
         # Code decides: what the pantry already holds is not ordered again.
-        items = [i for i in items if i.item.lower() not in have]
+        items = [i for i in named if i.item.lower() not in have]
         if not items:
             raise InvalidOutput("build_list returned no items")
-        return {"items": [i.model_dump(mode="json") for i in items]}
+        # The AG5 dislike rule, with members named by user id (agents §6).
+        owners = {
+            members.get(agent, agent): _dislikes(c) for agent, c in sorted(constraints.items())
+        }
+        holder = None
+        if state.get("take_turns") and state.get("kind") == "dinner" and not solo:
+            holder = turn_holder(constraints, members, _int(state.get("turn_index"), 0))
+        removable: set[str] = set()
+        if solo and state.get("user_id"):
+            removable.add(str(state["user_id"]))
+        if holder is not None:
+            removable.add(holder)
+        outcome = apply_dislike_rule(
+            [i.model_dump(mode="json") for i in items], owners, frozenset(removable)
+        )
+        for name in outcome.dropped:
+            await trace_decision(state, "build_list", "dislike_dropped", f"item={name}")
+        unavoidable: set[str] = set()
+        for name, values in outcome.kept:
+            unavoidable.update(values)
+            text = f"item={name} dislikes={', '.join(values)}"
+            await trace_decision(state, "build_list", "dislike_kept", text)
+        return {
+            "items": outcome.items,
+            "dropped_items": outcome.dropped,
+            "unavoidable_dislikes": sorted(unavoidable),
+            "turn_holder": holder,
+        }
 
     async def request_quotes(state: HouseholdState) -> dict[str, Any]:
         if not state.get("requotes"):
@@ -654,6 +798,8 @@ def build_graph(
         for codes in (state.get("constraints") or {}).values():
             allergens.update(codes["allergens"])
             diets.update(codes["diets"])
+        # `household_allergens` is set only for a solo order (agents §6).
+        allergens.update(state.get("household_allergens") or [])
         now = clock()
         body = {
             "order_id": state["order_id"],
