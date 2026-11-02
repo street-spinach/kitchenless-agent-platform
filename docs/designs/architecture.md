@@ -1472,6 +1472,9 @@ provisional shapes in §13 are enough to start every step in mock mode.
         others).
     *   `vendor_key(key: str) -> str` returns `str(uuid5(KEY_NAMESPACE, key))`.
         `KEY_NAMESPACE` is a fixed UUID constant in this file.
+*   **Amended 2026-11-02 (mock courier, #48).** `mock_batch_id(external_delivery_id: str)
+    -> UUID` returns `uuid5(UUID(external_delivery_id), "batch")`, the `batch_id` of a
+    mock booking that starts a new batch (item 46).
 *   **Amended 2026-11-02 (retry prompt, #36).** `retry_prompt_id(run_id: UUID) -> UUID`
     returns `uuid5(run_id, "retry_prompt")`, the `message_id` of a run's retry prompt
     (item 24).
@@ -2343,6 +2346,34 @@ and values; none of these may be renamed or dropped.
         `next_state_at`. Each step lasts `MOCK_COURIER_STEP_SECONDS` (default 20), plus the
         delay of any active `courier_delayed` event.
     *   Each change is posted to `api` `/internal/delivery-status`.
+*   **Amended 2026-11-02 (mock courier, #48).** These rules define the quote, the batch
+    join, delays and status posting:
+    *   **Rules.** Each courier card has `business_rules` kind `delivery` = `{fee_minor,
+        slot_minutes, slot_capacity}` (item 55). The mock reads it on every quote and
+        booking.
+    *   **`quote_delivery(order_id, zone_id, window)`** returns `{price_minor, currency,
+        windows: [Window]}`. `price_minor` is `fee_minor` and `currency` is the card's.
+        `windows` splits the requested window into back-to-back slots of
+        `slot_minutes`, starting at `window.start`, keeping only whole slots inside the
+        window. It drops any slot that already overlaps `slot_capacity` `booked`
+        `mock_deliveries` rows with the same `env`, `agent_id` and `zone_id`. The list is
+        in start order and can be empty. `choose_window` picks from this list, with the
+        first slot as its default. The quote's `expires_at` is set by the handler
+        (`COURIER_QUOTE_TTL_SECONDS`), not by the adapter.
+    *   **Booking.** `external_delivery_id = vendor_key(key)`. A new booking joins a batch
+        only from rows with `state='booked'` and the same `env`, `agent_id` and
+        `zone_id`, whose window overlaps its own. It takes the earliest such row's
+        `batch_id`, and it keeps its own window and its own progression. If there is no
+        such row, `batch_id = ids.mock_batch_id(external_delivery_id)`.
+    *   **`courier_delayed`.** `params: {delay_seconds: int > 0}`, matched on
+        `target_agent_id = mock_deliveries.agent_id` and `env`. When several events are
+        active, the largest `delay_seconds` applies. It is added to each step's
+        `MOCK_COURIER_STEP_SECONDS`.
+    *   **Status posts.** Each change posts `{external_delivery_id, status: <new state>,
+        event_id: f"{external_delivery_id}:{state}"}`. `mock_deliveries.state` and
+        `next_state_at` change only after a 2xx. On any other result, the loop logs it and
+        retries the same post on its next tick. Repeats are harmless, because
+        `apply_delivery_status` only moves forward.
 
 ##### 47. `services/mocks/control.py` (Create)
 
@@ -2469,6 +2500,9 @@ and values; none of these may be renamed or dropped.
     *   `data/rules.yaml`: `business_rules` per business card. Mock and sandbox store floors are
         95% of list price, so the household stub's 90% counter is always below the floor
         total and the G11 floor eval exercises a real refusal.
+        *Amended 2026-11-02 (mock courier, #48):* courier cards have a `delivery` rule
+        instead of `floor_pct`: `delivery:mock-us` and `delivery:doordash-us` both get
+        `{fee_minor: 599, slot_minutes: 60, slot_capacity: 2}`.
     *   `data/catalog_mock.yaml` and `data/menu_mock.yaml`: items for `grocery:mock-us`,
         `grocery:square-us`, `restaurant:mock-us` and `restaurant:square-us`, including at
         least one item with `tree_nuts`.
@@ -2901,6 +2935,9 @@ against every adapter of that interface:
 *   `delivery` (DoorDash Drive, mock courier):
     *   `test_book_delivery_idempotent`
     *   `test_status_progression`
+    *   Amended 2026-11-02 (#48), mock only: `test_quote_windows_respect_slot_capacity`,
+        `test_booking_joins_overlapping_booked_batch`, `test_courier_delayed_largest_wins`,
+        `test_state_advances_only_after_status_post`.
     *   `test_result_has_no_address`
 
 **Smoke**: the existing tests with updated URLs, plus `test_internal_routes_not_public`.
