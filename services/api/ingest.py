@@ -18,6 +18,10 @@
         the inbound row is not kept: a redelivered tap is tried again.
     *   An approval button (`ap:<approval_id>:approved|rejected`, #63) calls
         `/mcp/household decide_approval` with `api`'s service token; see `_approval_tap`.
+    *   A take-turns button (`tt:<order_id>:on|off`, agents §10), checked before the
+        approval button, starts a `chat` run (committed first, so the guard sees it) and
+        calls `/mcp/household set_take_turns` with `api`'s service token; see
+        `_take_turns_tap`.
     *   Any other button starts nothing.
 4.  Text equal to "retry", any case: if `runs.retry_target` finds a run, start a new run
     with `retry_of` and send the original request again as `user_message`. Otherwise it is
@@ -50,7 +54,9 @@ __all__ = [
     "APPROVAL_EXPIRED",
     "MEDIA_NOT_SUPPORTED",
     "NOT_APPROVER",
+    "SET_TAKE_TURNS",
     "SHORTFALL_PREFIX",
+    "TAKE_TURNS_SAVED",
     "WHATSAPP",
     "Content",
     "ingest",
@@ -78,6 +84,9 @@ HOUSEHOLD_SERVER = "household"
 CHOOSE_SHORTFALL_OPTION = "choose_shortfall_option"
 # The `whatsapp_out` template for "Already decided." (agent-protocol §10).
 ALREADY_DECIDED = "already_decided"
+# The take-turns tap (agents §10): `tt:<order_id>:on|off`.
+SET_TAKE_TURNS = "set_take_turns"
+TAKE_TURNS_SAVED = "take_turns_saved"
 
 
 @dataclass(frozen=True)
@@ -225,36 +234,86 @@ async def ingest(
             return None
 
         inbound = ids.inbound_id(channel, external_id)
+        trigger: dict[str, Any] = {
+            "source": channel,
+            "user_id": member.user_id,
+            "inbound_id": inbound,
+        }
         if content.kind == "button":
             if content.button.startswith(SHORTFALL_PREFIX):
                 run = await _shortfall_button(conn, member, inbound, content.button)
                 if run is not None:
                     await conn.execute(_SET_RUN_SQL, (run, channel, external_id))
                 return None
-            tap = ids.parse_approval_button(content.button)
-            if tap is None:
-                log.info("inbound button ignored: neither a shortfall nor an approval button")
-                return None
-            approval_run = await _approval_tap(conn, member, inbound, *tap, call_tool=call_tool)
-            if approval_run is not None:
-                await conn.execute(_SET_RUN_SQL, (approval_run, channel, external_id))
-            return approval_run
-
-        trigger: dict[str, Any] = {
-            "source": channel,
-            "user_id": member.user_id,
-            "inbound_id": inbound,
-        }
-        if overrides:
-            trigger["overrides"] = overrides
-
-        if content.kind == "media":
-            started = await _media_reply(conn, member, inbound, trigger)
+            # The take-turns tap is checked before the approval button (agents §10).
+            take_turns = ids.parse_take_turns_button(content.button)
+            if take_turns is None:
+                tap = ids.parse_approval_button(content.button)
+                if tap is None:
+                    log.info("inbound button ignored: not a shortfall, take-turns or approval")
+                    return None
+                approval_run = await _approval_tap(conn, member, inbound, *tap, call_tool=call_tool)
+                if approval_run is not None:
+                    await conn.execute(_SET_RUN_SQL, (approval_run, channel, external_id))
+                return approval_run
+            # A new `chat` run, since the order's run has ended. It is committed below,
+            # before the tool call, so that the guard's step 0 sees it running.
+            started = await runs.start(
+                conn, household_id=member.household_id, kind=CHAT, trigger=trigger
+            )
+            await conn.execute(_SET_RUN_SQL, (started, channel, external_id))
         else:
-            started = await _start_text(conn, member, inbound, trigger, content.text, kind, run_id)
+            if overrides:
+                trigger["overrides"] = overrides
 
-        await conn.execute(_SET_RUN_SQL, (started, channel, external_id))
-        return started
+            if content.kind == "media":
+                started = await _media_reply(conn, member, inbound, trigger)
+            else:
+                started = await _start_text(
+                    conn, member, inbound, trigger, content.text, kind, run_id
+                )
+
+            await conn.execute(_SET_RUN_SQL, (started, channel, external_id))
+            return started
+
+    # Only a take-turns tap gets here.
+    await conn.commit()
+    order_id, on = take_turns
+    await _take_turns_tap(conn, started, member, inbound, order_id, on, call_tool=call_tool)
+    return started
+
+
+async def _take_turns_tap(
+    conn: AsyncConnection,
+    run_id: uuid.UUID,
+    member: _Member,
+    inbound: uuid.UUID,
+    order_id: uuid.UUID,
+    on: bool,
+    *,
+    call_tool: CallTool,
+) -> None:
+    """Steps 2 to 5 of the take-turns tap (agents §10): `set_take_turns` with `api`'s
+    service token in the new run; `take_turns_saved` only if the setting changed; any
+    refusal is logged and sends nothing; the run ends `completed`.
+
+    If the tool cannot be reached the error propagates, nothing is sent and the run is
+    left to its `run_timeout`. The tap can simply be sent again.
+    """
+    args = {"order_id": str(order_id), "on": on, "user_id": str(member.user_id)}
+    ctx = RunContext(run_id=run_id, agent_id=API_AGENT, conversation_id=None)
+    try:
+        result = await call_tool(
+            HOUSEHOLD_SERVER, SET_TAKE_TURNS, args, ctx=ctx, token=_service_token()
+        )
+    except ToolRefused as refused:
+        log.info("take-turns tap refused: %s", refused.reason)
+        result = {}
+    async with conn.transaction():
+        if result.get("changed") is True:
+            state = {"state": "on" if result.get("take_turns") else "off"}
+            await _reply(conn, run_id, member, inbound, TAKE_TURNS_SAVED, state)
+        await runs.finish(conn, run_id, API_AGENT, "completed", SET_TAKE_TURNS)
 
 
 async def _start_text(

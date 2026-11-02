@@ -110,6 +110,8 @@ class FakeHousehold:
             }
         if tool == "record_delivery":
             return {"order_id": args["order_id"], "recorded": 4}
+        if tool == "advance_turn":
+            return {"advanced": bool(self.rules.get("take_turns"))}
         if tool == "open_shortfall":
             self.shortfall = {"lines": args["lines"], "picks": {}, "status": "pending"}
             return {"shortfall_id": args["shortfall_id"], "status": "pending", "opened": True}
