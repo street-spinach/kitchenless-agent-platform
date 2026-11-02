@@ -21,10 +21,13 @@ def test_agents_health_reports_postgres(reachable: bool) -> None:
     async def check_db() -> bool:
         return reachable
 
-    resp = TestClient(host.create_app(check_db)).get("/health")
+    async def no_backlog() -> None:
+        return None
+
+    resp = TestClient(host.create_app(check_db, get_backlog=no_backlog)).get("/health")
     assert (resp.status_code, resp.json()) == (
         200,
-        {"status": "ok", "service": "agents", "postgres": reachable},
+        {"status": "ok", "service": "agents", "postgres": reachable, "cards": 0, "backlog": None},
     )
 
 

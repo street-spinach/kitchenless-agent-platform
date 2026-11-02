@@ -2,7 +2,7 @@
 
 `find` is internal discovery (architecture §4, agent-protocol §2): it returns enabled cards
 only, refuses `cls='channel'` and never returns `external` cards. `card` looks up one
-card by id whether or not it is enabled.
+card by id whether or not it is enabled. `hosted` lists the enabled cards of one host.
 """
 
 from dataclasses import dataclass, field
@@ -12,7 +12,7 @@ from typing import Any
 from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 
-__all__ = ["AgentCard", "UnknownAgent", "card", "find"]
+__all__ = ["AgentCard", "UnknownAgent", "card", "find", "hosted"]
 
 _COLUMNS = (
     "agent_id, class AS agent_class, owner_ref, region, zone_ids, currency, host_process,"
@@ -65,6 +65,18 @@ async def find(
             " AND region = %s AND %s = ANY(zone_ids) AND currency = %s"
             " ORDER BY agent_id",
             (cls, region, zone_id, currency),
+        )
+        rows = await cur.fetchall()
+    return [_to_card(row) for row in rows]
+
+
+async def hosted(conn: AsyncConnection, host_process: str) -> list[AgentCard]:
+    """Enabled cards with this `host_process`, the cards a host loads at startup (item 27)."""
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            f"SELECT {_COLUMNS} FROM agent_cards WHERE host_process = %s AND enabled"
+            " ORDER BY agent_id",
+            (host_process,),
         )
         rows = await cur.fetchall()
     return [_to_card(row) for row in rows]
