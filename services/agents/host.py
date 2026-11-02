@@ -30,7 +30,9 @@ from starlette.routing import Route
 
 from services.agents import sweeper
 from services.agents.consumer import graph as consumer_graph
+from services.agents.grocery import handler as grocery_handler
 from services.agents.household import graph as household_graph
+from services.agents.restaurant import handler as restaurant_handler
 from services.common import db, directory, runs
 from services.common import logging as app_logging
 from services.common.config import get_settings
@@ -66,6 +68,8 @@ Backlog = dict[str, dict[str, Any]]
 HANDLERS: dict[str, ClassHandler] = {
     "consumer": consumer_graph.handle,
     "household": household_graph.handle,
+    "grocery": grocery_handler.handle,
+    "restaurant": restaurant_handler.handle,
 }
 
 _BACKLOG_SQL = """

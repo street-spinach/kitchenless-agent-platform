@@ -12,8 +12,9 @@ Each claimed `agent_messages` row runs as one **step**:
     at once (no retry, no poison rule), writes an `error` trace and sends `protocol_error`
     back to the sender (never to `system:*` or `channel:*`, never for a `protocol_error`).
 3.  Run the handler with no transaction or pooled connection held.
-4.  One short final transaction applies the `StepResult`: the conditional `quotes` and
-    `shortfalls` updates, the outgoing messages, the timer changes and the `processed` mark.
+4.  One short final transaction applies the `StepResult`: new `quotes` rows, the
+    conditional `quotes` and `shortfalls` updates, the outgoing messages, the timer
+    changes and the `processed` mark.
     A conditional update that changes no row rolls the whole step back, and it is retried.
 
 A handler that gives up on a message raises `StepFailed`: the row is `failed` at once with
@@ -52,6 +53,7 @@ __all__ = [
     "Inbound",
     "InjectedFailure",
     "Outgoing",
+    "QuoteInsert",
     "QuoteUpdate",
     "RunFinish",
     "ShortfallUpdate",
@@ -199,6 +201,27 @@ class QuoteUpdate:
 
 
 @dataclass(frozen=True)
+class QuoteInsert:
+    """A new `quotes` row: a seller's first offer, or a courier's quote (catalog rows 7, 14).
+
+    Inserted with `ON CONFLICT DO NOTHING`; a row that already exists rolls the step back
+    like a stale conditional update.
+    """
+
+    quote_id: UUID
+    run_id: UUID
+    order_id: UUID
+    conversation_id: UUID
+    seller_agent_id: str
+    buyer_agent_id: str
+    items: Any
+    total_minor: int
+    currency: str
+    expires_at: datetime
+    constraints: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class ShortfallUpdate:
     """`UPDATE shortfalls SET <set> WHERE shortfall_id AND status IN <expected>`."""
 
@@ -244,6 +267,7 @@ class StepResult:
 
     messages: Sequence[Outgoing] = ()
     timers: Sequence[TimerCreate | TimerCancel] = ()
+    quote_inserts: Sequence[QuoteInsert] = ()
     quote_updates: Sequence[QuoteUpdate] = ()
     shortfall_updates: Sequence[ShortfallUpdate] = ()
     finish: RunFinish | None = None
@@ -324,6 +348,29 @@ async def _apply_quote(conn: AsyncConnection, u: QuoteUpdate) -> None:
     )
     if cur.rowcount != 1:
         raise StaleUpdate(f"quote {u.quote_id} is not in {u.expected_status}/{u.expected_round}")
+
+
+async def _insert_quote(conn: AsyncConnection, q: QuoteInsert) -> None:
+    cur = await conn.execute(
+        "INSERT INTO quotes (quote_id, run_id, order_id, conversation_id, seller_agent_id,"
+        " buyer_agent_id, items, total_minor, currency, expires_at, constraints)"
+        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+        (
+            q.quote_id,
+            q.run_id,
+            q.order_id,
+            q.conversation_id,
+            q.seller_agent_id,
+            q.buyer_agent_id,
+            Jsonb(q.items),
+            q.total_minor,
+            q.currency,
+            q.expires_at,
+            Jsonb(dict(q.constraints)),
+        ),
+    )
+    if cur.rowcount != 1:
+        raise StaleUpdate(f"quote {q.quote_id} already exists")
 
 
 async def _apply_shortfall(conn: AsyncConnection, u: ShortfallUpdate) -> None:
@@ -460,6 +507,8 @@ class Consumer:
 
     async def _commit(self, conn: AsyncConnection, row: AgentMessageRow, r: StepResult) -> None:
         """The step's final transaction (architecture §4 step 3, agent-protocol §7)."""
+        for qi in r.quote_inserts:
+            await _insert_quote(conn, qi)
         for q in r.quote_updates:
             await _apply_quote(conn, q)
         for s in r.shortfall_updates:
