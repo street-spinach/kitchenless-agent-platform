@@ -1,6 +1,7 @@
 """Bounded choices for business agents: `choose()` (architecture §4, §6, item 22; issue #52)."""
 
 import asyncio
+import json
 from typing import Any
 
 from services.agents.common.model import (
@@ -220,3 +221,59 @@ def test_rationale_urls_stripped() -> None:
     text = "See https://evil.example/x?y=1 and www.spam.example now.\x07‮"
     assert check_rationale(text, {}) == "See and now."
     assert check_rationale("https://only.example/link", {}) is None
+
+
+# Choice-point guidance (agents §12 prompts 7-9, AG12, AG-A10) ---------------------------
+
+CONTRACT = (
+    "You make the 'choose_window' choice for a business. Answer with one JSON object "
+    '{"pick": <your pick>, "rationale": <at most 200 characters>}. The pick must '
+    'satisfy: {"one_of": ["w1", "w2"]}'
+)
+
+
+def _system_prompt(guidance: str | None) -> tuple[str, Choice]:
+    transport = ScriptedTransport([completion({"pick": "w2", "rationale": "Later is fine."})])
+    c = client(mode="real", transport=transport)
+    choice = asyncio.run(
+        c.choose(ctx(), "choose_window", OneOf(["w1", "w2"]), "w1", {}, guidance=guidance)
+    )
+    (_, body, _) = transport.calls[0]
+    (system, _user) = body["messages"]
+    assert system["role"] == "system"
+    return system["content"], choice
+
+
+def test_guidance_precedes_contract() -> None:
+    guidance = "Prefer the earliest window."
+
+    system, choice = _system_prompt(guidance)
+
+    assert system.startswith(guidance)
+    assert system == f"{guidance}\n\n{CONTRACT}"
+    # The answer format and the allowed set are still sent, and still enforced.
+    assert '{"pick": <your pick>, "rationale": <at most 200 characters>}' in system
+    assert json.dumps(OneOf(["w1", "w2"]).describe()) in system
+    assert choice == Choice("w2", "Later is fine.", "model", None)
+
+
+def test_no_guidance_prompt_unchanged() -> None:
+    system, _ = _system_prompt(None)
+
+    assert system == CONTRACT
+
+
+def test_guidance_ignored_in_stub_mode() -> None:
+    seen: list[Any] = []
+
+    def stub(inputs: Any, default: Any, *, out_of_bounds: bool = False) -> ModelResult:
+        seen.append(inputs)
+        return stub_answer(default, "Stub.")
+
+    c = client(stubs={"choose_window": stub})
+    choice = asyncio.run(
+        c.choose(ctx(), "choose_window", OneOf(["w1"]), "w1", {"a": 1}, guidance="ignored")
+    )
+
+    assert seen == [{"a": 1}]
+    assert choice.value == "w1"

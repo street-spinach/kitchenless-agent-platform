@@ -627,15 +627,20 @@ class ModelClient:
         allowed: Allowed,
         default: Any,
         inputs: Mapping[str, Any],
+        guidance: str | None = None,
     ) -> Choice:
-        """A bounded choice at `point`. Never raises; writes one `decision` row."""
+        """A bounded choice at `point`. Never raises; writes one `decision` row.
+
+        `guidance` (agents §12, prompts 7-9) goes before the unchanged contract text in the
+        real-mode system prompt; stub mode ignores it.
+        """
         template = TEMPLATES.get(point, _DEFAULT_TEMPLATE)
         choice = Choice(default, template, "rule_default", "model_unavailable")
         model_pick: Any = None
         cols: dict[str, Any] = {}
         try:
             choice, model_pick, cols = await self._choose(
-                ctx, point, allowed, default, inputs, template
+                ctx, point, allowed, default, inputs, template, guidance
             )
         except Exception:
             log.exception("choose(%s) failed; using the rule default", point)
@@ -666,6 +671,7 @@ class ModelClient:
         default: Any,
         inputs: Mapping[str, Any],
         template: str,
+        guidance: str | None = None,
     ) -> tuple[Choice, Any, dict[str, Any]]:
         def fallback(reason: str) -> Choice:
             return Choice(default, template, "rule_default", reason)
@@ -684,7 +690,7 @@ class ModelClient:
                 result = stub(inputs, default, out_of_bounds=out_of_bounds)
         else:
             try:
-                result = await self._choose_real(point, allowed, inputs)
+                result = await self._choose_real(point, allowed, inputs, guidance)
             except TimeoutError:
                 return fallback("timeout"), None, {"model": self._settings.model_business_name}
             except InvalidOutput:
@@ -721,7 +727,11 @@ class ModelClient:
         return Choice(pick, text, "model", None), pick, cols
 
     async def _choose_real(
-        self, point: str, allowed: Allowed, inputs: Mapping[str, Any]
+        self,
+        point: str,
+        allowed: Allowed,
+        inputs: Mapping[str, Any],
+        guidance: str | None = None,
     ) -> ModelResult:
         s = self._settings
         if not s.model_base_url:
@@ -731,6 +741,8 @@ class ModelClient:
             '{"pick": <your pick>, "rationale": <at most 200 characters>}. The pick must '
             f"satisfy: {json.dumps(allowed.describe(), default=str)}"
         )
+        if guidance:
+            system = f"{guidance}\n\n{system}"
         body = {
             "model": s.model_business_name,
             "max_tokens": BUSINESS_MAX_TOKENS,

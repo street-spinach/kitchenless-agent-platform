@@ -29,6 +29,7 @@ from typing import Any, Protocol
 from uuid import UUID
 
 from services.agents.common.model import Allowed, Choice, OneOf
+from services.agents.delivery.prompts import GUIDANCE
 from services.common import ids, mcp_client
 from services.common.config import get_settings
 from services.common.consumer import Inbound, Outgoing, QuoteInsert, StepFailed, StepResult
@@ -87,6 +88,7 @@ class Chooser(Protocol):
         allowed: Allowed,
         default: Any,
         inputs: Mapping[str, Any],
+        guidance: str | None = None,
     ) -> Choice: ...
 
 
@@ -263,6 +265,7 @@ class DeliveryHandler:
                 "price_minor": price,
                 "allowed": allowed.describe(),
             },
+            guidance=GUIDANCE["choose_window"],
         )
         # Code decides: a pick outside the allowed set gives the rule default.
         window = choice.value if allowed.check(choice.value) else default

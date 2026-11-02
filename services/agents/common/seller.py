@@ -54,6 +54,7 @@ from decimal import Decimal
 from typing import Any, Protocol
 from uuid import UUID
 
+from services.agents.common import seller_prompts
 from services.agents.common.model import (
     TEMPLATES,
     Actions,
@@ -225,6 +226,7 @@ class Chooser(Protocol):
         allowed: Allowed,
         default: Any,
         inputs: Mapping[str, Any],
+        guidance: str | None = None,
     ) -> Choice: ...
 
 
@@ -529,6 +531,7 @@ class SellerHandler:
             allowed,
             default,
             self._inputs(step, rules, allowed),
+            guidance=seller_prompts.guidance("rank_substitutes", self.area),
         )
         picks = choice.value if allowed.check(choice.value) else default
 
@@ -665,6 +668,7 @@ class SellerHandler:
             allowed,
             default,
             self._inputs(step, rules, allowed),
+            guidance=seller_prompts.guidance("respond_to_counter", self.area),
         )
         # Code decides: an answer outside the allowed set gives the rule default.
         pick = choice.value if allowed.check(choice.value) else default
@@ -956,6 +960,7 @@ class SellerHandler:
             allowed,
             default,
             self._inputs(step, rules, allowed),
+            guidance=seller_prompts.guidance("rank_substitutes", self.area),
         )
         # Code decides: a pick outside the allowed set gives the rule default.
         picks = choice.value if allowed.check(choice.value) else default
