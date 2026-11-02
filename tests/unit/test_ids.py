@@ -101,6 +101,8 @@ def test_shortfall_id_one_per_order() -> None:
     assert ids.shortfall_id(ORDER) != ids.shortfall_id(uuid4())
     sf = ids.shortfall_id(ORDER)
     assert ids.shortfall_conversation_id(sf) == uuid5(sf, "conversation")
+    assert ids.shortfall_closed_id(sf) == uuid5(sf, "shortfall_closed")
+    assert ids.shortfall_closed_id(sf) != ids.shortfall_conversation_id(sf)
 
 
 def test_order_status_id_one_per_order_state() -> None:

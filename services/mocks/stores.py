@@ -10,7 +10,8 @@ Everything works over the `mock_*` rows of one card and one `env` (the call's). 
 A SKU's available quantity is `mock_stock.qty` (0 without a row), or 0 while an
 `out_of_stock` event names it. `place_order` decrements `mock_stock.qty` conditionally, in
 the same transaction as the `mock_orders` insert, and is idempotent on `idempotency_key`:
-a replay returns the stored order and decrements nothing.
+a replay returns the stored order and decrements nothing. `amend_order` replaces the
+stored order's lines and total after a shortfall (agent-protocol P27).
 
 Search applies the exact filters (allergen codes, diet codes, stock, zone and price) and
 then ranks by `ts_rank` over the item's `search` tsvector (§5 "Search").
@@ -300,6 +301,43 @@ class MockShop:
             except _Replay:
                 return await self._stored(conn, idempotency_key)
         return self._result(idempotency_key, "placed", body)
+
+    async def amend_order(
+        self,
+        *,
+        external_order_id: str,
+        lines: Sequence[Mapping[str, Any]],
+        currency: str,
+    ) -> dict[str, Any]:
+        """Replace the placed order's lines and total in its `mock_orders` body.
+
+        The row is the one `place_order` stored under its key (`external_order_id`). Stock
+        is not changed. An order of another card or `env` raises `adapter_4xx`.
+        """
+        wanted = [(str(i["sku"]), _whole_qty(i["qty"]), int(i["unit_minor"])) for i in lines]
+        async with db.get_pool().connection() as conn:
+            await self._events(conn, "amend_order")
+            async with conn.transaction():
+                cur = await conn.execute(
+                    "SELECT body FROM mock_orders WHERE external_order_id = %s"
+                    " AND env = %s AND agent_id = %s FOR UPDATE",
+                    (external_order_id, self.env, self.agent_id),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    raise AdapterFailure(INVALID_REQUEST, retryable=False)
+                body = {
+                    **row[0],
+                    "lines": [{"sku": s, "qty": q, "unit_minor": u} for s, q, u in wanted],
+                    "total_minor": sum(q * u for _, q, u in wanted),
+                    "currency": currency,
+                }
+                cur = await conn.execute(
+                    "UPDATE mock_orders SET body = %s WHERE external_order_id = %s RETURNING state",
+                    (Jsonb(body), external_order_id),
+                )
+                (state,) = await cur.fetchone() or (None,)
+        return self._result(external_order_id, state, body)
 
     @staticmethod
     def _per_sku(wanted: Sequence[tuple[str, int, int]]) -> dict[str, int]:
