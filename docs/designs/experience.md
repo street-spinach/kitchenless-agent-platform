@@ -1,7 +1,7 @@
 # Kitchenless experience: WhatsApp, the /me pages, onboarding, reminders and the owner app
 
 *   **Author:** madushankaf
-*   **Status:** In Review
+*   **Status:** Approved
 *   **Date:** 2026-11-03
 *   **Path:** `docs/designs/experience.md`
 *   **Issue:** #271
