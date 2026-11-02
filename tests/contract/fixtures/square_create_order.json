@@ -1,0 +1,211 @@
+{
+  "case": "create_order",
+  "request": {
+    "body": {
+      "idempotency_key": "d9caf458-228b-48ea-a8db-3eec1ef8fe61",
+      "order": {
+        "fulfillments": [
+          {
+            "pickup_details": {
+              "recipient": {
+                "display_name": "11111111-1111-4111-8111-111111111111"
+              },
+              "schedule_type": "ASAP"
+            },
+            "state": "PROPOSED",
+            "type": "PICKUP"
+          }
+        ],
+        "line_items": [
+          {
+            "base_price_money": {
+              "amount": 399,
+              "currency": "USD"
+            },
+            "name": "Oat milk 1L",
+            "note": "MOCK-OAT-MILK",
+            "quantity": "2"
+          },
+          {
+            "base_price_money": {
+              "amount": 550,
+              "currency": "USD"
+            },
+            "name": "Sourdough loaf",
+            "note": "MOCK-SOURDOUGH",
+            "quantity": "1"
+          }
+        ],
+        "location_id": "LOCATION_ID",
+        "reference_id": "11111111-1111-4111-8111-111111111111"
+      }
+    },
+    "method": "POST",
+    "path": "/orders"
+  },
+  "response": {
+    "body": {
+      "order": {
+        "created_at": "2026-11-02T06:42:50.875Z",
+        "fulfillments": [
+          {
+            "pickup_details": {
+              "recipient": {
+                "display_name": "11111111-1111-4111-8111-111111111111"
+              },
+              "schedule_type": "ASAP"
+            },
+            "state": "PROPOSED",
+            "type": "PICKUP",
+            "uid": "034qStPAvofkFJLLdjiyUS"
+          }
+        ],
+        "id": "GGQIhiXSyLM6WiH2qE1nukSVBEFZY",
+        "line_items": [
+          {
+            "base_price_money": {
+              "amount": 399,
+              "currency": "USD"
+            },
+            "gross_sales_money": {
+              "amount": 798,
+              "currency": "USD"
+            },
+            "item_type": "ITEM",
+            "name": "Oat milk 1L",
+            "note": "MOCK-OAT-MILK",
+            "quantity": "2",
+            "total_card_surcharge_money": {
+              "amount": 0,
+              "currency": "USD"
+            },
+            "total_discount_money": {
+              "amount": 0,
+              "currency": "USD"
+            },
+            "total_money": {
+              "amount": 798,
+              "currency": "USD"
+            },
+            "total_service_charge_money": {
+              "amount": 0,
+              "currency": "USD"
+            },
+            "total_tax_money": {
+              "amount": 0,
+              "currency": "USD"
+            },
+            "uid": "V61wzGw0nE1AD5Y9Z692kB",
+            "variation_total_price_money": {
+              "amount": 798,
+              "currency": "USD"
+            }
+          },
+          {
+            "base_price_money": {
+              "amount": 550,
+              "currency": "USD"
+            },
+            "gross_sales_money": {
+              "amount": 550,
+              "currency": "USD"
+            },
+            "item_type": "ITEM",
+            "name": "Sourdough loaf",
+            "note": "MOCK-SOURDOUGH",
+            "quantity": "1",
+            "total_card_surcharge_money": {
+              "amount": 0,
+              "currency": "USD"
+            },
+            "total_discount_money": {
+              "amount": 0,
+              "currency": "USD"
+            },
+            "total_money": {
+              "amount": 550,
+              "currency": "USD"
+            },
+            "total_service_charge_money": {
+              "amount": 0,
+              "currency": "USD"
+            },
+            "total_tax_money": {
+              "amount": 0,
+              "currency": "USD"
+            },
+            "uid": "Mxp3gbB8FKQ3jFcbnCHHfD",
+            "variation_total_price_money": {
+              "amount": 550,
+              "currency": "USD"
+            }
+          }
+        ],
+        "location_id": "LOCATION_ID",
+        "net_amount_due_money": {
+          "amount": 1348,
+          "currency": "USD"
+        },
+        "net_amounts": {
+          "card_surcharge_money": {
+            "amount": 0,
+            "currency": "USD"
+          },
+          "discount_money": {
+            "amount": 0,
+            "currency": "USD"
+          },
+          "service_charge_money": {
+            "amount": 0,
+            "currency": "USD"
+          },
+          "tax_money": {
+            "amount": 0,
+            "currency": "USD"
+          },
+          "tip_money": {
+            "amount": 0,
+            "currency": "USD"
+          },
+          "total_money": {
+            "amount": 1348,
+            "currency": "USD"
+          }
+        },
+        "reference_id": "11111111-1111-4111-8111-111111111111",
+        "source": {
+          "name": "Sandbox for sq0idp-gh59C0CbcjRaYgB_svONHg"
+        },
+        "state": "OPEN",
+        "total_card_surcharge_money": {
+          "amount": 0,
+          "currency": "USD"
+        },
+        "total_discount_money": {
+          "amount": 0,
+          "currency": "USD"
+        },
+        "total_money": {
+          "amount": 1348,
+          "currency": "USD"
+        },
+        "total_service_charge_money": {
+          "amount": 0,
+          "currency": "USD"
+        },
+        "total_tax_money": {
+          "amount": 0,
+          "currency": "USD"
+        },
+        "total_tip_money": {
+          "amount": 0,
+          "currency": "USD"
+        },
+        "updated_at": "2026-11-02T06:42:50.875Z",
+        "version": 1
+      }
+    },
+    "status": 200
+  },
+  "square_version": "2025-01-23"
+}
