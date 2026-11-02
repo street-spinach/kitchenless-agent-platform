@@ -1,7 +1,7 @@
 # Kitchenless identity, delegation and authorization
 
 *   **Author:** madushankaf
-*   **Status:** Approved (2026-11-01, #100); amended 2026-11-01 (spike results, #111); amended 2026-11-02 (build-order fixes)
+*   **Status:** Approved (2026-11-01, #100); amended 2026-11-01 (spike results, #111); amended 2026-11-02 (build-order fixes); amended 2026-11-02 (agents, #186)
 *   **Date:** 2026-11-01
 *   **Path:** `docs/designs/identity-authz.md`
 *   **Builds on:** [architecture.md](architecture.md) (approved) and
@@ -807,6 +807,8 @@ A delegated token without the scope, a delegated token on a service tool, or a s
 token on a tool not listed for its client's agent class is refused with `scope_missing`. The adapters
 design (a future design) adds rows for new tools; a tool with no row is refused.
 
+*Amended 2026-11-02 (agents, #186):* rows added for the agents design's tools (agents.md §9, §10, AG-A6): `get_household_allergens` (delegated, household agent, `constraints:read`); `record_dislike` (delegated, consumer agent, new scope `constraints:write`, granted only to consumer agent clients); `get_household_rules` (delegated, household agent, no scope); `advance_turn` (delegated, household agent, `orders:place`); `set_take_turns` (service, `svc.api`).
+
 **Step 2: OpenFGA and the household argument.**
 *   Any tool argument named `household_id` that differs from the run's household is refused
     with `authz_denied` (I-CUJ 9).
@@ -825,6 +827,8 @@ design (a future design) adds rows for new tools; a tool with no row is refused.
 `ctx.authz_form` records which `get_constraints` form ran. A timeout or connection error
 raises `AuthzUnavailable` with reason `authz_unavailable`, not a refusal (I-G9).
 
+*Amended 2026-11-02 (agents, #186):* relations for the new tools: `get_household_allergens`, `get_household_rules` and `advance_turn` check `agent acts_for household`; `record_dislike(user_id)` checks `agent acts_for user:<user_id>`; `set_take_turns` has none (a service token from `svc.api`; limits check the approver) (AG-A6).
+
 **Step 3: limits.**
 *   For `authorize_spend`, in order:
     1.  allergens (unchanged);
@@ -834,6 +838,8 @@ raises `AuthzUnavailable` with reason `authz_unavailable`, not a refusal (I-G9).
 *   For `place_order`, the limits also require that the household agent of the order's
     household has an active grant; otherwise `grant_revoked` (I-D22).
 *   Business quotes are bounded by the card's floors, which the owner rule raises (§10).
+
+*Amended 2026-11-02 (agents, #186):* the `authorize_spend` limits become: allergens, budget (approval needed), child requester (`check_child_requester`: a run started by a `child` member needs an approval covering the total, I-D9), currency, `a2a_demo` (agents.md §9, AG-A8).
 
 **Scoping helper.**
 *   `scope.scoped(conn, scope)` returns a query wrapper. `scope` is a
@@ -855,6 +861,8 @@ raises `AuthzUnavailable` with reason `authz_unavailable`, not a refusal (I-G9).
     `links.use`, `tokens.validate`, `audit.record`, `fga.reconcile`, the seed,
     `services/common/runs.py`, the sweeper, `services/api/ingest.py`, the control routes and
     `evals/checks`.
+
+*Amended 2026-11-02 (agents, #186):* `household_rules` joins the list of household-owned tables (agents.md §10, AG-A6).
 
 ### 9. Money: one approval, two triggers
 
@@ -2142,6 +2150,8 @@ ALTER TABLE approvals ADD COLUMN limits text[] NOT NULL DEFAULT '{}'   -- 'band'
 *   **Proposed Changes**: No new branch. A `needs_approval` refusal follows the existing
     approval path, whichever limit triggered it.
 *   **Tests**: `safety-over-band-needs-approval` (I35).
+
+*Amended 2026-11-02 (agents, #186):* today's household graph ends the run on any `authorize_spend` refusal. The agents design adds the branch: `needs_approval` routes to `request_approval`, and a second refusal after a covering approval ends `error, approval_loop`. I31 relies on that branch (agents.md §7, AG-A7).
 
 ##### I32. `services/api/routes/app.py` (Create)
 

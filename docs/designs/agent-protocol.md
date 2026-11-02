@@ -2,7 +2,7 @@
 
 *   **Author:** madushankaf
 *   **Status:** Approved; amended 2026-11-01 (identity-authz I-P1: per-message tokens
-    closed); amended 2026-11-02 (adapters, #146)
+    closed); amended 2026-11-02 (adapters, #146); amended 2026-11-02 (agents, #186)
 *   **Date:** 2026-10-31
 *   **Path:** `docs/designs/agent-protocol.md`
 *   **Builds on:** `docs/designs/architecture.md` (approved; amended 2026-10-31, commit
@@ -440,6 +440,8 @@ Every message is one `agent_messages` row. The envelope is its columns:
 
 Old code that receives an unknown `type` sends `protocol_error {code: unknown_type}`. Old
 sweeper code skips timer kinds it does not know and leaves them `pending`.
+
+*Amended 2026-11-02 (agents, #186):* `StartOrder` (messages 2 and 3) gains `scope: "household" | "solo"`, default `"household"`. The field is added with a default, so `schema_version` stays 1 (agents.md AG-A4).
 
 ### 5. Message catalog
 

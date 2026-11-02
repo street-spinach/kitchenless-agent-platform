@@ -4,7 +4,7 @@
 *   **Status:** Approved; amended 2026-10-31 (bounded model calls for business agents);
     amended 2026-10-31 (agent-protocol); amended 2026-10-31 (build step 1 ports and smoke);
     amended 2026-11-01 (MCP client contract); amended 2026-11-01 (identity-authz);
-    amended 2026-11-01 (tool_errors signature); amended 2026-11-02 (adapters, #146)
+    amended 2026-11-01 (tool_errors signature); amended 2026-11-02 (adapters, #146); amended 2026-11-02 (agents, #186)
 *   **Date:** 2026-10-31
 *   **Path:** `docs/designs/architecture.md`
 
@@ -265,6 +265,8 @@ Each goal has a test, an eval or a measurement in the Verification Plan.
         template.
     *   Group chats need an Official Business Account (brief D22).
     *   Until both are confirmed, the demo family uses one-to-one chats.
+
+    *Amended 2026-11-02 (agents, #186):* the agents design adds templates `off_topic_reply`, `dislike_saved`, `dislike_removed`, `dislike_not_removed`, `dislike_not_saved`, `take_turns_offer`, `take_turns_offer_off` and `take_turns_saved`, and makes `approval_request` neutral about the reason: "Your agent wants to spend {amount} and needs your approval. Approve?" (agents.md §11). The take-turns offer and approval messages need approved templates outside the 24-hour window.
 *   **Q6. DoorDash Drive webhook signing and status names.**
     *   The mapping in §8 assumes DoorDash Drive status names. Verify them against the
         sandbox in the adapters design.
@@ -628,6 +630,8 @@ outbox and marks the timer `done`.
 | `quote_round` | When the household agent sends quote requests (30 s), and when a seller sends courier quote requests (10 s) | Never; firing late is harmless | Send `quote_round_closed` to the agent named in `ref.to` |
 | `shortfall_expiry` | When the household agent opens a shortfall (due at its `reply_by`) | Never; the update is conditional | Close the shortfall if still `pending` and send `shortfall_closed {reason: timeout}` (agent-protocol §10) |
 
+*Amended 2026-11-02 (agents, #186):* business choice points pass their own guidance to `choose()`, placed before the existing contract text. Allowed sets, rule defaults and rationale rules are unchanged (agents.md §12, AG-A10 and AG-A11). In the household graph, code decides the counter and the offer; Spark writes only the explanation (agents.md §7, §11).
+
 ### 5. MCP servers and adapters
 
 `services/mcp/app.py` is one Starlette app. It mounts five MCP servers over streamable HTTP.
@@ -764,6 +768,8 @@ them.
     `milk`, `molluscs`, `mustard`, `tree_nuts`, `peanuts`, `sesame`, `soy`, `sulphites`.
 *   **Diets:** `vegetarian`, `vegan`, `pescatarian`, `halal`, `kosher`, `keto`,
     `high_protein`.
+
+*Amended 2026-11-02 (agents, #186):* the household MCP server gains five guarded tools: `get_household_allergens`, `record_dislike`, `get_household_rules`, `advance_turn` and `set_take_turns` (agents.md §9, §10). Each runs every guard step through `run_guarded`.
 
 ### 6. Model client
 
@@ -913,6 +919,8 @@ check.
     to `gs://<GCS_BACKUP_BUCKET>/pg/<date>/`, keeping 7 days. That costs a few cents a month.
 *   Restore: `pg_restore --clean -d <db>` from the chosen date, then `make up`.
 *   Neo4j is rebuilt by `make seed`.
+
+*Amended 2026-11-02 (agents, #186):* `/panel/reset` also deletes `eval` households' learned dislikes (`member_constraints` rows with `source = 'learned'`) and their `household_rules` rows (agents.md AG-A12). Migration `0012_agents.sql` adds the `household_rules` table and a CHECK that learned rows are dislikes only.
 
 ### 8. Weekly grocery order: end-to-end flow
 
@@ -1930,6 +1938,8 @@ and values; none of these may be renamed or dropped.
         number in the payload. It returns `None` when the text fails, and `choose()` then
         uses the template.
 
+*Amended 2026-11-02 (agents, #186):* `choose(ctx, point, allowed, default, inputs, guidance=None)`. When given, the guidance is placed before the existing system prompt text; stub mode ignores it (agents.md AG-A10, file 35).
+
 ##### 23. `services/common/mcp_client.py` (Create)
 
 *   **Type / Scope**: Python module.
@@ -2054,6 +2064,8 @@ and values; none of these may be renamed or dropped.
         "dinner" is classified as dinner; anything else that mentions food is a weekly
         order.
 
+*Amended 2026-11-02 (agents, #186):* `INTENTS` becomes `weekly_order`, `dinner`, `instant`, `dislike`, `off_topic`, `chat`. New nodes `refuse_off_topic` and `learn_dislike`; `instant` relays `start_dinner {kind: dinner, scope: solo}`; `reply_to_user` reads the member's constraints; the graph gets a trace sink. No node is renamed (agents.md §5, AG-A1).
+
 ##### 29. `services/agents/household/graph.py` and `services/agents/household/stubs.py` (Create)
 
 *   **Type / Scope**: LangGraph graph and stub decisions.
@@ -2090,6 +2102,8 @@ and values; none of these may be renamed or dropped.
     *   `stubs.py` chooses the cheapest valid offer and writes a fixed explanation. If that
         offer is over the remaining weekly budget, the stub first sends one `counter_offer`
         at 90% of its total, so evals exercise the store's `respond_to_counter` choice.
+
+*Amended 2026-11-02 (agents, #186):* `negotiate` and `choose_offer` decide in code: offers are ranked by items covered, then total; the household counters at most once (`HOUSEHOLD_MAX_COUNTERS = 1`, `MAX_COUNTER_ROUNDS` stays 2), at the remaining budget, only when the runner-up covers as many items. A `needs_approval` refusal at `authorize` routes to `request_approval`. Adds the solo dinner scope, dislike handling and take-turns in `finish` (agents.md §6–§10, AG-A2, AG-A3).
 
 ##### 30. `services/agents/grocery/handler.py`, `services/agents/restaurant/handler.py`, `services/agents/delivery/handler.py` (Create)
 
@@ -2137,6 +2151,8 @@ and values; none of these may be renamed or dropped.
             `idempotency_key(order_id, "book_delivery", self)`, then send `delivery_booked`
             to the seller and the household agent.
 
+*Amended 2026-11-02 (agents, #186):* the seller and delivery handlers pass per-choice-point guidance to `choose()` (agents.md §12, AG-A11).
+
 ##### 31. `services/agents/hello/main.py` (Modify)
 
 *   **Type / Scope**: Python module.
@@ -2178,6 +2194,8 @@ and values; none of these may be renamed or dropped.
         consumer agent.
 
     The webhook acknowledges once steps 1–6 have committed. None of them waits on an agent.
+
+*Amended 2026-11-02 (agents, #186):* a button payload `tt:<order_id>:on|off` is handled before the approval button: it starts a new `chat` run and calls `set_take_turns` with the service token (agents.md §10, AG-A9).
 
 ##### 34. `services/api/routes/whatsapp.py` (Create)
 
@@ -2347,6 +2365,8 @@ and values; none of these may be renamed or dropped.
     *   Each tool picks its adapter with `modes.adapter_for(vendor, ctx.modes)`.
 *   **Amended 2026-11-01 (identity-authz I-A1, I-A5, I-A10).** `request_approval` no longer trusts an agent-supplied approver or amount: the guard computes both (identity-authz §9). `get_constraints` has the household-agent form. `place_order` limits call `check_household_grant` (identity-authz I30, I39).
 
+*Amended 2026-11-02 (agents, #186):* the household server gains `get_household_allergens`, `record_dislike`, `get_household_rules`, `advance_turn` and `set_take_turns` (agents.md §9, §10, AG-A5).
+
 ##### 44. `services/mcp/<area>/adapters/*.py` (Create)
 
 *   **Type / Scope**: Adapter modules. Each area has one interface with a real and a mock
@@ -2450,6 +2470,8 @@ and values; none of these may be renamed or dropped.
     `shortfalls`, `sim_outbound` by eval phone, and the `mock_stock_rows("eval")` re-seed).
 *   *Amended 2026-11-02 (adapters, #146):* `inject_event` refuses a `shortfall` event whose order's run pinned
     the seller's vendor key to `real` (adapters.md §8).
+
+*Amended 2026-11-02 (agents, #186):* the reset list adds learned dislikes and `household_rules` rows of `eval` households, before `runs` (agents.md file 12, AG-A12).
 
 ##### 48. `services/mocks/panel.py` (Keep)
 
