@@ -62,9 +62,17 @@ async def sim_whatsapp(request: Request) -> JSONResponse:
     return JSONResponse({"run_id": None if run_id is None else str(run_id)})
 
 
+def _phone_param(raw: str | None) -> str | None:
+    """The E.164 `phone` query value. An unencoded `+` decodes to a space; E.164 has no
+    spaces, so a leading space can only be that `+`."""
+    if raw is not None and raw.startswith(" "):
+        return "+" + raw[1:]
+    return raw
+
+
 async def sim_outbox(request: Request) -> JSONResponse:
     """`?phone=&after_id=`: the phone's `sim_outbound` rows after `after_id`, oldest first."""
-    phone = request.query_params.get("phone")
+    phone = _phone_param(request.query_params.get("phone"))
     if not phone:
         return _error(400, "phone is required")
     try:

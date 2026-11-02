@@ -71,6 +71,10 @@ def test_sim_outbound_never_calls_graph_api(world: str) -> None:
 
     resp = w.client(world).get(f"/internal/sim/outbox?phone={w.MEMBER_PHONE}&after_id=0")
     assert [m["id"] for m in resp.json()["messages"]] == [row["id"]]
+    resp = w.client(world).get(
+        "/internal/sim/outbox", params={"phone": w.MEMBER_PHONE, "after_id": 0}
+    )  # the same phone with its `+` encoded as `%2B`
+    assert [m["id"] for m in resp.json()["messages"]] == [row["id"]]
     resp = w.client(world).get(f"/internal/sim/outbox?phone={w.MEMBER_PHONE}&after_id={row['id']}")
     assert resp.json()["messages"] == []
 
