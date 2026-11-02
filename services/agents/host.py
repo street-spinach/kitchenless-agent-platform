@@ -30,6 +30,7 @@ from starlette.routing import Route
 
 from services.agents import sweeper
 from services.agents.consumer import graph as consumer_graph
+from services.agents.delivery import handler as delivery_handler
 from services.agents.grocery import handler as grocery_handler
 from services.agents.household import graph as household_graph
 from services.agents.restaurant import handler as restaurant_handler
@@ -70,6 +71,7 @@ HANDLERS: dict[str, ClassHandler] = {
     "household": household_graph.handle,
     "grocery": grocery_handler.handle,
     "restaurant": restaurant_handler.handle,
+    "delivery": delivery_handler.handle,
 }
 
 _BACKLOG_SQL = """
