@@ -25,11 +25,10 @@ import yaml
 from psycopg.types.json import Jsonb
 
 from services.common import ids
+from services.seed import DATA_DIR, mock_stock_rows
 
-DATA_DIR = Path(__file__).parent / "data"
 ENVS = ("live", "eval", "all")
 CARD_VERSION_DEFAULT = "1.0.0"
-MOCK_STOCK_QTY = 100
 E164 = re.compile(r"^\+[1-9][0-9]{7,14}$")
 # Fictional numbers only (555-01xx). Real numbers come from the environment.
 FICTIONAL_PHONE = re.compile(r"^\+1555010[0-9]{4}$")
@@ -350,20 +349,13 @@ def _people_card(
 
 def _seed_mock_stock(conn: psycopg.Connection, data: dict[str, Any], envs: Iterable[str]) -> None:
     for env in envs:
-        for groups in (data["catalogs"], data["menus"]):
-            for agent_id, items in groups.items():
-                for item in items:
-                    _upsert(
-                        conn,
-                        "mock_stock",
-                        ["env", "agent_id", "sku"],
-                        {
-                            "env": env,
-                            "agent_id": agent_id,
-                            "sku": item["sku"],
-                            "qty": MOCK_STOCK_QTY,
-                        },
-                    )
+        for row_env, agent_id, sku, qty in mock_stock_rows(env, data):
+            _upsert(
+                conn,
+                "mock_stock",
+                ["env", "agent_id", "sku"],
+                {"env": row_env, "agent_id": agent_id, "sku": sku, "qty": qty},
+            )
 
 
 def seed(
