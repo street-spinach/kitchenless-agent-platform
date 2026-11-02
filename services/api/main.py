@@ -1,5 +1,6 @@
 """The `api` service (architecture item 32): `/health`, the reserved routes, the simulated
-WhatsApp routes, `/runs`, and the consumer that sends `whatsapp_out` messages.
+WhatsApp routes, `/runs`, the real WhatsApp webhook, and the consumer that sends
+`whatsapp_out` messages.
 
 Run with `python -m services.api.main`. It serves on port 8000.
 """
@@ -15,11 +16,12 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from services.api.connect import Connect, pool_connect
-from services.api.routes import internal, reserved, runs
-from services.api.whatsapp.sender import Sender
+from services.api.routes import internal, reserved, runs, whatsapp
+from services.api.whatsapp.sender import GraphSender, Sender
 from services.common import db
 from services.common import logging as app_logging
 from services.common import runs as common_runs
+from services.common.config import get_settings
 from services.common.consumer import consume_forever
 
 SERVICE = "api"
@@ -35,7 +37,13 @@ async def health(request: Request) -> JSONResponse:
 
 def create_app(connect: Connect = pool_connect) -> Starlette:
     app = Starlette(
-        routes=[Route("/health", health), *reserved.routes, *internal.routes, *runs.routes]
+        routes=[
+            Route("/health", health),
+            *reserved.routes,
+            *internal.routes,
+            *runs.routes,
+            *whatsapp.routes,
+        ]
     )
     app.state.connect = connect
     return app
@@ -52,7 +60,13 @@ async def serve() -> None:
         server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=PORT, log_config=None))
         stop = asyncio.Event()
         consumer = asyncio.create_task(
-            consume_forever(HOST, Sender(), finish_run=common_runs.finish, pool=pool, stop=stop)
+            consume_forever(
+                HOST,
+                Sender(send_real=GraphSender.from_settings(get_settings())),
+                finish_run=common_runs.finish,
+                pool=pool,
+                stop=stop,
+            )
         )
 
         async def stop_server() -> None:

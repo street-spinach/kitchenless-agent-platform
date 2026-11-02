@@ -3,24 +3,45 @@
 `dispatch` looks up the member's phone and its `channel_mode`:
 
 *   `sim`: insert the message into `sim_outbound`. The Graph API is never called.
-*   `real`: call `send_real`. The Graph API client, its retries and the 24-hour window
-    belong to #73; until then `send_real` raises, so the step fails and follows the
-    consumer's retry rules (it fails closed).
+*   `real`: call `send_real`. `main.py` passes `GraphSender`, which calls the Graph API
+    (issue #73): 3 attempts in total over about a minute, then `StepFailed`, so the row
+    becomes `failed` and the run is unaffected (§9). A `Sender` built without `send_real`
+    raises `RealSendUnavailable` (fails closed).
+
+The Graph API decides the 24-hour customer service window: a send outside it is refused
+there and counts as a failed attempt. Templates for that case are Q5 (experience design).
 
 A member with no phone has nothing to send to, and the message is dropped with a log line.
 """
 
+import asyncio
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
+import httpx
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from services.api.connect import Connect, pool_connect
-from services.common.consumer import Inbound, StepResult
+from services.common.config import Settings
+from services.common.consumer import Inbound, StepFailed, StepResult
 
-__all__ = ["RealSendUnavailable", "Sender", "not_built"]
+__all__ = [
+    "ATTEMPTS",
+    "GRAPH_URL",
+    "MAX_BUTTONS",
+    "RETRY_DELAYS_SECONDS",
+    "SEND_FAILED",
+    "TEXTS",
+    "UNRENDERABLE",
+    "WHERE",
+    "GraphSender",
+    "RealSendUnavailable",
+    "Sender",
+    "graph_payload",
+    "not_built",
+]
 
 log = logging.getLogger(__name__)
 
@@ -43,15 +64,117 @@ SendReal = Callable[[str, dict[str, Any]], Awaitable[None]]
 
 
 class RealSendUnavailable(RuntimeError):
-    """The real WhatsApp sender is not built yet (#73)."""
+    """This `Sender` was built without a real sender."""
 
 
 async def not_built(phone: str, body: dict[str, Any]) -> None:
-    raise RealSendUnavailable("the real WhatsApp sender is not built yet (#73)")
+    raise RealSendUnavailable("this Sender has no real WhatsApp sender")
+
+
+# --- the Graph API ----------------------------------------------------------------------
+
+GRAPH_URL = "https://graph.facebook.com/v21.0"
+WHERE = "whatsapp.sender"
+SEND_FAILED = "whatsapp_send_failed"
+UNRENDERABLE = "whatsapp_unrenderable"
+# 3 attempts in total over about a minute (architecture §9). With an 8 s request timeout
+# the worst case is 3 x 8 + 40 = 64 s, inside the consumer's 75 s step cap.
+ATTEMPTS = 3
+RETRY_DELAYS_SECONDS: tuple[float, ...] = (20.0, 20.0)
+REQUEST_TIMEOUT_SECONDS = 8.0
+# WhatsApp reply buttons: at most 3 per message.
+MAX_BUTTONS = 3
+
+# The texts the designs fix (architecture §9 and item 33). Other wording belongs to the
+# agents and experience designs, which add their templates here; until then such a
+# message is not sent (fails closed).
+TEXTS: dict[str, str] = {
+    "retry_prompt": "I couldn't finish this. Reply *retry* to try again.",
+    "media_not_supported": "Photos and voice notes aren't supported yet.",
+}
+
+
+def graph_payload(phone: str, body: dict[str, Any]) -> dict[str, Any] | None:
+    """The Graph API `/messages` request for a `whatsapp_out` body, or `None` if its
+    template has no text here or it has more buttons than WhatsApp allows."""
+    text = TEXTS.get(body.get("template", ""))
+    buttons = body.get("buttons") or []
+    if text is None or len(buttons) > MAX_BUTTONS:
+        return None
+    base: dict[str, Any] = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": phone.removeprefix("+"),
+    }
+    if not buttons:
+        return {**base, "type": "text", "text": {"body": text}}
+    replies = [
+        {"type": "reply", "reply": {"id": b["payload"], "title": b["title"]}} for b in buttons
+    ]
+    return {
+        **base,
+        "type": "interactive",
+        "interactive": {"type": "button", "body": {"text": text}, "action": {"buttons": replies}},
+    }
+
+
+class GraphSender:
+    """`send_real` for `channel_mode='real'` phones: one Graph API text or button message.
+
+    An attempt that times out, fails to connect or gets a non-2xx response is retried after
+    `RETRY_DELAYS_SECONDS`; after `ATTEMPTS` it raises `StepFailed`. A body that cannot be
+    rendered, or missing credentials, raise `StepFailed` without calling the Graph API.
+    """
+
+    def __init__(
+        self,
+        token: str,
+        phone_number_id: str,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        delays: Sequence[float] = RETRY_DELAYS_SECONDS,
+    ) -> None:
+        self._token = token
+        self._phone_number_id = phone_number_id
+        self._transport = transport
+        self._sleep = sleep
+        self._delays = tuple(delays)
+
+    @classmethod
+    def from_settings(cls, settings: Settings) -> "GraphSender":
+        return cls(settings.whatsapp_token or "", settings.whatsapp_phone_number_id or "")
+
+    async def __call__(self, phone: str, body: dict[str, Any]) -> None:
+        payload = graph_payload(phone, body)
+        if payload is None:
+            raise StepFailed(WHERE, UNRENDERABLE)
+        if not self._token or not self._phone_number_id:
+            raise StepFailed(WHERE, SEND_FAILED)
+        url = f"{GRAPH_URL}/{self._phone_number_id}/messages"
+        headers = {"Authorization": f"Bearer {self._token}"}
+        async with httpx.AsyncClient(
+            timeout=REQUEST_TIMEOUT_SECONDS, transport=self._transport
+        ) as client:
+            for attempt in range(1, ATTEMPTS + 1):
+                try:
+                    response = await client.post(url, json=payload, headers=headers)
+                    if response.is_success:
+                        return
+                    error = f"HTTP {response.status_code}"
+                except httpx.HTTPError as exc:
+                    error = type(exc).__name__
+                log.warning("whatsapp send attempt %s/%s failed: %s", attempt, ATTEMPTS, error)
+                if attempt < ATTEMPTS:
+                    await self._sleep(self._delays[min(attempt, len(self._delays)) - 1])
+        raise StepFailed(WHERE, SEND_FAILED)
+
+
+# --- the handler ------------------------------------------------------------------------
 
 
 class Sender:
-    """`consume_forever("api", Sender())` delivers every `whatsapp_out` message."""
+    """`consume_forever("api", Sender(...))` delivers every `whatsapp_out` message."""
 
     def __init__(self, connect: Connect = pool_connect, send_real: SendReal = not_built) -> None:
         self._connect = connect
