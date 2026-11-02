@@ -13,6 +13,10 @@ if [ ! -f /swapfile ]; then
 fi
 swapon --show | grep -q /swapfile || swapon /swapfile
 
+# Prefer RAM over swap (architecture item 60), persisted across reboots.
+echo 'vm.swappiness=10' > /etc/sysctl.d/60-spinach-swappiness.conf
+sysctl -q -w vm.swappiness=10
+
 # Docker Engine with the Compose plugin, make and git.
 if ! command -v docker >/dev/null; then
   apt-get update -q
@@ -58,5 +62,14 @@ if [ ! -d /opt/app/.git ]; then
     log "clone failed; add the deploy key to the repo, then reset the VM"
   fi
 fi
+
+# Nightly Postgres backup at 03:00 as deploy (architecture §7 "Backups"). The file is rewritten
+# on every boot, so re-running never duplicates the entry. Output goes to syslog.
+cat > /etc/cron.d/spinach-backup <<'CRON'
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+0 3 * * * deploy /opt/app/infra/vm/backup.sh 2>&1 | logger -t spinach-backup
+CRON
+chmod 644 /etc/cron.d/spinach-backup
 
 log "done"
