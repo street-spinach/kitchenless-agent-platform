@@ -7,18 +7,41 @@ permissions:
   contents: write
   issues: write
   pull-requests: write
+  packages: write
 concurrency:
   group: deploy
   cancel-in-progress: false
 
 jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      APP_IMAGE: ghcr.io/street-spinach/kitchenless-app
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build and push app image
+        run: |
+          docker build -f infra/Dockerfile -t "$APP_IMAGE:${{ github.sha }}" .
+          docker push "$APP_IMAGE:${{ github.sha }}"
+
   deploy:
+    needs: build
+    # Run even when build fails, so the existing failure step reports it. The SSH and
+    # deploy steps also require a successful build, so a failed build never deploys.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        if: ${{ !cancelled() }}
 
       - name: Configure SSH
+        if: needs.build.result == 'success'
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.VM_SSH_KEY }}" > ~/.ssh/id_ed25519
@@ -26,6 +49,7 @@ jobs:
           ssh-keyscan -H "${{ secrets.VM_HOST }}" >> ~/.ssh/known_hosts
 
       - name: Deploy and verify on VM
+        if: needs.build.result == 'success'
         shell: bash
         run: |
           set -o pipefail
