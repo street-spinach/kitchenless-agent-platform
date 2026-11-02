@@ -659,3 +659,115 @@ def test_take_turns_setup_removed(world: dict[str, Any]) -> None:
         with pytest.raises(control.ControlRefused):
             _reset_setup(pg, {"take_turns": value})
     assert rules() == [(LIVE, True)]
+
+
+_PANTRY_SQL = (
+    "SELECT household_id, item, pantry_item, kind, delta, unit, source, order_id, run_id,"
+    " round(extract(epoch FROM now() - ts) / 3600)::int"
+    " FROM pantry_events WHERE source = 'eval_setup' ORDER BY event_id"
+)
+
+
+def _pantry_rows(conn: psycopg.Connection) -> list[tuple[Any, ...]]:
+    return [tuple(r) for r in conn.execute(_PANTRY_SQL).fetchall()]
+
+
+@pytest.mark.db
+def test_pantry_setup_key(world: dict[str, Any]) -> None:
+    """Pantry §8, PG9: one `pantry_events` row per entry, in list order, for the case's
+    household only, with `delta 0`, `unit 'each'`, `source 'eval_setup'` and a back-dated
+    `ts`. Other households (eval or live) get no rows."""
+    pg = world["pg"]
+    setup = {
+        "pantry": {
+            "milk": [{"kind": "add", "age_hours": 30}, {"kind": "verify", "age_hours": 2}],
+            "eggs": [{"kind": "out", "age_hours": 0}],
+            "rice": [{"kind": "add", "age_hours": 5.5}, {"kind": "add", "age_hours": 5.5}],
+        }
+    }
+    hid = "us-2-eval"
+    _reset_setup(pg, setup, hid)
+    with psycopg.connect(pg) as conn:
+        rows = _pantry_rows(conn)
+        ages = conn.execute(
+            "SELECT extract(epoch FROM now() - ts) / 3600 FROM pantry_events"
+            " WHERE source = 'eval_setup' ORDER BY event_id"
+        ).fetchall()
+        # Other eval households have no rows; live rows from the fixture are not setup rows.
+        others = _count(
+            conn,
+            "SELECT count(*) FROM pantry_events WHERE household_id <> %s"
+            " AND (source = 'eval_setup' OR household_id IN"
+            " (SELECT household_id FROM households WHERE env = 'eval'))",
+            hid,
+        )
+    assert rows == [
+        (hid, "milk", "milk", "add", 0, "each", "eval_setup", None, None, 30),
+        (hid, "milk", "milk", "verify", 0, "each", "eval_setup", None, None, 2),
+        (hid, "eggs", "eggs", "out", 0, "each", "eval_setup", None, None, 0),
+        (hid, "rice", "rice", "add", 0, "each", "eval_setup", None, None, 6),
+        (hid, "rice", "rice", "add", 0, "each", "eval_setup", None, None, 6),
+    ]
+    assert [round(float(a[0]), 1) for a in ages][3:] == [5.5, 5.5]
+    assert others == 0
+
+
+@pytest.mark.db
+def test_pantry_setup_refusals(world: dict[str, Any]) -> None:
+    """Pantry §8: each `ControlRefused` case names the item and writes nothing."""
+    pg = world["pg"]
+    ok = {"kind": "add", "age_hours": 1}
+    older_last = [{"kind": "add", "age_hours": 1}, {"kind": "add", "age_hours": 2}]
+    bad: list[tuple[Any, str]] = [
+        ({"caviar": [ok]}, "caviar"),  # not in the vocabulary
+        ({"whole milk": [ok]}, "whole milk"),  # an alias is not a vocabulary name
+        ({"milk": [{"kind": "gone", "age_hours": 1}]}, "milk"),  # kind not in KINDS
+        ({"eggs": [{"kind": "add", "age_hours": -1}]}, "eggs"),  # below 0
+        ({"eggs": [{"kind": "add", "age_hours": "1"}]}, "eggs"),  # not a number
+        ({"eggs": [{"kind": "add", "age_hours": True}]}, "eggs"),  # bool is not a number
+        ({"eggs": [{"kind": "add", "age_hours": float("nan")}]}, "eggs"),  # not finite
+        ({"bread": older_last}, "bread"),  # age_hours increases
+        ({"rice": [{"kind": "add", "age_hours": 1, "qty": 2}]}, "rice"),  # extra key
+        ({"rice": [{"kind": "add"}]}, "rice"),  # missing key
+        ({"pasta": []}, "pasta"),  # empty list
+        ({"pasta": ok}, "pasta"),  # not a list
+    ]
+    for value, item in bad:
+        with pytest.raises(control.ControlRefused, match=item):
+            _reset_setup(pg, {"pantry": value})
+    with pytest.raises(control.ControlRefused):
+        _reset_setup(pg, {"pantry": [["milk", ok]]})
+    with psycopg.connect(pg) as conn:
+        assert _pantry_rows(conn) == []
+
+
+@pytest.mark.db
+def test_pantry_setup_undone_by_reset(world: dict[str, Any]) -> None:
+    """Pantry PG9: the next reset removes the setup rows, keeps live pantry rows, and leaves
+    the eval households with no pantry events."""
+    pg = world["pg"]
+    with psycopg.connect(pg) as conn:
+        conn.execute(
+            "INSERT INTO pantry_events (household_id, item, delta, unit, source)"
+            " VALUES (%s, 'live-sku', 1, 'each', 'delivery')",
+            (LIVE,),
+        )
+    live_sql = "SELECT count(*) FROM pantry_events WHERE household_id = %s"
+    with psycopg.connect(pg) as conn:
+        live_before = _count(conn, live_sql, LIVE)
+    assert live_before >= 1
+    eval_sql = (
+        "SELECT count(*) FROM pantry_events WHERE household_id IN"
+        " (SELECT household_id FROM households WHERE env = 'eval')"
+    )
+
+    _reset_setup(pg, {"pantry": {"bananas": [{"kind": "add", "age_hours": 1}]}})
+    with psycopg.connect(pg) as conn:
+        assert len(_pantry_rows(conn)) == 1
+        assert _count(conn, live_sql, EVAL) == 1
+
+    _reset(pg, "eval")
+    with psycopg.connect(pg) as conn:
+        assert _pantry_rows(conn) == []
+        assert _count(conn, eval_sql) == 0
+        assert _count(conn, live_sql, LIVE) == live_before
