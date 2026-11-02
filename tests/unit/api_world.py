@@ -71,7 +71,13 @@ def _card(conn: psycopg.Connection, agent_id: str, cls: str, owner: str, host: s
 
 
 def patch_settings(monkeypatch: pytest.MonkeyPatch) -> None:
-    env = {"SERVICE_NAME": "migrate", "DATABASE_URL": "x", "LOG_LEVEL": "info"}
+    env = {
+        "SERVICE_NAME": "migrate",
+        "DATABASE_URL": "x",
+        "LOG_LEVEL": "info",
+        "OPENFGA_PRESHARED_KEY": "x",
+        "OPENFGA_API_URL": "x",
+    }
     settings = Settings.from_env(env)
     monkeypatch.setattr(runs, "get_settings", lambda: settings)
     monkeypatch.setattr(modes, "get_settings", lambda: settings)

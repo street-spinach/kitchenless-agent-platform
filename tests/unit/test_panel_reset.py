@@ -44,7 +44,13 @@ MOCK_TABLES = ("mock_orders", "mock_deliveries", "mock_events")
 
 @pytest.fixture(autouse=True)
 def _settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
-    env = {"SERVICE_NAME": "migrate", "DATABASE_URL": "x", "LOG_LEVEL": "info"}
+    env = {
+        "SERVICE_NAME": "migrate",
+        "DATABASE_URL": "x",
+        "LOG_LEVEL": "info",
+        "OPENFGA_PRESHARED_KEY": "x",
+        "OPENFGA_API_URL": "x",
+    }
     settings = Settings.from_env(env)
     monkeypatch.setattr(control, "get_settings", lambda: settings)
     return settings

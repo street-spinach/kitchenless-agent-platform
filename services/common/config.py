@@ -119,18 +119,16 @@ class Settings:
     )
     kc_onboarding_secret: str | None = _id({"api"}, sources=LIVE)
     session_secret: str | None = _id({"api"})
-    # Required on every app service and migrate once OpenFGA authentication is on (I16c,
-    # build step 4); optional until then.
-    openfga_preshared_key: str | None = _id(SERVICES, None)
+    # Required on every app service and migrate: OpenFGA authentication is on (I16c).
+    openfga_preshared_key: str | None = _id(SERVICES)
 
     neo4j_uri: str | None = _var({"mcp", "testrunner"})
     neo4j_user: str | None = _var({"mcp", "testrunner"})
     neo4j_password: str | None = _var({"mcp", "testrunner"})
 
-    openfga_api_url: str | None = _var({"mcp", "testrunner"})
-    # Retired by identity-authz §13 in the PR that removes its last reader
-    # (services/identity/fga.py, build step 4).
-    openfga_store_id: str | None = _var({"mcp", "testrunner"})
+    # migrate writes the model (authz/apply.py, I8). The store and model ids are read from
+    # fga_models; OPENFGA_STORE_ID is retired (identity-authz §13).
+    openfga_api_url: str | None = _var({"mcp", "migrate", "testrunner"})
 
     # Internal Keycloak URL; required only live (identity-authz §13).
     keycloak_url: str | None = _id({"agents", "api", "mcp"}, sources=LIVE)
