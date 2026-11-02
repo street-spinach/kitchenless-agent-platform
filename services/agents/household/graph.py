@@ -146,6 +146,8 @@ MAX_REQUOTES = 1
 # The delivery window asked for in `quote_request`, relative to the request.
 WINDOW_START = timedelta(hours=2)
 WINDOW_END = timedelta(hours=4)
+# A solo (instant) order's window (agents §8): now+30 min to now+90 min.
+SOLO_WINDOW = (timedelta(minutes=30), timedelta(minutes=90))
 HOUSEHOLD_SERVER = "household"
 WHATSAPP = "channel:whatsapp"
 SELLER_CLASS = {"grocery": "grocery", "dinner": "restaurant"}
@@ -159,6 +161,7 @@ SCOPES: Mapping[str, tuple[str, ...]] = {
     "get_pantry": ("pantry:read",),
     "get_budget": (),
     "get_household_rules": (),  # agents §10: no scope
+    "get_household_allergens": ("constraints:read",),  # agents §6, AG-A6
     "set_order_state": ("orders:place",),
     "open_shortfall": (),
     "get_shortfall": (),
@@ -691,6 +694,7 @@ def build_graph(
         return {
             "order_id": order_id,
             "kind": kind,
+            "scope": state["body"].get("scope") or HOUSEHOLD_SCOPE,
             "take_turns": bool(rules.get("take_turns")),
             "turn_index": _int(rules.get("turn_index"), 0),
             "approver_user_id": str(approver) if approver else None,
@@ -700,11 +704,28 @@ def build_graph(
         members = dict(await load_members(state["household_id"]))
         if not members:
             raise ValueError(f"household {state['household_id']} has no consumer agents")
+        update: dict[str, Any] = {}
+        if (state.get("scope") or HOUSEHOLD_SCOPE) == SOLO_SCOPE:
+            # A solo order asks only the requester and filters on every member's
+            # allergens (agents §6, §8).
+            requester = state.get("user_id")
+            members = {a: u for a, u in members.items() if requester and u == requester}
+            if not members:
+                # Fails closed: the requester has no consumer agent in the household.
+                raise ValueError(f"the requester has no consumer agent in {state['household_id']}")
+            found = await tool(state, "get_household_allergens", {})
+            update["household_allergens"] = sorted(str(a) for a in found.get("allergens") or [])
         out = list(state.get("outgoing") or [])
         for agent_id, user_id in sorted(members.items()):
             body = {"order_id": state["order_id"], "user_id": user_id}
             _add(state, out, agent_id, "constraints_request", body)
-        return {"members": members, "constraints": {}, "phase": CONSTRAINTS, "outgoing": out}
+        return {
+            **update,
+            "members": members,
+            "constraints": {},
+            "phase": CONSTRAINTS,
+            "outgoing": out,
+        }
 
     async def record_constraints(state: HouseholdState) -> dict[str, Any]:
         body = state["body"]
@@ -801,6 +822,9 @@ def build_graph(
         # `household_allergens` is set only for a solo order (agents §6).
         allergens.update(state.get("household_allergens") or [])
         now = clock()
+        start, end = WINDOW_START, WINDOW_END
+        if (state.get("scope") or HOUSEHOLD_SCOPE) == SOLO_SCOPE:
+            start, end = SOLO_WINDOW
         body = {
             "order_id": state["order_id"],
             "kind": state["kind"],
@@ -809,8 +833,8 @@ def build_graph(
             "currency": state["currency"],
             "zone_id": state["zone_id"],
             "window": {
-                "start": (now + WINDOW_START).isoformat(),
-                "end": (now + WINDOW_END).isoformat(),
+                "start": (now + start).isoformat(),
+                "end": (now + end).isoformat(),
             },
             "reply_by": (now + timedelta(seconds=QUOTE_ROUND_SECONDS)).isoformat(),
         }
@@ -1019,6 +1043,19 @@ def build_graph(
                 conversation,
             )
         except ToolRefused as refused:
+            if refused.reason == "needs_approval":
+                # Agents §7, AG10: ask the approver unless an approval already covers the
+                # total; a refusal after such an approval is a loop and ends the run.
+                approved = state.get("approved_minor")
+                if approved is None or approved < offer["total_minor"]:
+                    await trace_decision(state, "authorize", "needs_approval_routed")
+                    return {"decision": "request_approval"}
+                await trace_decision(state, "authorize", "approval_loop")
+                return {
+                    "decision": "approval_loop",
+                    "phase": DONE,
+                    "finish": {"status": "error", "reason": "approval_loop"},
+                }
             # Fails closed: nothing is accepted (architecture §9, guard refusal).
             return {"phase": DONE, "finish": {"status": "error", "reason": refused.reason}}
         body = {
@@ -1331,6 +1368,9 @@ def build_graph(
     def after_approval(state: HouseholdState) -> str:
         return "authorize" if state.get("decision") == "authorize" else "send"
 
+    def after_authorize(state: HouseholdState) -> str:
+        return "request_approval" if state.get("decision") == "request_approval" else "send"
+
     def after_rejected(state: HouseholdState) -> str:
         return {
             "requote": "requote",
@@ -1405,7 +1445,7 @@ def build_graph(
     g.add_edge("no_offers", "send")
     g.add_edge("request_approval", "send")
     g.add_conditional_edges("approval_decided", after_approval, ["authorize", "send"])
-    g.add_edge("authorize", "send")
+    g.add_conditional_edges("authorize", after_authorize, ["request_approval", "send"])
     g.add_conditional_edges(
         "track_order", after_track, ["record_delivery", "finish", "shortfall_result", "send"]
     )

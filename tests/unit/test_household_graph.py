@@ -73,6 +73,8 @@ class FakeHousehold:
             "turn_index": 0,
             "approver_user_id": APPROVER,
         }
+        # What `get_household_allergens` returns: every member's allergens (agents §6).
+        self.allergens: list[str] = []
 
     def of(self, tool: str) -> list[dict[str, Any]]:
         return [c for c in self.calls if c["tool"] == tool]
@@ -86,6 +88,8 @@ class FakeHousehold:
             return {"order_id": args["order_id"], "kind": args["kind"], "state": "draft"}
         if tool == "get_household_rules":
             return dict(self.rules)
+        if tool == "get_household_allergens":
+            return {"allergens": list(self.allergens)}
         if tool == "get_pantry":
             return {"household_id": "us-1", "items": [{"item": "rice", "qty": 2, "unit": "each"}]}
         if tool == "set_order_state":
