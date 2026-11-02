@@ -7,7 +7,7 @@ import psycopg
 import pytest
 
 import services.seed as seed_pkg
-from services.common import directory, ids, modes, vendors
+from services.common import directory, ids, modes, pantry, vendors
 from services.seed import __main__ as seed_mod
 
 # Seeded tables, with the columns that vary between runs left out.
@@ -169,6 +169,62 @@ def test_display_names_carry_simulated() -> None:
         "delivery:doordash-us", "delivery:mock-us", "grocery:kroger-us",
         "grocery:mock-us", "restaurant:mock-us",
     ]  # fmt: skip
+
+
+def test_catalog_pantry_items_in_vocabulary() -> None:
+    data = seed_mod.load_data()
+    vocab = pantry.load_vocabulary()
+    links = {i["sku"]: i.get("pantry_item") for items in data["catalogs"].values() for i in items}
+    # Pantry design P3: every catalog SKU names its vocabulary item.
+    assert links == {
+        "MOCK-MILK-WHOLE": "milk", "MOCK-MILK-2PCT": "milk", "SQ-MILK-WHOLE": "milk",
+        "MOCK-MILK-ALMOND": "almond milk",
+        "MOCK-EGGS-12": "eggs", "SQ-EGGS-12": "eggs",
+        "MOCK-BREAD-WHEAT": "bread", "SQ-BREAD-WHITE": "bread",
+        "MOCK-BANANAS-2LB": "bananas", "SQ-BANANAS-2LB": "bananas",
+        "MOCK-APPLES-3LB": "apples",
+        "MOCK-CHICKEN-BREAST": "chicken breast",
+        "MOCK-RICE-2LB": "rice",
+        "MOCK-GRANOLA-NUT": "granola",
+        "SQ-PASTA-1LB": "pasta",
+        "SQ-ALMONDS-1LB": "almonds",
+    }  # fmt: skip
+    assert set(links.values()) <= set(vocab.names)
+
+    # The seed refuses a link to a name outside the vocabulary.
+    data["catalogs"]["grocery:mock-us"][0]["pantry_item"] = "oat milk"
+    with pytest.raises(seed_mod.SeedError, match="oat milk"):
+        seed_mod._validate(data)
+
+
+def test_vocabulary_rejects_duplicate_alias() -> None:
+    data = seed_mod.load_data()
+    entries = data["pantry_items"]
+    eggs = next(e for e in entries if e["name"] == "eggs")
+
+    eggs["aliases"] = [*eggs["aliases"], "whole milk"]  # already an alias of milk
+    with pytest.raises(seed_mod.SeedError, match="whole milk"):
+        seed_mod._validate(data)
+
+    eggs["aliases"] = ["egg", "milk"]  # another item's name
+    with pytest.raises(seed_mod.SeedError, match="milk"):
+        seed_mod._validate(data)
+
+    data["pantry_items"] = [*entries, {"name": "eggs", "aliases": [], "window_days": 7}]
+    eggs["aliases"] = ["egg"]
+    with pytest.raises(seed_mod.SeedError, match="eggs"):
+        seed_mod._validate(data)
+
+
+@pytest.mark.db
+def test_seed_writes_catalog_pantry_item(pg: str) -> None:
+    with psycopg.connect(pg) as conn:
+        seed_mod.seed(conn, "eval")
+        rows = dict(conn.execute("SELECT sku, pantry_item FROM catalog_items").fetchall())
+    assert rows["MOCK-MILK-2PCT"] == "milk"
+    assert rows["MOCK-MILK-ALMOND"] == "almond milk"
+    assert rows["SQ-PASTA-1LB"] == "pasta"
+    assert None not in rows.values()
 
 
 @pytest.mark.db
