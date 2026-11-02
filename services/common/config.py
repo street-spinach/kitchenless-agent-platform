@@ -86,6 +86,8 @@ class Settings:
     square_retail_token: str | None = _var({"mcp"})
     square_restaurant_token: str | None = _var({"mcp"})
     square_env: str | None = _var({"mcp"})
+    square_retail_location_id: str | None = _var({"mcp"})
+    square_restaurant_location_id: str | None = _var({"mcp"})
 
     kroger_client_id: str | None = _var({"mcp", "testrunner"})
     kroger_client_secret: str | None = _var({"mcp", "testrunner"})
