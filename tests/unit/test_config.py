@@ -91,6 +91,22 @@ def test_protocol_settings_have_their_defaults() -> None:
     assert s.agents_url == "http://localhost:8003"
 
 
+def test_square_location_ids_read_for_mcp() -> None:
+    env = {
+        **full_env("mcp"),
+        "SQUARE_RETAIL_LOCATION_ID": "L-RETAIL",
+        "SQUARE_RESTAURANT_LOCATION_ID": "L-KITCHEN",
+    }
+    s = Settings.from_env(env)
+    assert (s.square_retail_location_id, s.square_restaurant_location_id) == (
+        "L-RETAIL",
+        "L-KITCHEN",
+    )
+    assert config.Settings.__dataclass_fields__["square_retail_location_id"].metadata[
+        "services"
+    ] == {"mcp"}
+
+
 def test_env_overrides_default_and_bad_number_raises() -> None:
     env = {**full_env("agents"), "OFFER_TTL_SECONDS": "60", "MODE_FORCE_MOCK": "1"}
     s = Settings.from_env(env)
