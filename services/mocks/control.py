@@ -17,6 +17,7 @@ The route checks that belong to `/panel/events` (the order is `courier_booked` a
 shortfall, then `shortfall_detected`) are agent-protocol P31 and live in the route.
 """
 
+import math
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -25,7 +26,7 @@ from uuid import UUID
 from psycopg import AsyncConnection
 from psycopg.types.json import Jsonb
 
-from services.common import directory, dislikes, ids, vendors
+from services.common import directory, dislikes, ids, pantry, vendors
 from services.common.config import get_settings
 from services.common.modes import ALWAYS_MOCK, VENDORS
 from services.seed import household_envs, mock_stock_rows, seeded_limits
@@ -237,11 +238,76 @@ async def _undo_take_turns(
     )
 
 
+_PANTRY_ENTRY_KEYS = frozenset({"kind", "age_hours"})
+
+
+def _check_pantry(name: str, value: Mapping[Any, Any]) -> dict[str, list[dict[str, Any]]]:
+    """`{vocabulary name: [{kind, age_hours}]}` (pantry design §8). Each list is non-empty,
+    each `kind` is in `pantry.KINDS`, each `age_hours` is a finite number >= 0 and does not
+    increase along the list, so the last entry is both the latest and the newest event."""
+    vocab = pantry.load_vocabulary()
+    checked: dict[str, list[dict[str, Any]]] = {}
+    for item, entries in value.items():
+        if not isinstance(item, str) or item not in vocab.window_days:
+            raise ControlRefused(f"setup key {name!r}: {item!r} is not a pantry vocabulary name")
+        if not isinstance(entries, list) or not entries:
+            raise ControlRefused(f"setup key {name!r}: {item} needs a non-empty list of events")
+        previous: float | None = None
+        rows: list[dict[str, Any]] = []
+        for entry in entries:
+            if not isinstance(entry, Mapping) or set(entry) != _PANTRY_ENTRY_KEYS:
+                raise ControlRefused(
+                    f"setup key {name!r}: {item} events must have exactly kind and age_hours"
+                )
+            kind, age = entry["kind"], entry["age_hours"]
+            if not isinstance(kind, str) or kind not in pantry.KINDS:
+                raise ControlRefused(f"setup key {name!r}: {item} has an unknown kind {kind!r}")
+            if (
+                isinstance(age, bool)
+                or not isinstance(age, int | float)
+                or not math.isfinite(age)
+                or age < 0
+            ):
+                raise ControlRefused(f"setup key {name!r}: {item} age_hours must be a number >= 0")
+            if previous is not None and age > previous:
+                raise ControlRefused(f"setup key {name!r}: {item} age_hours must not increase")
+            previous = age
+            rows.append({"kind": kind, "age_hours": float(age)})
+        checked[item] = rows
+    return checked
+
+
+async def _apply_pantry(
+    conn: AsyncConnection, household_id: str, value: Mapping[str, list[dict[str, Any]]]
+) -> None:
+    checked = _check_pantry("pantry", value)
+    for item, entries in checked.items():
+        for entry in entries:
+            cur = await conn.execute(
+                "INSERT INTO pantry_events"
+                " (household_id, item, pantry_item, kind, delta, unit, source, ts)"
+                " SELECT household_id, %s, %s, %s, 0, 'each', 'eval_setup',"
+                " now() - make_interval(secs => %s)"
+                " FROM households WHERE household_id = %s AND env = 'eval'",
+                (item, item, entry["kind"], entry["age_hours"] * 3600, household_id),
+            )
+            if cur.rowcount != 1:
+                raise ControlRefused(f"pantry: {household_id} is not an eval household")
+
+
+async def _undo_pantry(
+    conn: AsyncConnection, household_id: str, seeded: Mapping[str, int | None]
+) -> None:
+    # The reset's deletes already removed every eval household's pantry_events (pantry §8).
+    return
+
+
 SETUP_KEYS: Mapping[str, SetupKey] = {
     "budget_minor": SetupKey(int, _apply_budget, _undo_budget),
     "per_order_minor": SetupKey(int, _apply_per_order, _undo_per_order),
     "dislikes": SetupKey(dict, _apply_dislikes, _undo_dislikes, _check_dislikes),
     "take_turns": SetupKey(bool, _apply_take_turns, _undo_take_turns),
+    "pantry": SetupKey(dict, _apply_pantry, _undo_pantry, _check_pantry),
 }
 
 
