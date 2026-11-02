@@ -13,6 +13,8 @@ from starlette.testclient import TestClient
 
 from services.api import main as api
 from services.api.routes import panel
+from services.common import ids
+from services.common.config import Settings
 from services.common.protocol.schemas import SCHEMAS
 from services.mocks import control
 from tests.unit import api_world as w
@@ -58,6 +60,10 @@ CONSTRAINTS = {
 @pytest.fixture(autouse=True)
 def _settings(monkeypatch: pytest.MonkeyPatch) -> None:
     w.patch_settings(monkeypatch)
+    settings = Settings.from_env(
+        {"SERVICE_NAME": "migrate", "DATABASE_URL": "x", "LOG_LEVEL": "info"}
+    )
+    monkeypatch.setattr(control, "get_settings", lambda: settings)
 
 
 @pytest.fixture
@@ -222,17 +228,13 @@ def test_runs_live_refuses_bad_query(query: str) -> None:
     assert resp.status_code == 400
 
 
-def test_shortfall_event_is_refused_until_its_route_checks_exist() -> None:
+@pytest.mark.parametrize("params", [None, {}, {"order_id": "not-a-uuid", "skus": ["SKU-1"]}])
+def test_shortfall_event_without_order_id_refused_before_db(params: Any) -> None:
     resp = _client_no_db().post(
         "/panel/events",
-        json={
-            "env": "eval",
-            "kind": "shortfall",
-            "target_agent_id": STORE,
-            "params": {"order_id": str(ORDER_ID), "skus": ["SKU-1"]},
-        },
+        json={"env": "eval", "kind": "shortfall", "target_agent_id": STORE, "params": params},
     )
-    assert resp.status_code == 501
+    assert resp.status_code == 400
 
 
 def test_message_detail_unknown_id_is_404() -> None:
@@ -475,6 +477,129 @@ def test_events_writes_mock_event(world: str) -> None:
         "/panel/events", json={"env": "eval", "kind": "nope", "target_agent_id": STORE}
     )
     assert bad.status_code == 400
+
+
+# --- shortfall event (agent-protocol §10 and P31, #70) --------------------------------------
+
+
+def _order(pg: str, state: str) -> uuid.UUID:
+    """A run with a `grocery` order from STORE in `state`, lines SKU-1 and SKU-2."""
+    address_ref = uuid.uuid4()
+    order_id = uuid.uuid4()
+    with psycopg.connect(pg) as conn:
+        conn.execute(
+            "INSERT INTO agent_cards (agent_id, class, owner_ref, region, host_process)"
+            " VALUES (%s, 'grocery', 'org:mock-store-us', 'us', 'agents')"
+            " ON CONFLICT DO NOTHING",
+            (STORE,),
+        )
+        conn.execute(
+            "INSERT INTO household_addresses"
+            " (address_ref, household_id, line1, city, region, postal_code, country)"
+            " VALUES (%s, %s, '1 Main St', 'Cincinnati', 'OH', '45202', 'US')",
+            (address_ref, w.HOUSEHOLD_ID),
+        )
+        run_id = _run(conn)
+        conn.execute(
+            "INSERT INTO orders (order_id, run_id, household_id, kind, state, seller_agent_id,"
+            " total_minor, currency, address_ref)"
+            " VALUES (%s, %s, %s, 'grocery', %s, %s, 1050, 'USD', %s)",
+            (order_id, run_id, w.HOUSEHOLD_ID, state, STORE, address_ref),
+        )
+        for line, sku in ((1, "SKU-1"), (2, "SKU-2")):
+            conn.execute(
+                "INSERT INTO order_items (order_id, line, sku, name, qty, unit_minor)"
+                " VALUES (%s, %s, %s, 'Item', 1, 525)",
+                (order_id, line, sku),
+            )
+    return order_id
+
+
+def _shortfall_event(
+    pg: str, order_id: uuid.UUID, skus: list[str] | None = None, target: str = STORE
+) -> Any:
+    return w.client(pg).post(
+        "/panel/events",
+        json={
+            "env": "eval",
+            "kind": "shortfall",
+            "target_agent_id": target,
+            "params": {"order_id": str(order_id), "skus": skus or ["SKU-1"]},
+        },
+    )
+
+
+def _detected(pg: str) -> list[dict[str, Any]]:
+    return w.query(pg, "SELECT * FROM agent_messages WHERE type = 'shortfall_detected'")
+
+
+@db
+@pytest.mark.parametrize(
+    "state", ["placed", "authorized", "in_delivery", "delivered", "failed", "cancelled"]
+)
+def test_shortfall_event_refused_unless_courier_booked(world: str, state: str) -> None:
+    order_id = _order(world, state)
+    resp = _shortfall_event(world, order_id)
+    assert resp.status_code == 409
+    assert w.query(world, "SELECT * FROM mock_events") == []
+    assert _detected(world) == []
+
+
+@db
+def test_shortfall_event_sends_shortfall_detected_to_the_seller(world: str) -> None:
+    order_id = _order(world, "courier_booked")
+    resp = _shortfall_event(world, order_id, ["SKU-1", "SKU-2"])
+    assert resp.status_code == 200
+    event_id = resp.json()["event_id"]
+    [event] = w.query(world, "SELECT * FROM mock_events WHERE id = %s", event_id)
+    assert (event["env"], event["kind"], event["target_agent_id"]) == ("eval", "shortfall", STORE)
+    assert event["params"] == {"order_id": str(order_id), "skus": ["SKU-1", "SKU-2"]}
+    [msg] = _detected(world)
+    source = ids.mock_event_id(event_id)
+    assert msg["message_id"] == ids.message_id(source, 0)
+    assert (msg["from_agent"], msg["to_agent"]) == ("system:api", STORE)
+    assert msg["body"] == {
+        "order_id": str(order_id),
+        "skus": ["SKU-1", "SKU-2"],
+        "event_id": str(source),
+    }
+
+
+@db
+def test_second_shortfall_event_refused(world: str) -> None:
+    order_id = _order(world, "courier_booked")
+    assert _shortfall_event(world, order_id).status_code == 200
+
+    # Before the household opens the `shortfalls` row: the first event already counts.
+    assert _shortfall_event(world, order_id, ["SKU-2"]).status_code == 409
+
+    # After the row exists.
+    with psycopg.connect(world) as conn:
+        conn.execute(
+            "INSERT INTO shortfalls (shortfall_id, run_id, order_id, seller_agent_id, lines,"
+            " due_at) SELECT %s, run_id, order_id, seller_agent_id, '[]', now()"
+            " FROM orders WHERE order_id = %s",
+            (ids.shortfall_id(order_id), order_id),
+        )
+        conn.execute("DELETE FROM mock_events")
+    assert _shortfall_event(world, order_id, ["SKU-2"]).status_code == 409
+    assert len(_detected(world)) == 1
+
+
+@db
+@pytest.mark.parametrize(
+    ("skus", "target"),
+    [
+        (["SKU-9"], STORE),
+        (["SKU-1", "SKU-2", "SKU-1"], STORE),
+        (["SKU-1"], "grocery:other"),
+    ],
+)
+def test_shortfall_event_refuses_bad_params(world: str, skus: list[str], target: str) -> None:
+    order_id = _order(world, "courier_booked")
+    assert _shortfall_event(world, order_id, skus, target).status_code == 400
+    assert w.query(world, "SELECT * FROM mock_events") == []
+    assert _detected(world) == []
 
 
 @db

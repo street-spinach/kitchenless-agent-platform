@@ -135,6 +135,20 @@ def timer_event_id(timer_id: int) -> UUID:
     return uuid5(NS_TIMER, f"timer|{timer_id}")
 
 
+NS_MOCK_EVENT = UUID("49943078-fba5-4410-82da-863b077c4a2e")
+
+
+def mock_event_id(event_id: int) -> UUID:
+    """The source event id of a `mock_events` row (agent-protocol §10, P31).
+
+    It is `shortfall_detected.event_id`; the message `api` sends for the event uses
+    `message_id(mock_event_id(event_id), 0)`.
+    """
+    if not isinstance(event_id, int) or isinstance(event_id, bool):
+        raise ValueError(f"event_id must be an int, got {event_id!r}")
+    return uuid5(NS_MOCK_EVENT, f"mock_event|{event_id}")
+
+
 NS_INBOUND = UUID("1663a266-7392-4541-9021-c5940595acec")
 
 
