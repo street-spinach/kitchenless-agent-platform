@@ -1,0 +1,622 @@
+{
+ "source": "Hand-built subset shaped after Open Food Facts product fields; one product per seeded SKU",
+ "products": [
+  {
+   "sku": "MOCK-MILK-WHOLE",
+   "name": "Whole milk 1 gal",
+   "category": "milk",
+   "diets": [
+    "vegetarian"
+   ],
+   "ingredients": [
+    {
+     "name": "whole milk",
+     "allergens": [
+      "milk"
+     ],
+     "contains": []
+    }
+   ]
+  },
+  {
+   "sku": "MOCK-MILK-2PCT",
+   "name": "Reduced fat 2% milk 1 gal",
+   "category": "milk",
+   "diets": [
+    "vegetarian"
+   ],
+   "ingredients": [
+    {
+     "name": "reduced fat milk",
+     "allergens": [
+      "milk"
+     ],
+     "contains": []
+    }
+   ]
+  },
+  {
+   "sku": "MOCK-MILK-ALMOND",
+   "name": "Almond milk 64 oz",
+   "category": "milk",
+   "diets": [
+    "vegetarian",
+    "vegan"
+   ],
+   "ingredients": [
+    {
+     "name": "almond milk",
+     "allergens": [],
+     "contains": [
+      {
+       "name": "water",
+       "allergens": []
+      },
+      {
+       "name": "almonds",
+       "allergens": [
+        "tree_nuts"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "sku": "MOCK-EGGS-12",
+   "name": "Large eggs 12 ct",
+   "category": "eggs",
+   "diets": [
+    "vegetarian"
+   ],
+   "ingredients": [
+    {
+     "name": "eggs",
+     "allergens": [
+      "eggs"
+     ],
+     "contains": []
+    }
+   ]
+  },
+  {
+   "sku": "MOCK-BREAD-WHEAT",
+   "name": "Whole wheat bread",
+   "category": "bread",
+   "diets": [
+    "vegetarian",
+    "vegan"
+   ],
+   "ingredients": [
+    {
+     "name": "whole wheat flour",
+     "allergens": [
+      "gluten"
+     ],
+     "contains": []
+    },
+    {
+     "name": "water",
+     "allergens": [],
+     "contains": []
+    },
+    {
+     "name": "yeast",
+     "allergens": [],
+     "contains": []
+    },
+    {
+     "name": "salt",
+     "allergens": [],
+     "contains": []
+    }
+   ]
+  },
+  {
+   "sku": "MOCK-BANANAS-2LB",
+   "name": "Bananas 2 lb",
+   "category": "fruit",
+   "diets": [
+    "vegetarian",
+    "vegan"
+   ],
+   "ingredients": [
+    {
+     "name": "bananas",
+     "allergens": [],
+     "contains": []
+    }
+   ]
+  },
+  {
+   "sku": "MOCK-APPLES-3LB",
+   "name": "Gala apples 3 lb",
+   "category": "fruit",
+   "diets": [
+    "vegetarian",
+    "vegan"
+   ],
+   "ingredients": [
+    {
+     "name": "apples",
+     "allergens": [],
+     "contains": []
+    }
+   ]
+  },
+  {
+   "sku": "MOCK-CHICKEN-BREAST",
+   "name": "Chicken breast 1.5 lb",
+   "category": "poultry",
+   "diets": [
+    "high_protein"
+   ],
+   "ingredients": [
+    {
+     "name": "chicken",
+     "allergens": [],
+     "contains": []
+    }
+   ]
+  },
+  {
+   "sku": "MOCK-RICE-2LB",
+   "name": "Long grain white rice 2 lb",
+   "category": "rice",
+   "diets": [
+    "vegetarian",
+    "vegan"
+   ],
+   "ingredients": [
+    {
+     "name": "rice",
+     "allergens": [],
+     "contains": []
+    }
+   ]
+  },
+  {
+   "sku": "MOCK-GRANOLA-NUT",
+   "name": "Maple pecan granola",
+   "category": "cereal",
+   "diets": [
+    "vegetarian"
+   ],
+   "ingredients": [
+    {
+     "name": "oats",
+     "allergens": [],
+     "contains": []
+    },
+    {
+     "name": "pecans",
+     "allergens": [
+      "tree_nuts"
+     ],
+     "contains": []
+    },
+    {
+     "name": "maple syrup",
+     "allergens": [],
+     "contains": []
+    }
+   ]
+  },
+  {
+   "sku": "SQ-MILK-WHOLE",
+   "name": "Whole milk 1 gal",
+   "category": "milk",
+   "diets": [
+    "vegetarian"
+   ],
+   "ingredients": [
+    {
+     "name": "whole milk",
+     "allergens": [
+      "milk"
+     ],
+     "contains": []
+    }
+   ]
+  },
+  {
+   "sku": "SQ-EGGS-12",
+   "name": "Large eggs 12 ct",
+   "category": "eggs",
+   "diets": [
+    "vegetarian"
+   ],
+   "ingredients": [
+    {
+     "name": "eggs",
+     "allergens": [
+      "eggs"
+     ],
+     "contains": []
+    }
+   ]
+  },
+  {
+   "sku": "SQ-BREAD-WHITE",
+   "name": "White sandwich bread",
+   "category": "bread",
+   "diets": [
+    "vegetarian",
+    "vegan"
+   ],
+   "ingredients": [
+    {
+     "name": "wheat flour",
+     "allergens": [
+      "gluten"
+     ],
+     "contains": []
+    },
+    {
+     "name": "water",
+     "allergens": [],
+     "contains": []
+    },
+    {
+     "name": "yeast",
+     "allergens": [],
+     "contains": []
+    },
+    {
+     "name": "salt",
+     "allergens": [],
+     "contains": []
+    }
+   ]
+  },
+  {
+   "sku": "SQ-BANANAS-2LB",
+   "name": "Bananas 2 lb",
+   "category": "fruit",
+   "diets": [
+    "vegetarian",
+    "vegan"
+   ],
+   "ingredients": [
+    {
+     "name": "bananas",
+     "allergens": [],
+     "contains": []
+    }
+   ]
+  },
+  {
+   "sku": "SQ-PASTA-1LB",
+   "name": "Penne pasta 1 lb",
+   "category": "pasta",
+   "diets": [
+    "vegetarian",
+    "vegan"
+   ],
+   "ingredients": [
+    {
+     "name": "durum wheat semolina",
+     "allergens": [
+      "gluten"
+     ],
+     "contains": []
+    }
+   ]
+  },
+  {
+   "sku": "SQ-ALMONDS-1LB",
+   "name": "Roasted almonds 1 lb",
+   "category": "nuts",
+   "diets": [
+    "vegetarian",
+    "vegan"
+   ],
+   "ingredients": [
+    {
+     "name": "almonds",
+     "allergens": [
+      "tree_nuts"
+     ],
+     "contains": []
+    },
+    {
+     "name": "salt",
+     "allergens": [],
+     "contains": []
+    }
+   ]
+  },
+  {
+   "sku": "MOCK-DIN-CHICKEN-RICE",
+   "name": "Grilled chicken and rice bowl",
+   "category": "dinner",
+   "diets": [
+    "high_protein"
+   ],
+   "ingredients": [
+    {
+     "name": "chicken",
+     "allergens": [],
+     "contains": []
+    },
+    {
+     "name": "rice",
+     "allergens": [],
+     "contains": []
+    },
+    {
+     "name": "vegetables",
+     "allergens": [],
+     "contains": []
+    }
+   ]
+  },
+  {
+   "sku": "MOCK-DIN-VEG-PASTA",
+   "name": "Vegetable penne",
+   "category": "dinner",
+   "diets": [
+    "vegetarian",
+    "vegan"
+   ],
+   "ingredients": [
+    {
+     "name": "penne pasta",
+     "allergens": [],
+     "contains": [
+      {
+       "name": "durum wheat semolina",
+       "allergens": [
+        "gluten"
+       ]
+      }
+     ]
+    },
+    {
+     "name": "tomato",
+     "allergens": [],
+     "contains": []
+    },
+    {
+     "name": "vegetables",
+     "allergens": [],
+     "contains": []
+    }
+   ]
+  },
+  {
+   "sku": "MOCK-DIN-PESTO-PASTA",
+   "name": "Pesto penne with pine nuts",
+   "category": "dinner",
+   "diets": [
+    "vegetarian"
+   ],
+   "ingredients": [
+    {
+     "name": "penne pasta",
+     "allergens": [],
+     "contains": [
+      {
+       "name": "durum wheat semolina",
+       "allergens": [
+        "gluten"
+       ]
+      }
+     ]
+    },
+    {
+     "name": "pesto",
+     "allergens": [],
+     "contains": [
+      {
+       "name": "basil",
+       "allergens": []
+      },
+      {
+       "name": "pine nuts",
+       "allergens": [
+        "tree_nuts"
+       ]
+      },
+      {
+       "name": "parmesan",
+       "allergens": [
+        "milk"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "sku": "MOCK-DIN-SALMON",
+   "name": "Baked salmon with greens",
+   "category": "dinner",
+   "diets": [
+    "pescatarian",
+    "high_protein"
+   ],
+   "ingredients": [
+    {
+     "name": "salmon",
+     "allergens": [
+      "fish"
+     ],
+     "contains": []
+    },
+    {
+     "name": "greens",
+     "allergens": [],
+     "contains": []
+    },
+    {
+     "name": "lemon",
+     "allergens": [],
+     "contains": []
+    }
+   ]
+  },
+  {
+   "sku": "MOCK-DIN-KIDS-MAC",
+   "name": "Kids mac and cheese",
+   "category": "dinner",
+   "diets": [
+    "vegetarian"
+   ],
+   "ingredients": [
+    {
+     "name": "macaroni",
+     "allergens": [
+      "gluten"
+     ],
+     "contains": []
+    },
+    {
+     "name": "cheese",
+     "allergens": [
+      "milk"
+     ],
+     "contains": []
+    },
+    {
+     "name": "milk",
+     "allergens": [
+      "milk"
+     ],
+     "contains": []
+    }
+   ]
+  },
+  {
+   "sku": "SQ-DIN-BURRITO",
+   "name": "Bean burrito",
+   "category": "dinner",
+   "diets": [
+    "vegetarian",
+    "vegan"
+   ],
+   "ingredients": [
+    {
+     "name": "tortilla",
+     "allergens": [
+      "gluten"
+     ],
+     "contains": []
+    },
+    {
+     "name": "beans",
+     "allergens": [],
+     "contains": []
+    },
+    {
+     "name": "rice",
+     "allergens": [],
+     "contains": []
+    },
+    {
+     "name": "salsa",
+     "allergens": [],
+     "contains": []
+    }
+   ]
+  },
+  {
+   "sku": "SQ-DIN-CHICKEN-SALAD",
+   "name": "Chicken salad",
+   "category": "dinner",
+   "diets": [
+    "high_protein"
+   ],
+   "ingredients": [
+    {
+     "name": "chicken",
+     "allergens": [],
+     "contains": []
+    },
+    {
+     "name": "greens",
+     "allergens": [],
+     "contains": []
+    },
+    {
+     "name": "dressing",
+     "allergens": [],
+     "contains": [
+      {
+       "name": "eggs",
+       "allergens": [
+        "eggs"
+       ]
+      },
+      {
+       "name": "oil",
+       "allergens": []
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "sku": "SQ-DIN-SATAY",
+   "name": "Chicken satay with cashew sauce",
+   "category": "dinner",
+   "diets": [
+    "high_protein"
+   ],
+   "ingredients": [
+    {
+     "name": "chicken",
+     "allergens": [],
+     "contains": []
+    },
+    {
+     "name": "cashew sauce",
+     "allergens": [],
+     "contains": [
+      {
+       "name": "cashews",
+       "allergens": [
+        "tree_nuts"
+       ]
+      },
+      {
+       "name": "soy sauce",
+       "allergens": [
+        "soy"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "sku": "SQ-DIN-PIZZA",
+   "name": "Margherita pizza",
+   "category": "dinner",
+   "diets": [
+    "vegetarian"
+   ],
+   "ingredients": [
+    {
+     "name": "wheat dough",
+     "allergens": [
+      "gluten"
+     ],
+     "contains": []
+    },
+    {
+     "name": "tomato",
+     "allergens": [],
+     "contains": []
+    },
+    {
+     "name": "mozzarella",
+     "allergens": [
+      "milk"
+     ],
+     "contains": []
+    }
+   ]
+  }
+ ]
+}

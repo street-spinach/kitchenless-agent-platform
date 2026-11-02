@@ -7,7 +7,7 @@ define allow_empty
 s=$$?; if [ $$s -eq 5 ]; then echo "No $(1) tests yet."; exit 0; fi; exit $$s
 endef
 
-.PHONY: up down lint test-unit test-contract smoke scenario eval-fast eval-full seed
+.PHONY: up down lint test-unit test-contract smoke scenario eval-fast eval-full seed seed-local
 
 up:
 	$(COMPOSE) up -d --build --remove-orphans --wait
@@ -40,6 +40,9 @@ eval-fast:
 eval-full:
 	$(COMPOSE) run --rm testrunner python -m evals.run --all
 
-# Placeholder until the mocks, catalog and knowledge graph exist.
+# SEED_ARGS, for example --env eval (architecture items 55 and 73).
 seed:
-	@echo "Nothing to seed yet."
+	$(COMPOSE) run --rm testrunner python -m services.seed $(SEED_ARGS)
+
+seed-local:
+	uv run python -m services.seed $(SEED_ARGS)

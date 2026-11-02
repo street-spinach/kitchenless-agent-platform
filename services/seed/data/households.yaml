@@ -1,0 +1,76 @@
+# Seeded households (architecture item 55, §3 launch roster; agent-protocol P34).
+# Phones here are fictional 555-01xx numbers. us-1's real numbers come from
+# SEED_US1_PHONES at seed time; no real number is ever committed (test_seed.py).
+# Member roles: the approver is `admin`; a child is `child`; everyone else `member`.
+
+defaults: &us
+  region: us
+  zone_id: us-oh-45202
+  timezone: America/New_York
+  currency: USD
+
+households:
+  - household_id: us-1
+    name: US household 1
+    env: live
+    <<: *us
+    weekly_budget_minor: 15000
+    address: &addr
+      line1: 100 Main Street
+      city: Cincinnati
+      region: OH
+      postal_code: "45202"
+      country: US
+    members:
+      - {member_id: us-1-a, role: admin, approver: true}
+      - {member_id: us-1-b, role: member}
+      - {member_id: us-1-c, role: child, allergies: [tree_nuts]}
+    # Three phones, in member order, from SEED_US1_PHONES; channel_mode 'real'.
+    phones_from_env: SEED_US1_PHONES
+
+  - household_id: us-2
+    name: US household 2
+    env: live
+    <<: *us
+    weekly_budget_minor: 15000
+    address:
+      <<: *addr
+      line1: 200 Main Street
+    members:
+      - {member_id: us-2-a, role: admin, approver: true, phone: "+15550100001"}
+      - {member_id: us-2-b, role: member, phone: "+15550100002"}
+
+  - household_id: us-1-eval
+    name: US household 1 (eval)
+    env: eval
+    <<: *us
+    weekly_budget_minor: 15000
+    address:
+      <<: *addr
+      line1: 101 Main Street
+    members:
+      - {member_id: us-1-a-eval, role: admin, approver: true, phone: "+15550100101"}
+      - {member_id: us-1-b-eval, role: member, phone: "+15550100102"}
+      - {member_id: us-1-c-eval, role: child, allergies: [tree_nuts], phone: "+15550100103"}
+
+  - household_id: us-2-eval
+    name: US household 2 (eval)
+    env: eval
+    <<: *us
+    weekly_budget_minor: 15000
+    address:
+      <<: *addr
+      line1: 201 Main Street
+    members:
+      - {member_id: us-2-a-eval, role: admin, approver: true, phone: "+15550100104"}
+      - {member_id: us-2-b-eval, role: member, phone: "+15550100105"}
+
+  # Agent-protocol P34: the buyer household of `a2a_demo` runs. One address, no members.
+  - household_id: a2a-demo
+    name: A2A demo household
+    env: eval
+    <<: *us
+    address:
+      <<: *addr
+      line1: 300 Main Street
+    members: []
