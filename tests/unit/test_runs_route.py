@@ -83,7 +83,14 @@ def test_post_runs_dinner_scenario_and_get_run(world: str) -> None:
     assert run["kind"] == "dinner"
 
     got = w.client(world).get(f"/runs/{run_id}")
-    assert got.json() == {"run_id": run_id, "status": "running", "reason": None, "summary": None}
+    assert got.json() == {
+        "run_id": run_id,
+        "status": "running",
+        "reason": None,
+        "summary": None,
+        "seller": None,
+        "courier": None,
+    }
     assert w.client(world).get(f"/runs/{uuid.uuid4()}").status_code == 404
 
 
