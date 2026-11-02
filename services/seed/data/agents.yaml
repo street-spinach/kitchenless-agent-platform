@@ -11,6 +11,18 @@ organizations:
   - {org_id: doordash-us, name: DoorDash Drive (US)}
   - {org_id: mock-courier-us, name: Mock Courier US}
 
+# One seeded owner per organization (identity-authz §3, §10): a Keycloak user with a fixed
+# id, username `owner.<org_id>` and the shared OWNER_DEMO_PASSWORD. The realm file
+# services/identity/realm/kitchenless.json uses the same ids (tests/unit/test_realm_file.py).
+owners:
+  - {org_id: kroger-us, keycloak_user_id: 9618f10c-1457-438b-92eb-6bfa5afbed75}
+  - {org_id: square-grocery-us, keycloak_user_id: f01f45fd-a1ab-44a3-b09b-4928b6380b94}
+  - {org_id: mock-grocery-us, keycloak_user_id: 080b7334-9580-48cb-9ff2-787c372ca64c}
+  - {org_id: square-restaurant-us, keycloak_user_id: c9f18104-f19e-4506-bb67-5c86e92312f4}
+  - {org_id: mock-restaurant-us, keycloak_user_id: 8b16114d-14d2-4446-8454-e22932ca93b1}
+  - {org_id: doordash-us, keycloak_user_id: 357bb333-8293-4b7c-84ed-eb4b51e006b7}
+  - {org_id: mock-courier-us, keycloak_user_id: e1e831f5-99a5-4f4c-988c-516b6e94fe2e}
+
 # Every business card covers zone us-oh-45202 and gets `config.description` and
 # `config.card_version` (P34; agent-protocol §4 default "1.0.0").
 business:

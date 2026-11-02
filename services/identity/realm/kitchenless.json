@@ -1,0 +1,2097 @@
+{
+  "realm": "kitchenless",
+  "enabled": true,
+  "sslRequired": "external",
+  "registrationAllowed": false,
+  "accessTokenLifespan": 300,
+  "offlineSessionIdleTimeout": 2592000,
+  "offlineSessionMaxLifespanEnabled": true,
+  "offlineSessionMaxLifespan": 2592000,
+  "revokeRefreshToken": false,
+  "eventsEnabled": true,
+  "eventsExpiration": 2592000,
+  "eventsListeners": [
+    "jboss-logging"
+  ],
+  "adminEventsEnabled": true,
+  "adminEventsDetailsEnabled": false,
+  "attributes": {
+    "adminEventsExpiration": "2592000"
+  },
+  "adminPermissionsEnabled": true,
+  "requiredActions": [
+    {
+      "alias": "TERMS_AND_CONDITIONS",
+      "name": "Terms and Conditions",
+      "providerId": "TERMS_AND_CONDITIONS",
+      "enabled": false,
+      "defaultAction": false,
+      "priority": 20,
+      "config": {}
+    },
+    {
+      "alias": "UPDATE_PROFILE",
+      "name": "Update Profile",
+      "providerId": "UPDATE_PROFILE",
+      "enabled": true,
+      "defaultAction": false,
+      "priority": 40,
+      "config": {}
+    },
+    {
+      "alias": "VERIFY_EMAIL",
+      "name": "Verify Email",
+      "providerId": "VERIFY_EMAIL",
+      "enabled": true,
+      "defaultAction": false,
+      "priority": 50,
+      "config": {}
+    },
+    {
+      "alias": "CONFIGURE_TOTP",
+      "name": "Configure OTP",
+      "providerId": "CONFIGURE_TOTP",
+      "enabled": true,
+      "defaultAction": false,
+      "priority": 54,
+      "config": {}
+    },
+    {
+      "alias": "UPDATE_PASSWORD",
+      "name": "Update Password",
+      "providerId": "UPDATE_PASSWORD",
+      "enabled": true,
+      "defaultAction": false,
+      "priority": 57,
+      "config": {}
+    },
+    {
+      "alias": "delete_account",
+      "name": "Delete Account",
+      "providerId": "delete_account",
+      "enabled": false,
+      "defaultAction": false,
+      "priority": 60,
+      "config": {}
+    },
+    {
+      "alias": "UPDATE_EMAIL",
+      "name": "Update Email",
+      "providerId": "UPDATE_EMAIL",
+      "enabled": false,
+      "defaultAction": false,
+      "priority": 70,
+      "config": {}
+    },
+    {
+      "alias": "webauthn-register",
+      "name": "Webauthn Register",
+      "providerId": "webauthn-register",
+      "enabled": true,
+      "defaultAction": false,
+      "priority": 80,
+      "config": {}
+    },
+    {
+      "alias": "webauthn-register-passwordless",
+      "name": "Webauthn Register Passwordless",
+      "providerId": "webauthn-register-passwordless",
+      "enabled": true,
+      "defaultAction": false,
+      "priority": 90,
+      "config": {}
+    },
+    {
+      "alias": "VERIFY_PROFILE",
+      "name": "Verify Profile",
+      "providerId": "VERIFY_PROFILE",
+      "enabled": false,
+      "defaultAction": false,
+      "priority": 100,
+      "config": {}
+    },
+    {
+      "alias": "delete_credential",
+      "name": "Delete Credential",
+      "providerId": "delete_credential",
+      "enabled": true,
+      "defaultAction": false,
+      "priority": 110,
+      "config": {}
+    },
+    {
+      "alias": "idp_link",
+      "name": "Linking Identity Provider",
+      "providerId": "idp_link",
+      "enabled": true,
+      "defaultAction": false,
+      "priority": 120,
+      "config": {}
+    },
+    {
+      "alias": "CONFIGURE_RECOVERY_AUTHN_CODES",
+      "name": "Recovery Authentication Codes",
+      "providerId": "CONFIGURE_RECOVERY_AUTHN_CODES",
+      "enabled": true,
+      "defaultAction": false,
+      "priority": 130,
+      "config": {}
+    },
+    {
+      "alias": "update_user_locale",
+      "name": "Update User Locale",
+      "providerId": "update_user_locale",
+      "enabled": true,
+      "defaultAction": false,
+      "priority": 1000,
+      "config": {}
+    }
+  ],
+  "clientScopes": [
+    {
+      "name": "basic",
+      "description": "OpenID Connect scope for add all basic claims to the token",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "false",
+        "display.on.consent.screen": "false"
+      },
+      "protocolMappers": [
+        {
+          "name": "auth_time",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usersessionmodel-note-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.session.note": "AUTH_TIME",
+            "id.token.claim": "true",
+            "introspection.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "auth_time",
+            "jsonType.label": "long"
+          }
+        },
+        {
+          "name": "sub",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-sub-mapper",
+          "consentRequired": false,
+          "config": {
+            "introspection.token.claim": "true",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "name": "acr",
+      "description": "OpenID Connect scope for add acr (authentication context class reference) to the token",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "false",
+        "display.on.consent.screen": "false"
+      },
+      "protocolMappers": [
+        {
+          "name": "acr loa level",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-acr-mapper",
+          "consentRequired": false,
+          "config": {
+            "id.token.claim": "true",
+            "introspection.token.claim": "true",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "name": "web-origins",
+      "description": "OpenID Connect scope for add allowed web origins to the access token",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "false",
+        "display.on.consent.screen": "false"
+      },
+      "protocolMappers": [
+        {
+          "name": "allowed web origins",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-allowed-origins-mapper",
+          "consentRequired": false,
+          "config": {
+            "introspection.token.claim": "true",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "name": "roles",
+      "description": "OpenID Connect scope for add user roles to the access token",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "false",
+        "consent.screen.text": "${rolesScopeConsentText}",
+        "display.on.consent.screen": "true"
+      },
+      "protocolMappers": [
+        {
+          "name": "realm roles",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "foo",
+            "introspection.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "realm_access.roles",
+            "jsonType.label": "String",
+            "multivalued": "true"
+          }
+        },
+        {
+          "name": "client roles",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-client-role-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "foo",
+            "introspection.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "resource_access.${client_id}.roles",
+            "jsonType.label": "String",
+            "multivalued": "true"
+          }
+        },
+        {
+          "name": "audience resolve",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-resolve-mapper",
+          "consentRequired": false,
+          "config": {
+            "introspection.token.claim": "true",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "name": "profile",
+      "description": "OpenID Connect built-in scope: profile",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "consent.screen.text": "${profileScopeConsentText}",
+        "display.on.consent.screen": "true"
+      },
+      "protocolMappers": [
+        {
+          "name": "zoneinfo",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "introspection.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "user.attribute": "zoneinfo",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "zoneinfo",
+            "jsonType.label": "String"
+          }
+        },
+        {
+          "name": "locale",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "introspection.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "user.attribute": "locale",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "locale",
+            "jsonType.label": "String"
+          }
+        },
+        {
+          "name": "middle name",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "introspection.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "user.attribute": "middleName",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "middle_name",
+            "jsonType.label": "String"
+          }
+        },
+        {
+          "name": "family name",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "introspection.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "user.attribute": "lastName",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "family_name",
+            "jsonType.label": "String"
+          }
+        },
+        {
+          "name": "gender",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "introspection.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "user.attribute": "gender",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "gender",
+            "jsonType.label": "String"
+          }
+        },
+        {
+          "name": "website",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "introspection.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "user.attribute": "website",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "website",
+            "jsonType.label": "String"
+          }
+        },
+        {
+          "name": "given name",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "introspection.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "user.attribute": "firstName",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "given_name",
+            "jsonType.label": "String"
+          }
+        },
+        {
+          "name": "full name",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-full-name-mapper",
+          "consentRequired": false,
+          "config": {
+            "id.token.claim": "true",
+            "introspection.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "updated at",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "introspection.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "user.attribute": "updatedAt",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "updated_at",
+            "jsonType.label": "long"
+          }
+        },
+        {
+          "name": "picture",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "introspection.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "user.attribute": "picture",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "picture",
+            "jsonType.label": "String"
+          }
+        },
+        {
+          "name": "nickname",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "introspection.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "user.attribute": "nickname",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "nickname",
+            "jsonType.label": "String"
+          }
+        },
+        {
+          "name": "username",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "introspection.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "user.attribute": "username",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "preferred_username",
+            "jsonType.label": "String"
+          }
+        },
+        {
+          "name": "birthdate",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "introspection.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "user.attribute": "birthdate",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "birthdate",
+            "jsonType.label": "String"
+          }
+        },
+        {
+          "name": "profile",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "introspection.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "user.attribute": "profile",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "profile",
+            "jsonType.label": "String"
+          }
+        }
+      ]
+    },
+    {
+      "name": "email",
+      "description": "OpenID Connect built-in scope: email",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "consent.screen.text": "${emailScopeConsentText}",
+        "display.on.consent.screen": "true"
+      },
+      "protocolMappers": [
+        {
+          "name": "email",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "introspection.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "user.attribute": "email",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "email",
+            "jsonType.label": "String"
+          }
+        },
+        {
+          "name": "email verified",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-property-mapper",
+          "consentRequired": false,
+          "config": {
+            "introspection.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "user.attribute": "emailVerified",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "email_verified",
+            "jsonType.label": "boolean"
+          }
+        }
+      ]
+    },
+    {
+      "name": "service_account",
+      "description": "Specific scope for a client enabled for service accounts",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "false",
+        "display.on.consent.screen": "false"
+      },
+      "protocolMappers": [
+        {
+          "name": "Client ID",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usersessionmodel-note-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.session.note": "client_id",
+            "id.token.claim": "true",
+            "introspection.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "client_id",
+            "jsonType.label": "String"
+          }
+        },
+        {
+          "name": "Client Host",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usersessionmodel-note-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.session.note": "clientHost",
+            "id.token.claim": "true",
+            "introspection.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "clientHost",
+            "jsonType.label": "String"
+          }
+        },
+        {
+          "name": "Client IP Address",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usersessionmodel-note-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.session.note": "clientAddress",
+            "id.token.claim": "true",
+            "introspection.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "clientAddress",
+            "jsonType.label": "String"
+          }
+        }
+      ]
+    },
+    {
+      "name": "delegation:client",
+      "description": "OpenID Connect scope for agent/client token exchange delegation",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "parameterized.scope.type": "client-delegation",
+        "display.on.consent.screen": "true",
+        "always.display.consent": "true",
+        "is.parameterized.scope": "true",
+        "consent.screen.text": "${clientDelegationScopeConsentText}"
+      },
+      "protocolMappers": [
+        {
+          "name": "client may_act sub",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-parameterized-scope-client-sub-mapper",
+          "consentRequired": false,
+          "config": {
+            "id.token.claim": "true",
+            "introspection.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "may_act.sub",
+            "jsonType.label": "String"
+          }
+        },
+        {
+          "name": "client delegation audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-parameterized-scope-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "introspection.token.claim": "true",
+            "access.token.claim": "true"
+          }
+        },
+        {
+          "name": "client may_act client_id",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-parameterized-scope-mapper",
+          "consentRequired": false,
+          "config": {
+            "id.token.claim": "true",
+            "introspection.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "may_act.client_id",
+            "jsonType.label": "String"
+          }
+        }
+      ]
+    },
+    {
+      "name": "constraints:read",
+      "description": "Kitchenless agent scope: constraints:read",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true",
+        "consent.screen.text": "Read your allergies, diets and household budget"
+      }
+    },
+    {
+      "name": "pantry:read",
+      "description": "Kitchenless agent scope: pantry:read",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true",
+        "consent.screen.text": "Read your household pantry"
+      }
+    },
+    {
+      "name": "meals:plan",
+      "description": "Kitchenless agent scope: meals:plan",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true",
+        "consent.screen.text": "Plan meals for you"
+      }
+    },
+    {
+      "name": "pantry:write",
+      "description": "Kitchenless agent scope: pantry:write",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true",
+        "consent.screen.text": "Update your household pantry"
+      }
+    },
+    {
+      "name": "orders:place",
+      "description": "Kitchenless agent scope: orders:place",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true",
+        "consent.screen.text": "Place food orders within your household's budget"
+      }
+    },
+    {
+      "name": "approvals:request",
+      "description": "Kitchenless agent scope: approvals:request",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true",
+        "consent.screen.text": "Ask your household's approver to approve an order"
+      }
+    }
+  ],
+  "defaultDefaultClientScopes": [
+    "basic",
+    "acr",
+    "web-origins",
+    "roles",
+    "profile",
+    "email"
+  ],
+  "defaultOptionalClientScopes": [],
+  "clients": [
+    {
+      "clientId": "household.us-1",
+      "name": "household.us-1",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-jwt",
+      "consentRequired": true,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "frontchannelLogout": false,
+      "redirectUris": [
+        "https://${DOMAIN}/me/callback"
+      ],
+      "webOrigins": [],
+      "attributes": {
+        "jwt.credential.certificate": "${AGENT_SIGNING_CERT}",
+        "standard.token.exchange.enabled": "true"
+      },
+      "protocolMappers": [
+        {
+          "name": "audience kitchenless-mcp",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "kitchenless-mcp",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ],
+      "defaultClientScopes": [
+        "basic",
+        "acr",
+        "web-origins",
+        "roles",
+        "profile",
+        "email",
+        "service_account",
+        "constraints:read",
+        "pantry:read",
+        "pantry:write",
+        "orders:place",
+        "approvals:request"
+      ],
+      "optionalClientScopes": [
+        "offline_access",
+        "delegation:client"
+      ]
+    },
+    {
+      "clientId": "consumer.us-1-a",
+      "name": "consumer.us-1-a",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-jwt",
+      "consentRequired": true,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "frontchannelLogout": false,
+      "redirectUris": [
+        "https://${DOMAIN}/me/callback"
+      ],
+      "webOrigins": [],
+      "attributes": {
+        "jwt.credential.certificate": "${AGENT_SIGNING_CERT}",
+        "standard.token.exchange.enabled": "true"
+      },
+      "protocolMappers": [
+        {
+          "name": "audience kitchenless-mcp",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "kitchenless-mcp",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ],
+      "defaultClientScopes": [
+        "basic",
+        "acr",
+        "web-origins",
+        "roles",
+        "profile",
+        "email",
+        "service_account",
+        "constraints:read",
+        "pantry:read",
+        "meals:plan"
+      ],
+      "optionalClientScopes": [
+        "offline_access",
+        "delegation:client"
+      ]
+    },
+    {
+      "clientId": "consumer.us-1-b",
+      "name": "consumer.us-1-b",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-jwt",
+      "consentRequired": true,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "frontchannelLogout": false,
+      "redirectUris": [
+        "https://${DOMAIN}/me/callback"
+      ],
+      "webOrigins": [],
+      "attributes": {
+        "jwt.credential.certificate": "${AGENT_SIGNING_CERT}",
+        "standard.token.exchange.enabled": "true"
+      },
+      "protocolMappers": [
+        {
+          "name": "audience kitchenless-mcp",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "kitchenless-mcp",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ],
+      "defaultClientScopes": [
+        "basic",
+        "acr",
+        "web-origins",
+        "roles",
+        "profile",
+        "email",
+        "service_account",
+        "constraints:read",
+        "pantry:read",
+        "meals:plan"
+      ],
+      "optionalClientScopes": [
+        "offline_access",
+        "delegation:client"
+      ]
+    },
+    {
+      "clientId": "consumer.us-1-c",
+      "name": "consumer.us-1-c",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-jwt",
+      "consentRequired": true,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "frontchannelLogout": false,
+      "redirectUris": [
+        "https://${DOMAIN}/me/callback"
+      ],
+      "webOrigins": [],
+      "attributes": {
+        "jwt.credential.certificate": "${AGENT_SIGNING_CERT}",
+        "standard.token.exchange.enabled": "true"
+      },
+      "protocolMappers": [
+        {
+          "name": "audience kitchenless-mcp",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "kitchenless-mcp",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ],
+      "defaultClientScopes": [
+        "basic",
+        "acr",
+        "web-origins",
+        "roles",
+        "profile",
+        "email",
+        "service_account",
+        "constraints:read",
+        "pantry:read",
+        "meals:plan"
+      ],
+      "optionalClientScopes": [
+        "offline_access",
+        "delegation:client"
+      ]
+    },
+    {
+      "clientId": "household.us-2",
+      "name": "household.us-2",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-jwt",
+      "consentRequired": true,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "frontchannelLogout": false,
+      "redirectUris": [
+        "https://${DOMAIN}/me/callback"
+      ],
+      "webOrigins": [],
+      "attributes": {
+        "jwt.credential.certificate": "${AGENT_SIGNING_CERT}",
+        "standard.token.exchange.enabled": "true"
+      },
+      "protocolMappers": [
+        {
+          "name": "audience kitchenless-mcp",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "kitchenless-mcp",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ],
+      "defaultClientScopes": [
+        "basic",
+        "acr",
+        "web-origins",
+        "roles",
+        "profile",
+        "email",
+        "service_account",
+        "constraints:read",
+        "pantry:read",
+        "pantry:write",
+        "orders:place",
+        "approvals:request"
+      ],
+      "optionalClientScopes": [
+        "offline_access",
+        "delegation:client"
+      ]
+    },
+    {
+      "clientId": "consumer.us-2-a",
+      "name": "consumer.us-2-a",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-jwt",
+      "consentRequired": true,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "frontchannelLogout": false,
+      "redirectUris": [
+        "https://${DOMAIN}/me/callback"
+      ],
+      "webOrigins": [],
+      "attributes": {
+        "jwt.credential.certificate": "${AGENT_SIGNING_CERT}",
+        "standard.token.exchange.enabled": "true"
+      },
+      "protocolMappers": [
+        {
+          "name": "audience kitchenless-mcp",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "kitchenless-mcp",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ],
+      "defaultClientScopes": [
+        "basic",
+        "acr",
+        "web-origins",
+        "roles",
+        "profile",
+        "email",
+        "service_account",
+        "constraints:read",
+        "pantry:read",
+        "meals:plan"
+      ],
+      "optionalClientScopes": [
+        "offline_access",
+        "delegation:client"
+      ]
+    },
+    {
+      "clientId": "consumer.us-2-b",
+      "name": "consumer.us-2-b",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-jwt",
+      "consentRequired": true,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "frontchannelLogout": false,
+      "redirectUris": [
+        "https://${DOMAIN}/me/callback"
+      ],
+      "webOrigins": [],
+      "attributes": {
+        "jwt.credential.certificate": "${AGENT_SIGNING_CERT}",
+        "standard.token.exchange.enabled": "true"
+      },
+      "protocolMappers": [
+        {
+          "name": "audience kitchenless-mcp",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "kitchenless-mcp",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ],
+      "defaultClientScopes": [
+        "basic",
+        "acr",
+        "web-origins",
+        "roles",
+        "profile",
+        "email",
+        "service_account",
+        "constraints:read",
+        "pantry:read",
+        "meals:plan"
+      ],
+      "optionalClientScopes": [
+        "offline_access",
+        "delegation:client"
+      ]
+    },
+    {
+      "clientId": "template.consumer",
+      "name": "template.consumer",
+      "enabled": false,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-jwt",
+      "consentRequired": true,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "frontchannelLogout": false,
+      "redirectUris": [
+        "https://${DOMAIN}/me/callback"
+      ],
+      "webOrigins": [],
+      "attributes": {
+        "jwt.credential.certificate": "${AGENT_SIGNING_CERT}",
+        "standard.token.exchange.enabled": "true"
+      },
+      "protocolMappers": [
+        {
+          "name": "audience kitchenless-mcp",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "kitchenless-mcp",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ],
+      "defaultClientScopes": [
+        "basic",
+        "acr",
+        "web-origins",
+        "roles",
+        "profile",
+        "email",
+        "service_account",
+        "constraints:read",
+        "pantry:read",
+        "meals:plan"
+      ],
+      "optionalClientScopes": [
+        "offline_access",
+        "delegation:client"
+      ]
+    },
+    {
+      "clientId": "template.household",
+      "name": "template.household",
+      "enabled": false,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-jwt",
+      "consentRequired": true,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "frontchannelLogout": false,
+      "redirectUris": [
+        "https://${DOMAIN}/me/callback"
+      ],
+      "webOrigins": [],
+      "attributes": {
+        "jwt.credential.certificate": "${AGENT_SIGNING_CERT}",
+        "standard.token.exchange.enabled": "true"
+      },
+      "protocolMappers": [
+        {
+          "name": "audience kitchenless-mcp",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "kitchenless-mcp",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ],
+      "defaultClientScopes": [
+        "basic",
+        "acr",
+        "web-origins",
+        "roles",
+        "profile",
+        "email",
+        "service_account",
+        "constraints:read",
+        "pantry:read",
+        "pantry:write",
+        "orders:place",
+        "approvals:request"
+      ],
+      "optionalClientScopes": [
+        "offline_access",
+        "delegation:client"
+      ]
+    },
+    {
+      "clientId": "grocery.kroger-us",
+      "name": "grocery.kroger-us",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-jwt",
+      "consentRequired": false,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "frontchannelLogout": false,
+      "redirectUris": [],
+      "webOrigins": [],
+      "attributes": {
+        "jwt.credential.certificate": "${AGENT_SIGNING_CERT}"
+      },
+      "protocolMappers": [
+        {
+          "name": "audience kitchenless-mcp",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "kitchenless-mcp",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "grocery.square-us",
+      "name": "grocery.square-us",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-jwt",
+      "consentRequired": false,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "frontchannelLogout": false,
+      "redirectUris": [],
+      "webOrigins": [],
+      "attributes": {
+        "jwt.credential.certificate": "${AGENT_SIGNING_CERT}"
+      },
+      "protocolMappers": [
+        {
+          "name": "audience kitchenless-mcp",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "kitchenless-mcp",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "grocery.mock-us",
+      "name": "grocery.mock-us",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-jwt",
+      "consentRequired": false,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "frontchannelLogout": false,
+      "redirectUris": [],
+      "webOrigins": [],
+      "attributes": {
+        "jwt.credential.certificate": "${AGENT_SIGNING_CERT}"
+      },
+      "protocolMappers": [
+        {
+          "name": "audience kitchenless-mcp",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "kitchenless-mcp",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "restaurant.square-us",
+      "name": "restaurant.square-us",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-jwt",
+      "consentRequired": false,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "frontchannelLogout": false,
+      "redirectUris": [],
+      "webOrigins": [],
+      "attributes": {
+        "jwt.credential.certificate": "${AGENT_SIGNING_CERT}"
+      },
+      "protocolMappers": [
+        {
+          "name": "audience kitchenless-mcp",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "kitchenless-mcp",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "restaurant.mock-us",
+      "name": "restaurant.mock-us",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-jwt",
+      "consentRequired": false,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "frontchannelLogout": false,
+      "redirectUris": [],
+      "webOrigins": [],
+      "attributes": {
+        "jwt.credential.certificate": "${AGENT_SIGNING_CERT}"
+      },
+      "protocolMappers": [
+        {
+          "name": "audience kitchenless-mcp",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "kitchenless-mcp",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "delivery.doordash-us",
+      "name": "delivery.doordash-us",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-jwt",
+      "consentRequired": false,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "frontchannelLogout": false,
+      "redirectUris": [],
+      "webOrigins": [],
+      "attributes": {
+        "jwt.credential.certificate": "${AGENT_SIGNING_CERT}"
+      },
+      "protocolMappers": [
+        {
+          "name": "audience kitchenless-mcp",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "kitchenless-mcp",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "delivery.mock-us",
+      "name": "delivery.mock-us",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-jwt",
+      "consentRequired": false,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "frontchannelLogout": false,
+      "redirectUris": [],
+      "webOrigins": [],
+      "attributes": {
+        "jwt.credential.certificate": "${AGENT_SIGNING_CERT}"
+      },
+      "protocolMappers": [
+        {
+          "name": "audience kitchenless-mcp",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "kitchenless-mcp",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "svc.api",
+      "name": "svc.api",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-jwt",
+      "consentRequired": false,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "frontchannelLogout": false,
+      "redirectUris": [],
+      "webOrigins": [],
+      "attributes": {
+        "jwt.credential.certificate": "${AGENT_SIGNING_CERT}"
+      },
+      "protocolMappers": [
+        {
+          "name": "audience kitchenless-mcp",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "kitchenless-mcp",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "svc.onboarding",
+      "name": "svc.onboarding",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "${KC_ONBOARDING_SECRET}",
+      "consentRequired": false,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "frontchannelLogout": false,
+      "redirectUris": [],
+      "webOrigins": []
+    },
+    {
+      "clientId": "me-pages",
+      "name": "me-pages",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-jwt",
+      "consentRequired": false,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "frontchannelLogout": false,
+      "redirectUris": [
+        "https://${DOMAIN}/me/callback"
+      ],
+      "webOrigins": [],
+      "attributes": {
+        "jwt.credential.certificate": "${AGENT_SIGNING_CERT}"
+      }
+    },
+    {
+      "clientId": "owner-app",
+      "name": "owner-app",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "consentRequired": false,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "frontchannelLogout": false,
+      "redirectUris": [],
+      "webOrigins": [],
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
+      "protocolMappers": [
+        {
+          "name": "audience owner-app",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "owner-app",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "kitchenless-mcp",
+      "name": "kitchenless-mcp",
+      "description": "Names the MCP audience only; nobody signs in with it.",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-jwt",
+      "consentRequired": false,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "frontchannelLogout": false,
+      "redirectUris": [],
+      "webOrigins": []
+    },
+    {
+      "clientId": "admin-permissions",
+      "surrogateAuthRequired": false,
+      "enabled": true,
+      "alwaysDisplayInConsole": false,
+      "redirectUris": [],
+      "webOrigins": [],
+      "notBefore": 0,
+      "bearerOnly": false,
+      "consentRequired": false,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "authorizationServicesEnabled": true,
+      "publicClient": false,
+      "frontchannelLogout": false,
+      "protocol": "openid-connect",
+      "attributes": {
+        "realm_client": "false"
+      },
+      "authenticationFlowBindingOverrides": {},
+      "fullScopeAllowed": false,
+      "nodeReRegistrationTimeout": 0,
+      "defaultClientScopes": [
+        "web-origins",
+        "acr",
+        "roles",
+        "profile",
+        "basic",
+        "email"
+      ],
+      "optionalClientScopes": [
+        "address",
+        "delegation:user",
+        "phone",
+        "offline_access",
+        "organization",
+        "delegation:client",
+        "microprofile-jwt"
+      ],
+      "authorizationSettings": {
+        "allowRemoteResourceManagement": true,
+        "policyEnforcementMode": "ENFORCING",
+        "resources": [
+          {
+            "name": "Groups",
+            "type": "Groups",
+            "ownerManagedAccess": false,
+            "attributes": {},
+            "uris": [],
+            "scopes": [
+              {
+                "name": "manage-members"
+              },
+              {
+                "name": "view"
+              },
+              {
+                "name": "manage-membership-of-members"
+              },
+              {
+                "name": "manage-membership"
+              },
+              {
+                "name": "delegate-members"
+              },
+              {
+                "name": "view-members"
+              },
+              {
+                "name": "manage"
+              },
+              {
+                "name": "impersonate-members"
+              }
+            ]
+          },
+          {
+            "name": "Roles",
+            "type": "Roles",
+            "ownerManagedAccess": false,
+            "attributes": {},
+            "uris": [],
+            "scopes": [
+              {
+                "name": "map-role-composite"
+              },
+              {
+                "name": "map-role-client-scope"
+              },
+              {
+                "name": "map-role"
+              }
+            ]
+          },
+          {
+            "name": "Organizations",
+            "type": "Organizations",
+            "ownerManagedAccess": false,
+            "attributes": {},
+            "uris": [],
+            "scopes": [
+              {
+                "name": "view"
+              },
+              {
+                "name": "manage"
+              }
+            ]
+          },
+          {
+            "name": "Clients",
+            "type": "Clients",
+            "ownerManagedAccess": false,
+            "attributes": {},
+            "uris": [],
+            "scopes": [
+              {
+                "name": "view"
+              },
+              {
+                "name": "map-roles-client-scope"
+              },
+              {
+                "name": "map-roles"
+              },
+              {
+                "name": "manage"
+              },
+              {
+                "name": "map-roles-composite"
+              }
+            ]
+          },
+          {
+            "name": "Users",
+            "type": "Users",
+            "ownerManagedAccess": false,
+            "attributes": {},
+            "uris": [],
+            "scopes": [
+              {
+                "name": "delegate"
+              },
+              {
+                "name": "view"
+              },
+              {
+                "name": "manage-group-membership"
+              },
+              {
+                "name": "impersonate"
+              },
+              {
+                "name": "map-roles"
+              },
+              {
+                "name": "reset-password"
+              },
+              {
+                "name": "manage"
+              }
+            ]
+          }
+        ],
+        "policies": [
+          {
+            "name": "agents-may-delegate",
+            "type": "client",
+            "logic": "POSITIVE",
+            "decisionStrategy": "UNANIMOUS",
+            "config": {
+              "clients": "[\"household.us-1\", \"consumer.us-1-a\", \"consumer.us-1-b\", \"consumer.us-1-c\", \"household.us-2\", \"consumer.us-2-a\", \"consumer.us-2-b\"]"
+            }
+          },
+          {
+            "name": "agents-delegate-users",
+            "type": "scope",
+            "logic": "POSITIVE",
+            "decisionStrategy": "UNANIMOUS",
+            "config": {
+              "defaultResourceType": "Users",
+              "resources": "[\"Users\"]",
+              "scopes": "[\"delegate\"]",
+              "applyPolicies": "[\"agents-may-delegate\"]"
+            }
+          }
+        ],
+        "scopes": [
+          {
+            "name": "manage-group-membership"
+          },
+          {
+            "name": "map-roles-client-scope"
+          },
+          {
+            "name": "delegate-members"
+          },
+          {
+            "name": "view-members"
+          },
+          {
+            "name": "map-role"
+          },
+          {
+            "name": "reset-password"
+          },
+          {
+            "name": "manage"
+          },
+          {
+            "name": "impersonate-members"
+          },
+          {
+            "name": "manage-members"
+          },
+          {
+            "name": "delegate"
+          },
+          {
+            "name": "view"
+          },
+          {
+            "name": "manage-membership-of-members"
+          },
+          {
+            "name": "manage-membership"
+          },
+          {
+            "name": "impersonate"
+          },
+          {
+            "name": "map-role-composite"
+          },
+          {
+            "name": "map-roles"
+          },
+          {
+            "name": "map-role-client-scope"
+          },
+          {
+            "name": "map-roles-composite"
+          }
+        ],
+        "decisionStrategy": "UNANIMOUS",
+        "authorizationSchema": {
+          "resourceTypes": {
+            "Organizations": {
+              "type": "Organizations",
+              "scopes": [
+                "manage",
+                "view"
+              ],
+              "scopeAliases": {}
+            },
+            "Clients": {
+              "type": "Clients",
+              "scopes": [
+                "view",
+                "map-roles-client-scope",
+                "map-roles",
+                "manage",
+                "map-roles-composite"
+              ],
+              "scopeAliases": {}
+            },
+            "Users": {
+              "type": "Users",
+              "scopes": [
+                "delegate",
+                "map-roles",
+                "view",
+                "reset-password",
+                "manage-group-membership",
+                "impersonate",
+                "manage"
+              ],
+              "scopeAliases": {
+                "delegate": [
+                  "delegate-members"
+                ],
+                "manage-group-membership": [
+                  "manage-membership-of-members"
+                ],
+                "view": [
+                  "view-members"
+                ],
+                "manage": [
+                  "manage-members"
+                ],
+                "impersonate": [
+                  "impersonate-members"
+                ]
+              },
+              "groupType": "Groups"
+            },
+            "Groups": {
+              "type": "Groups",
+              "scopes": [
+                "impersonate-members",
+                "view",
+                "manage",
+                "delegate-members",
+                "view-members",
+                "manage-membership-of-members",
+                "manage-members",
+                "manage-membership"
+              ],
+              "scopeAliases": {}
+            },
+            "Roles": {
+              "type": "Roles",
+              "scopes": [
+                "map-role-composite",
+                "map-role-client-scope",
+                "map-role"
+              ],
+              "scopeAliases": {}
+            }
+          }
+        }
+      }
+    }
+  ],
+  "users": [
+    {
+      "id": "4ec40af4-f3ed-45f8-aece-861a4bca8cdb",
+      "username": "${SEED_US1_PHONE_1}",
+      "enabled": true,
+      "firstName": "us-1-a",
+      "realmRoles": [
+        "default-roles-kitchenless"
+      ]
+    },
+    {
+      "id": "5edc0c8a-872c-4913-8acd-dd725978804e",
+      "username": "${SEED_US1_PHONE_2}",
+      "enabled": true,
+      "firstName": "us-1-b",
+      "realmRoles": [
+        "default-roles-kitchenless"
+      ]
+    },
+    {
+      "id": "254a0ad1-1a33-4595-974a-e77712478340",
+      "username": "${SEED_US1_PHONE_3}",
+      "enabled": true,
+      "firstName": "us-1-c",
+      "realmRoles": [
+        "default-roles-kitchenless"
+      ]
+    },
+    {
+      "id": "ee21d97a-1d0a-47e1-bcf2-a78f8261a2b5",
+      "username": "sim.us-2.1",
+      "enabled": true,
+      "firstName": "us-2-a",
+      "realmRoles": [
+        "default-roles-kitchenless"
+      ]
+    },
+    {
+      "id": "575f5395-98b6-4832-8a99-0ecc93f14017",
+      "username": "sim.us-2.2",
+      "enabled": true,
+      "firstName": "us-2-b",
+      "realmRoles": [
+        "default-roles-kitchenless"
+      ]
+    },
+    {
+      "id": "d8908afd-9847-4d66-823c-4fd581578df4",
+      "username": "sim.us-1-eval.1",
+      "enabled": true,
+      "firstName": "us-1-a-eval",
+      "realmRoles": [
+        "default-roles-kitchenless"
+      ]
+    },
+    {
+      "id": "c365e5d4-6d30-410c-b43c-51c9f7904ad7",
+      "username": "sim.us-1-eval.2",
+      "enabled": true,
+      "firstName": "us-1-b-eval",
+      "realmRoles": [
+        "default-roles-kitchenless"
+      ]
+    },
+    {
+      "id": "0c4be7f4-133f-4168-ba33-4f74862e892f",
+      "username": "sim.us-1-eval.3",
+      "enabled": true,
+      "firstName": "us-1-c-eval",
+      "realmRoles": [
+        "default-roles-kitchenless"
+      ]
+    },
+    {
+      "id": "a5efaafb-175d-4ab9-a340-44d77e4e6517",
+      "username": "sim.us-2-eval.1",
+      "enabled": true,
+      "firstName": "us-2-a-eval",
+      "realmRoles": [
+        "default-roles-kitchenless"
+      ]
+    },
+    {
+      "id": "9c5274b0-7830-4a19-a409-74aea9d50663",
+      "username": "sim.us-2-eval.2",
+      "enabled": true,
+      "firstName": "us-2-b-eval",
+      "realmRoles": [
+        "default-roles-kitchenless"
+      ]
+    },
+    {
+      "id": "9618f10c-1457-438b-92eb-6bfa5afbed75",
+      "username": "owner.kroger-us",
+      "email": "owner.kroger-us@example.com",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "kroger-us",
+      "realmRoles": [
+        "default-roles-kitchenless"
+      ],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${OWNER_DEMO_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "f01f45fd-a1ab-44a3-b09b-4928b6380b94",
+      "username": "owner.square-grocery-us",
+      "email": "owner.square-grocery-us@example.com",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "square-grocery-us",
+      "realmRoles": [
+        "default-roles-kitchenless"
+      ],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${OWNER_DEMO_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "080b7334-9580-48cb-9ff2-787c372ca64c",
+      "username": "owner.mock-grocery-us",
+      "email": "owner.mock-grocery-us@example.com",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "mock-grocery-us",
+      "realmRoles": [
+        "default-roles-kitchenless"
+      ],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${OWNER_DEMO_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "c9f18104-f19e-4506-bb67-5c86e92312f4",
+      "username": "owner.square-restaurant-us",
+      "email": "owner.square-restaurant-us@example.com",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "square-restaurant-us",
+      "realmRoles": [
+        "default-roles-kitchenless"
+      ],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${OWNER_DEMO_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "8b16114d-14d2-4446-8454-e22932ca93b1",
+      "username": "owner.mock-restaurant-us",
+      "email": "owner.mock-restaurant-us@example.com",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "mock-restaurant-us",
+      "realmRoles": [
+        "default-roles-kitchenless"
+      ],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${OWNER_DEMO_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "357bb333-8293-4b7c-84ed-eb4b51e006b7",
+      "username": "owner.doordash-us",
+      "email": "owner.doordash-us@example.com",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "doordash-us",
+      "realmRoles": [
+        "default-roles-kitchenless"
+      ],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${OWNER_DEMO_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "e1e831f5-99a5-4f4c-988c-516b6e94fe2e",
+      "username": "owner.mock-courier-us",
+      "email": "owner.mock-courier-us@example.com",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "mock-courier-us",
+      "realmRoles": [
+        "default-roles-kitchenless"
+      ],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${OWNER_DEMO_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "username": "service-account-svc.onboarding",
+      "enabled": true,
+      "serviceAccountClientId": "svc.onboarding",
+      "realmRoles": [
+        "default-roles-kitchenless"
+      ],
+      "clientRoles": {
+        "realm-management": [
+          "manage-users",
+          "manage-clients"
+        ]
+      }
+    }
+  ]
+}

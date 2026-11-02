@@ -29,6 +29,15 @@ def parse_agent_id(agent_id: str) -> tuple[str, str]:
     return agent_class, name
 
 
+def keycloak_client_id(agent_id: str) -> str:
+    """Keycloak `client_id` of an agent: `<class>.<name>`, e.g. `household.us-1` (identity-authz
+    §3). Fails closed on a name that holds another `:`, so two agents never share a client."""
+    agent_class, name = parse_agent_id(agent_id)
+    if ":" in name:
+        raise ValueError(f"agent name must not contain ':', got {agent_id!r}")
+    return f"{agent_class}.{name}"
+
+
 def thread_id(agent_id: str, run_id: UUID) -> str:
     """Checkpointer thread id: `<agent_id>:<run_id>`."""
     return f"{_require('agent_id', agent_id)}:{_require('run_id', run_id)}"
