@@ -74,6 +74,7 @@ def test_defaulted_values_are_never_required() -> None:
     assert s.mode == "mock" and s.mode_force_mock is False
     assert s.model_business_timeout_seconds == 5
     assert s.mock_courier_step_seconds == 20
+    assert s.api_url == "http://api:8000"
 
 
 def test_protocol_settings_have_their_defaults() -> None:

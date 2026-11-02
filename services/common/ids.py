@@ -68,6 +68,14 @@ def quote_id(request_message_id: UUID) -> UUID:
     return uuid5(request_message_id, "quote")
 
 
+def mock_batch_id(external_delivery_id: str) -> UUID:
+    """`batch_id` of a mock courier booking that joins no batch (item 46, amended for #48).
+
+    `external_delivery_id` is a vendor key (`vendor_key`), so it is a UUID string.
+    """
+    return uuid5(UUID(_require("external_delivery_id", external_delivery_id)), "batch")
+
+
 def approval_id(order_id: UUID) -> UUID:
     """An order has at most one approval (its `request_approval` key has no scope)."""
     return uuid5(order_id, "approval")

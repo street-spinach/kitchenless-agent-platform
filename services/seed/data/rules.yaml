@@ -8,3 +8,8 @@ grocery:square-us: {floor_pct: 95}
 grocery:mock-us: {floor_pct: 95}
 restaurant:square-us: {floor_pct: 95}
 restaurant:mock-us: {floor_pct: 95}
+
+# Courier cards have a `delivery` rule instead of `floor_pct` (item 55, amended 2026-11-02,
+# #48): the fee, the slot length and how many booked deliveries one slot takes.
+delivery:mock-us: {delivery: {fee_minor: 599, slot_minutes: 60, slot_capacity: 2}}
+delivery:doordash-us: {delivery: {fee_minor: 599, slot_minutes: 60, slot_capacity: 2}}
