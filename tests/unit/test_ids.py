@@ -7,6 +7,26 @@ from services.common import ids
 ORDER = UUID("11111111-1111-4111-8111-111111111111")
 
 
+def test_approval_message_ids_are_deterministic_and_distinct() -> None:
+    approval = uuid4()
+    assert ids.approval_prompt_id(approval) == uuid5(approval, "approval_prompt")
+    assert ids.approval_decision_id(approval) == uuid5(approval, "approval_decision")
+    assert ids.approval_prompt_id(approval) != ids.approval_decision_id(approval)
+
+
+def test_approval_button_round_trips_and_rejects_anything_else() -> None:
+    approval = uuid4()
+    for decision in ("approved", "rejected"):
+        payload = ids.approval_button(approval, decision)
+        assert payload == f"ap:{approval}:{decision}"
+        assert ids.parse_approval_button(payload) == (approval, decision)
+    with pytest.raises(ValueError):
+        ids.approval_button(approval, "expired")
+    others = ["", "approve:1", f"ap:{approval}:expired", "ap:x:approved", f"sf:{approval}:1:drop"]
+    for payload in others:
+        assert ids.parse_approval_button(payload) is None
+
+
 def test_idempotency_key_is_deterministic() -> None:
     a = ids.idempotency_key(ORDER, "place_order", "grocery:square-us")
     b = ids.idempotency_key(ORDER, "place_order", "grocery:square-us")

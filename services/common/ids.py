@@ -81,6 +81,41 @@ def approval_id(order_id: UUID) -> UUID:
     return uuid5(order_id, "approval")
 
 
+def approval_prompt_id(approval_id: UUID) -> UUID:
+    """`message_id` of the approval prompt (`whatsapp_out` with buttons) sent to the
+    approver when the approval is requested (architecture §8, #63)."""
+    return uuid5(UUID(_require("approval_id", approval_id)), "approval_prompt")
+
+
+def approval_decision_id(approval_id: UUID) -> UUID:
+    """`message_id` of the `approval_decision` that `api` sends for the approver's tap. An
+    approval is decided once, so a repeated tap reuses the id and sends nothing new."""
+    return uuid5(UUID(_require("approval_id", approval_id)), "approval_decision")
+
+
+APPROVAL_DECISIONS = ("approved", "rejected")
+
+
+def approval_button(approval_id: UUID, decision: str) -> str:
+    """The WhatsApp button payload for `decision` on `approval_id`: `ap:<id>:<decision>`."""
+    if decision not in APPROVAL_DECISIONS:
+        raise ValueError(f"decision must be one of {APPROVAL_DECISIONS}, got {decision!r}")
+    return f"ap:{UUID(_require('approval_id', approval_id))}:{decision}"
+
+
+def parse_approval_button(payload: str) -> tuple[UUID, str] | None:
+    """`(approval_id, decision)` from an approval button payload, or `None` if it is not
+    one (fails closed: an unknown payload decides nothing)."""
+    prefix, _, rest = (payload or "").partition(":")
+    raw_id, _, decision = rest.partition(":")
+    if prefix != "ap" or decision not in APPROVAL_DECISIONS:
+        return None
+    try:
+        return UUID(raw_id), decision
+    except ValueError:
+        return None
+
+
 def conversation_id(opening_message_id: UUID) -> UUID:
     """Conversation opened by `opening_message_id` (a negotiation or store-to-courier)."""
     return uuid5(opening_message_id, "conversation")

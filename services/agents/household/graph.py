@@ -16,9 +16,14 @@ routed by its type and the order's phase:
 *   `quote_round_closed` → `negotiate` (state `negotiating`; at most 2 counter rounds) →
     `choose_offer` (the cheapest valid offer) → `request_approval` when the total is over
     the remaining weekly budget, else `authorize` (`authorize_spend`, then `accept`).
+*   `request_approval` calls the tool (which sends the approver's buttons, creates the
+    `approval_expiry` timer and pauses `run_timeout`) and leaves the thread in the
+    checkpointed `awaiting_approval` phase: the run waits there, across restarts, until an
+    `approval_decision` arrives; other messages meanwhile are ignored.
 *   `approval_decision` `approved` → `authorize`; `rejected` or `expired` → the run ends
-    `cancelled`. A re-quoted offer at or below the approved total uses that approval; a
-    higher total asks again.
+    `cancelled`. On `expired` (CUJ 3) the household also sends `cancel` to the seller and
+    "Order cancelled: no approval." to the approver. A re-quoted offer at or below the
+    approved total uses that approval; a higher total asks again.
 *   `reject` from a seller → `seller_rejected`, the household rule of agent-protocol §7:
     `expired` (answering our `accept`) → `requote` once (`authorized → quoting`, a new
     round of `quote_request`), a second time `error, offer_expired`; `no_courier` → the
@@ -134,6 +139,7 @@ DROP_SELLER_ON_REFUSAL = frozenset({"quote_request", "counter_offer"})
 END_RUN_ON_REFUSAL = frozenset({"accept", "cancel"})
 SUMMARY_TEMPLATE = "order_summary"
 NO_OFFERS_TEMPLATE = "no_offers"
+APPROVAL_CANCELLED_TEMPLATE = "approval_cancelled"
 
 # Phases of the household's order, kept in graph state.
 NEW = "new"
@@ -190,6 +196,7 @@ class HouseholdState(TypedDict, total=False):
     requotes: int  # 0 or 1 (agent-protocol §7 re-quote)
     approval_minor: int | None  # the total the pending approval asks for
     approved_minor: int | None  # the total an `approved` approval covers
+    approver_user_id: str | None  # who the pending approval asks (`request_approval`)
     accepts: int  # `accept` messages decided so far
     accept_delay_rounds: int  # the run override `STUB_ACCEPT_DELAY_ROUNDS`
     offer_ttl_seconds: int
@@ -604,9 +611,13 @@ def build_graph(
         result = await tool(
             state, "request_approval", {"order_id": state["order_id"], "amount": amount}
         )
+        # The tool sends the approver's prompt, creates the `approval_expiry` timer and
+        # pauses `run_timeout` in its own transaction. The thread now waits: the next
+        # invocation that reaches a decision node is the `approval_decision` (§8).
         return {
             "approval_id": str(result["approval_id"]),
             "approval_minor": offer["total_minor"],
+            "approver_user_id": result.get("approver_user_id"),
             "phase": AWAITING_APPROVAL,
         }
 
@@ -617,11 +628,34 @@ def build_graph(
             return {"decision": "ignore"}
         if body["status"] == "approved":
             return {"decision": "authorize", "approved_minor": state.get("approval_minor")}
-        return {
+        update: dict[str, Any] = {
             "decision": "cancelled",
             "phase": DONE,
             "finish": {"status": "cancelled", "reason": f"approval_{body['status']}"},
         }
+        if body["status"] == "expired":
+            # CUJ 3: the seller's open quote is closed and the admin is told.
+            out = list(state.get("outgoing") or [])
+            offer = _chosen(state)
+            seller = _seller_of(state, offer["quote_id"])
+            cancel = {
+                "order_id": state["order_id"],
+                "quote_id": offer["quote_id"],
+                "reason": "buyer_cancelled",
+            }
+            conversation = (state.get("conversations") or {}).get(seller)
+            _add(state, out, seller, "cancel", cancel, conversation_id=conversation)
+            admin = state.get("approver_user_id") or state.get("user_id")
+            if admin:
+                notice = {
+                    "user_id": admin,
+                    "template": APPROVAL_CANCELLED_TEMPLATE,
+                    "params": {},
+                    "buttons": [],
+                }
+                _add(state, out, WHATSAPP, "whatsapp_out", notice)
+            update["outgoing"] = out
+        return update
 
     async def authorize(state: HouseholdState) -> dict[str, Any]:
         await accept_delay(state)
@@ -1001,6 +1035,7 @@ class HouseholdGraph:
                 requotes=0,
                 approval_minor=None,
                 approved_minor=None,
+                approver_user_id=None,
                 accepts=0,
                 accept_delay_rounds=_int(run.overrides.get("STUB_ACCEPT_DELAY_ROUNDS"), 0),
                 offer_ttl_seconds=_int(

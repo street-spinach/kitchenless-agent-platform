@@ -13,7 +13,9 @@ others use `@traced`. Every tool body runs inside `meta.tool_errors()`.
     `quote_id`; sets `authorized`, `orders.seller_agent_id` (from the quote), the total,
     the items hash and `order_items`.
 *   `request_approval(order_id, amount)` *guarded*: a `pending` approval for the
-    household's approver; sets `awaiting_approval`.
+    household's approver; sets `awaiting_approval`. In the same transaction it creates the
+    `approval_expiry` timer, pauses `run_timeout` and sends the approver the
+    `approval_request` WhatsApp prompt with Approve and Reject buttons (§8, #63).
 *   `decide_approval(approval_id, decision, user_id)` *guarded*, `api` service token.
 *   `record_delivery(order_id)` *guarded*: one pantry event per SKU of a delivered order.
 
@@ -44,8 +46,10 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, ValidationError
 
-from services.common import db, ids, orders, outbox
+from services.common import db, ids, orders, outbox, runs
+from services.common.config import get_settings
 from services.common.money import Money
+from services.common.money import format as money_format
 from services.common.protocol.schemas import Currency, OrderLine, ShortfallLine
 from services.common.trace import TraceStore
 from services.mcp.knowledge.adapters.neo4j_knowledge import AllergenCheck
@@ -76,6 +80,10 @@ __all__ = [
 
 AREA = "household"
 API_AGENT = "system:api"
+WHATSAPP = "channel:whatsapp"
+# The approver's prompt (architecture §8); its text is in `services/api/whatsapp/sender.py`.
+APPROVAL_PROMPT_TEMPLATE = "approval_request"
+APPROVAL_TTL_OVERRIDE = "APPROVAL_TTL_SECONDS"
 
 # The only states `set_order_state` may set (item 43); the others have their own tools.
 SETTABLE_STATES = frozenset({"quoting", "negotiating", "cancelled"})
@@ -357,6 +365,62 @@ async def authorize_spend(
     )
 
 
+def _approval_ttl_seconds(overrides: Any) -> int:
+    """The run override `APPROVAL_TTL_SECONDS` if it is a positive integer, else the
+    setting (architecture item 36)."""
+    value = overrides.get(APPROVAL_TTL_OVERRIDE) if isinstance(overrides, Mapping) else None
+    try:
+        seconds = int(value) if value is not None and not isinstance(value, bool) else 0
+    except (TypeError, ValueError):
+        seconds = 0
+    return seconds if seconds > 0 else get_settings().approval_ttl_seconds
+
+
+async def _start_approval_wait(
+    conn: AsyncConnection,
+    ctx: CallContext,
+    approval_id: uuid.UUID,
+    order_id: uuid.UUID,
+    approver: str,
+    money: Money,
+) -> None:
+    """The rest of §8 "request_approval", in the tool's transaction: the `approval_expiry`
+    timer, `run_timeout` paused, and the approver's WhatsApp prompt with two buttons."""
+    cur = await conn.execute(
+        "SELECT trigger->'overrides' FROM runs WHERE run_id = %s", (ctx.run_id,)
+    )
+    (overrides,) = await cur.fetchone() or (None,)
+    await conn.execute(
+        "INSERT INTO timers (kind, run_id, due_at, ref)"
+        " VALUES ('approval_expiry', %s, now() + make_interval(secs => %s::float8), %s)",
+        (
+            ctx.run_id,
+            _approval_ttl_seconds(overrides),
+            Jsonb({"approval_id": str(approval_id), "order_id": str(order_id)}),
+        ),
+    )
+    await runs.pause_timeout(conn, ctx.run_id)
+    await outbox.send(
+        conn,
+        message_id=ids.approval_prompt_id(approval_id),
+        run_id=ctx.run_id,
+        conversation_id=None,
+        causation_id=None,
+        from_agent=ctx.agent_id,
+        to_agent=WHATSAPP,
+        type="whatsapp_out",
+        body={
+            "user_id": approver,
+            "template": APPROVAL_PROMPT_TEMPLATE,
+            "params": {"amount": money_format(money, "en")},
+            "buttons": [
+                {"payload": ids.approval_button(approval_id, "approved"), "title": "Approve"},
+                {"payload": ids.approval_button(approval_id, "rejected"), "title": "Reject"},
+            ],
+        },
+    )
+
+
 async def request_approval(
     ctx: CallContext, *, order_id: uuid.UUID, amount: MoneyArg | Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -399,6 +463,7 @@ async def request_approval(
         )
         if not await orders.transition(conn, order_id, "negotiating", "awaiting_approval"):
             raise RuntimeError(f"order {order_id} is no longer negotiating")
+        await _start_approval_wait(conn, ctx, approval_id, order_id, approver[0], money)
         await _TRACES.write(
             ctx.run_id,
             ctx.agent_id,
