@@ -93,6 +93,17 @@ def retry_prompt_id(run_id: UUID) -> UUID:
     return uuid5(run_id, "retry_prompt")
 
 
+NS_TIMER = UUID("b4c1e0d2-5f3a-4e8b-9c7d-1a2b3c4d5e6f")
+
+
+def timer_event_id(timer_id: int) -> UUID:
+    """The source event id of a fired timer; the sweeper's messages use
+    `message_id(timer_event_id(timer_id), ordinal)` (architecture §3)."""
+    if not isinstance(timer_id, int) or isinstance(timer_id, bool):
+        raise ValueError(f"timer_id must be an int, got {timer_id!r}")
+    return uuid5(NS_TIMER, f"timer|{timer_id}")
+
+
 def new_run_id() -> UUID:
     """A fresh `run_id` for `runs.start()` when the caller has none to derive it from.
 

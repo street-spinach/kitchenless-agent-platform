@@ -112,5 +112,12 @@ def test_retry_prompt_id_is_deterministic_per_run() -> None:
     assert ids.retry_prompt_id(run) != ids.retry_prompt_id(uuid4())
 
 
+def test_timer_event_id_is_deterministic_per_timer() -> None:
+    assert ids.timer_event_id(7) == ids.timer_event_id(7) == uuid5(ids.NS_TIMER, "timer|7")
+    assert ids.timer_event_id(7) != ids.timer_event_id(8)
+    with pytest.raises(ValueError):
+        ids.timer_event_id("7")  # type: ignore[arg-type]
+
+
 def test_new_run_id_is_fresh() -> None:
     assert ids.new_run_id() != ids.new_run_id()
