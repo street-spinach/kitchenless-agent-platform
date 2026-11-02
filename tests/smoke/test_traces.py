@@ -11,7 +11,7 @@ from services.agents.common.trace import TraceWriter, read_trace
 
 def test_hello_run_writes_trace_rows() -> None:
     req = urllib.request.Request(
-        "http://hello:8000/hello/run",
+        "http://api:8000/hello/run",
         data=json.dumps({"text": "smoke", "on_behalf_of": "smoke-test"}).encode(),
         method="POST",
     )
