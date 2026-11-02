@@ -1,8 +1,10 @@
 """The `/mcp/household` tools (architecture item 43, agent-protocol P25; issue #46)."""
 
 import asyncio
+import json
 import uuid
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timedelta
 from typing import Any
 
 import psycopg
@@ -11,7 +13,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
-from services.common import db, ids, orders
+from services.common import db, ids, orders, pantry
 from services.identity import fga, tokens
 from services.mcp.household import server as household
 from services.mcp.meta import CallContext
@@ -136,14 +138,14 @@ def _quote(pg: str, run_id: uuid.UUID, order_id: uuid.UUID, seller: str, total: 
     return quote_id
 
 
-def _ctx(run_id: uuid.UUID) -> CallContext:
+def _ctx(run_id: uuid.UUID, env: str = "live") -> CallContext:
     return CallContext(
         run_id=run_id,
         agent_id=AGENT,
         conversation_id=None,
         attempt=1,
         token=tokens.MockIssuer(secret=SECRET).issue(f"user:{USER}", AGENT, ["orders"]),
-        env="live",
+        env=env,
         modes={},
         on_behalf_of=AGENT,
     )
@@ -602,3 +604,223 @@ def test_set_take_turns_changed_flag(pg: str, monkeypatch: pytest.MonkeyPatch) -
     assert row == {"take_turns": True, "set_by": USER}
     assert tap(False) == {"changed": True, "take_turns": False}
     assert len(_results(pg, run_id, "set_take_turns")) == 4
+
+
+# --- Pantry (pantry design P4, PT-A2) ---
+
+ESTIMATE_KEYS = {
+    "pantry_item",
+    "latest_event_id",
+    "kind",
+    "age_hours",
+    "window_hours",
+    "present",
+    "trusted",
+    "confidence",
+}
+
+
+def _catalog(pg: str, agent_id: str, sku: str, pantry_item: str | None) -> None:
+    _exec(
+        pg,
+        "INSERT INTO catalog_items (agent_id, sku, name, price_minor, currency, pantry_item)"
+        " VALUES (%s, %s, %s, 100, 'USD', %s)",
+        agent_id,
+        sku,
+        sku,
+        pantry_item,
+    )
+
+
+def _delivered(pg: str, run_id: uuid.UUID, lines: list[tuple[str, int]]) -> uuid.UUID:
+    order_id = _order(pg, run_id, "delivered")
+    _exec(pg, "UPDATE orders SET seller_agent_id = %s WHERE order_id = %s", SELLER, order_id)
+    for n, (sku, qty) in enumerate(lines, start=1):
+        _exec(
+            pg,
+            "INSERT INTO order_items (order_id, line, sku, name, qty, unit_minor)"
+            " VALUES (%s, %s, %s, %s, %s, 100)",
+            order_id,
+            n,
+            sku,
+            sku,
+            qty,
+        )
+    return order_id
+
+
+def _record_delivery(
+    pg: str, monkeypatch: pytest.MonkeyPatch, run_id: uuid.UUID, order_id: uuid.UUID
+) -> dict[str, Any]:
+    return _with_pool(
+        pg, monkeypatch, lambda: household.record_delivery(_ctx(run_id), order_id=order_id)
+    )
+
+
+def _event(
+    pg: str,
+    item: str,
+    pantry_item: str | None,
+    kind: str = "add",
+    delta: int = 0,
+    age_hours: float = 1,
+    source: str = "eval_setup",
+) -> int:
+    with psycopg.connect(pg) as conn:
+        cur = conn.execute(
+            "INSERT INTO pantry_events (household_id, item, pantry_item, kind, delta, unit,"
+            " source, ts) VALUES (%s, %s, %s, %s, %s, 'each', %s,"
+            " now() - make_interval(secs => %s)) RETURNING event_id",
+            (HOUSEHOLD, item, pantry_item, kind, delta, source, age_hours * 3600),
+        )
+        row = cur.fetchone()
+    assert row is not None
+    return int(row[0])
+
+
+def _get_pantry(
+    pg: str, monkeypatch: pytest.MonkeyPatch, run_id: uuid.UUID, env: str = "eval"
+) -> dict[str, Any]:
+    return _with_pool(pg, monkeypatch, lambda: household.get_pantry(_ctx(run_id, env)))
+
+
+def test_record_delivery_writes_pantry_item(pg: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    run_id = _seed(pg)
+    _catalog(pg, SELLER, "MOCK-MILK-2PCT", "milk")
+    # The same SKU at another seller maps elsewhere: the join is on the order's seller.
+    _catalog(pg, OTHER_SELLER, "MOCK-MILK-2PCT", "eggs")
+    order_id = _delivered(pg, run_id, [("MOCK-MILK-2PCT", 2), ("MOCK-MILK-2PCT", 1)])
+
+    assert _record_delivery(pg, monkeypatch, run_id, order_id) == {
+        "order_id": str(order_id),
+        "recorded": 1,
+    }
+    rows = _query(
+        pg,
+        "SELECT household_id, item, pantry_item, kind, delta, unit, source, order_id, run_id"
+        " FROM pantry_events",
+    )
+    assert rows == [
+        {
+            "household_id": HOUSEHOLD,
+            "item": "MOCK-MILK-2PCT",
+            "pantry_item": "milk",
+            "kind": "add",
+            "delta": 3,
+            "unit": "each",
+            "source": "delivery",
+            "order_id": order_id,
+            "run_id": run_id,
+        }
+    ]
+    # Once per (order_id, item).
+    assert _record_delivery(pg, monkeypatch, run_id, order_id)["recorded"] == 0
+
+
+def test_record_delivery_unmapped_sku_null_pantry_item(
+    pg: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = _seed(pg)
+    _catalog(pg, SELLER, "MOCK-SOAP", None)
+    order_id = _delivered(pg, run_id, [("MOCK-SOAP", 1), ("NOT-IN-CATALOG", 1)])
+
+    assert _record_delivery(pg, monkeypatch, run_id, order_id)["recorded"] == 2
+    rows = _query(pg, "SELECT item, pantry_item, kind FROM pantry_events ORDER BY item")
+    assert rows == [
+        {"item": "MOCK-SOAP", "pantry_item": None, "kind": "add"},
+        {"item": "NOT-IN-CATALOG", "pantry_item": None, "kind": "add"},
+    ]
+
+
+def test_get_pantry_items_unchanged_by_new_rows(pg: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    run_id = _seed(pg)
+    _event(pg, "MOCK-MILK-2PCT", "milk", delta=2, source="delivery")
+    _event(pg, "legacy-bread", None, delta=1, source="delivery")
+    before = _get_pantry(pg, monkeypatch, run_id)["items"]
+    assert before == [
+        {"item": "MOCK-MILK-2PCT", "qty": 2, "unit": "each"},
+        {"item": "legacy-bread", "qty": 1, "unit": "each"},
+    ]
+
+    # Setup-key-style rows: delta 0, item = pantry_item, kinds verify and out (PG8).
+    _event(pg, "milk", "milk", kind="verify")
+    _event(pg, "eggs", "eggs", kind="out")
+    _event(pg, "rice", "rice", kind="add")
+    for env in ("eval", "live"):
+        assert _get_pantry(pg, monkeypatch, run_id, env)["items"] == before
+
+
+def test_get_pantry_estimates_latest_event_wins(pg: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    run_id = _seed(pg)
+    _event(pg, "milk", "milk", kind="add", age_hours=1)
+    # The later event wins even though its ts is older.
+    out = _event(pg, "milk", "milk", kind="out", age_hours=2)
+    eggs = _event(pg, "eggs", "eggs", kind="add", age_hours=5)
+    rice = _event(pg, "rice", "rice", kind="verify", age_hours=400)
+
+    result = _get_pantry(pg, monkeypatch, run_id)
+    assert result["enabled"] is True
+    by_item = {e["pantry_item"]: e for e in result["estimates"]}
+    assert set(by_item) == {"eggs", "milk", "rice"}
+    assert by_item["milk"]["latest_event_id"] == out
+    assert (by_item["milk"]["kind"], by_item["milk"]["present"]) == ("out", False)
+    assert (by_item["milk"]["trusted"], by_item["milk"]["confidence"]) == (False, 0.0)
+    assert by_item["eggs"]["latest_event_id"] == eggs
+    assert (by_item["eggs"]["present"], by_item["eggs"]["trusted"]) == (True, True)
+    assert by_item["eggs"]["window_hours"] == 7 * 24
+    assert by_item["rice"]["latest_event_id"] == rice
+    assert (by_item["rice"]["present"], by_item["rice"]["trusted"]) == (True, False)
+
+
+def test_get_pantry_ignores_legacy_rows(pg: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    run_id = _seed(pg)
+    _event(pg, "milk", None, delta=2, source="delivery")
+    # A name the vocabulary doesn't know is left out too.
+    _event(pg, "caviar", "caviar")
+
+    result = _get_pantry(pg, monkeypatch, run_id)
+    assert result["enabled"] is True
+    assert result["estimates"] == []
+    assert result["items"] == [{"item": "milk", "qty": 2, "unit": "each"}]
+
+
+def test_get_pantry_off_for_live_household(pg: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    run_id = _seed(pg)
+    _event(pg, "milk", "milk", kind="add", age_hours=1)
+
+    result = _get_pantry(pg, monkeypatch, run_id, env="live")
+    assert result["enabled"] is False
+    assert result["estimates"] == []
+    # The same row is estimated for an eval household (PG6: the gate is env alone).
+    assert len(_get_pantry(pg, monkeypatch, run_id)["estimates"]) == 1
+
+
+def test_get_pantry_result_shape(pg: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    run_id = _seed(pg)
+    _event(pg, "MOCK-EGGS-12", "eggs", delta=1, age_hours=1.234567, source="delivery")
+
+    result = _get_pantry(pg, monkeypatch, run_id)
+    assert set(result) == {"household_id", "items", "enabled", "as_of", "estimates"}
+    assert set(result["items"][0]) == {"item", "qty", "unit"}
+    as_of = datetime.fromisoformat(result["as_of"])
+    assert as_of.utcoffset() == timedelta(0)
+    [est] = result["estimates"]
+    assert set(est) == ESTIMATE_KEYS
+    assert isinstance(est["age_hours"], float)
+    assert est["age_hours"] == round(est["age_hours"], 2)
+    assert 1.2 <= est["age_hours"] <= 1.3
+    # The result goes through json.dumps with no default.
+    assert json.loads(json.dumps(result)) == result
+
+
+def test_get_pantry_vocabulary_failure_raises(pg: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    run_id = _seed(pg)
+
+    def broken() -> pantry.Vocabulary:
+        raise ValueError("bad vocabulary")
+
+    monkeypatch.setattr(pantry, "load_vocabulary", broken)
+    with pytest.raises(ValueError, match="bad vocabulary"):
+        _get_pantry(pg, monkeypatch, run_id)
+    # Not enabled: the vocabulary is not read, and estimates stay empty.
+    assert _get_pantry(pg, monkeypatch, run_id, env="live")["estimates"] == []
