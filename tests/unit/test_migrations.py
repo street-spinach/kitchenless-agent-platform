@@ -1,4 +1,5 @@
-"""Migrations 0001-0012 apply in order to an empty database (issues #25, #26, #27, #112, #196)."""
+"""Migrations 0001-0013 apply in order to an empty database (issues #25, #26, #27, #112, #196,
+#226)."""
 
 import uuid
 
@@ -47,6 +48,8 @@ TABLES = {
     "audit_events",
     "fga_models",
     "household_rules",
+    "eval_runs",
+    "eval_results",
 }
 # Tables whose own time column records creation (architecture, Migrations preamble).
 OWN_TIME_COLUMN = {
@@ -57,6 +60,7 @@ OWN_TIME_COLUMN = {
     "pantry_events",
     "audit_events",
     "fga_models",
+    "eval_runs",
 }
 
 
@@ -83,7 +87,7 @@ def test_applies_in_order_on_empty_database(empty_schema_dsn: str) -> None:
         "0009_trace_additions.sql",
     ]
     assert done[9:11] == ["0010_identity.sql", "0011_approval_band.sql"]
-    assert done[11:12] == ["0012_agents.sql"]
+    assert done[11:13] == ["0012_agents.sql", "0013_eval_history.sql"]
     assert apply(empty_schema_dsn) == []
     with psycopg.connect(empty_schema_dsn) as conn:
         rows = conn.execute(
@@ -564,3 +568,59 @@ def test_household_rules_defaults(pg: str) -> None:
             "SELECT take_turns, turn_index, last_turn_order_id, set_by FROM household_rules"
         ).fetchone()
     assert row == (False, 0, None, None)
+
+
+EVAL_RUN_INSERT = (
+    "INSERT INTO eval_runs (eval_run_id, trigger, git_sha, model_mode, models, selection,"
+    " thresholds) VALUES (%s, %s, 'abc123', 'stub', '{}', '{case-1}', '{}')"
+)
+EVAL_RESULT_INSERT = (
+    "INSERT INTO eval_results (eval_run_id, case_id, repeat, category, case_hash, model_mode,"
+    " verdict, error_kind, seconds, checks)"
+    " VALUES (%s, 'case-1', %s, 'safety', 'h', 'stub', 'pass', 'none', 1.5, '{}')"
+)
+
+
+@pytest.mark.parametrize(
+    ("trigger", "ok"),
+    [("nightly", True), ("manual", True), ("d4", True), ("rehearsal", True), ("ci", False)],
+)
+def test_eval_runs_trigger_check(pg: str, trigger: str, ok: bool) -> None:
+    with psycopg.connect(pg) as conn:
+        if ok:
+            conn.execute(EVAL_RUN_INSERT, (uuid.uuid4(), trigger))
+            row = conn.execute(
+                "SELECT tokens, outcome, reason_counts, error_kind_counts, finished_at"
+                " FROM eval_runs"
+            ).fetchone()
+            assert row == (0, None, {}, {}, None)
+        else:
+            with pytest.raises(psycopg.errors.CheckViolation):
+                conn.execute(EVAL_RUN_INSERT, (uuid.uuid4(), trigger))
+    with psycopg.connect(pg) as conn, pytest.raises(psycopg.errors.CheckViolation):
+        conn.execute(EVAL_RUN_INSERT.replace("'stub'", "'replay'"), (uuid.uuid4(), "manual"))
+
+
+def test_eval_results_cascade_with_eval_run(pg: str) -> None:
+    keep, drop = uuid.uuid4(), uuid.uuid4()
+    with psycopg.connect(pg) as conn:
+        for eval_run_id in (keep, drop):
+            conn.execute(EVAL_RUN_INSERT, (eval_run_id, "manual"))
+            conn.execute(EVAL_RESULT_INSERT, (eval_run_id, 0))
+            conn.execute(EVAL_RESULT_INSERT, (eval_run_id, 1))
+    with psycopg.connect(pg) as conn, pytest.raises(psycopg.errors.UniqueViolation):
+        conn.execute(EVAL_RESULT_INSERT, (keep, 1))
+    with psycopg.connect(pg) as conn:
+        row = conn.execute(
+            "SELECT agent_run_ids, tokens, models_used, reason FROM eval_results LIMIT 1"
+        ).fetchone()
+        assert row == ([], 0, [], None)
+        conn.execute("DELETE FROM eval_runs WHERE eval_run_id = %s", (drop,))
+        rows = conn.execute("SELECT eval_run_id FROM eval_results").fetchall()
+        indexes = conn.execute(
+            "SELECT indexdef FROM pg_indexes"
+            " WHERE schemaname = current_schema() AND tablename = 'eval_results'"
+        ).fetchall()
+    assert {r[0] for r in rows} == {keep}
+    assert len(rows) == 2
+    assert any("(case_id, model_mode, created_at DESC)" in r[0] for r in indexes)
