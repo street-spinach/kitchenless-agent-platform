@@ -104,3 +104,13 @@ def test_other_protocol_ids() -> None:
     m = uuid4()
     assert ids.conversation_id(m) == uuid5(m, "conversation")
     assert ids.protocol_error_id(m) == uuid5(m, "protocol_error")
+
+
+def test_retry_prompt_id_is_deterministic_per_run() -> None:
+    run = uuid4()
+    assert ids.retry_prompt_id(run) == ids.retry_prompt_id(run) == uuid5(run, "retry_prompt")
+    assert ids.retry_prompt_id(run) != ids.retry_prompt_id(uuid4())
+
+
+def test_new_run_id_is_fresh() -> None:
+    assert ids.new_run_id() != ids.new_run_id()
