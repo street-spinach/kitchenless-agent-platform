@@ -28,6 +28,7 @@ from tests.unit import model_fakes as mf
 SECRET = "unit-test-mock-token-secret-32-bytes-long"
 USER = uuid.UUID("11111111-1111-4111-8111-111111111111")
 CONSUMER = "consumer:us-1-a"
+ADMIN_NAME = "Asha"
 HOUSEHOLD = "household:us-1"
 CARD = AgentCard(
     agent_id=CONSUMER,
@@ -95,9 +96,11 @@ class World:
         *,
         household: FakeHousehold | None = None,
         overrides: dict[str, Any] | None = None,
+        admin_name: str | None = ADMIN_NAME,
     ) -> None:
         self.run_id = uuid.uuid4()
         self.text = text
+        self.admin_name = admin_name
         self.traces = mf.FakeTraces()
         self.household = household or FakeHousehold()
         self.checkpointer = InMemorySaver()
@@ -117,7 +120,7 @@ class World:
     async def load_run(self, run_id: uuid.UUID) -> cg.RunInfo:
         assert run_id == self.run_id
         self.runs_loaded += 1
-        return cg.RunInfo(household_id="us-1", text=self.text)
+        return cg.RunInfo(household_id="us-1", text=self.text, admin_name=self.admin_name)
 
     def inbound(self, type: str, body: dict[str, Any], *, from_agent: str) -> Inbound:
         raw = {"schema_version": 1, **body}
@@ -333,7 +336,8 @@ def test_learn_dislike_allergy_refused() -> None:
     _valid(result)
     [out] = result.messages
     assert out.body["template"] == "dislike_not_saved"
-    assert out.body["params"] == {}
+    # Experience EX-I2: the reply names the household's first admin.
+    assert out.body["params"] == {"admin": ADMIN_NAME}
     assert result.finish == RunFinish("completed")
     assert not [c for c in w.household.calls if c["tool"] == "record_dislike"]
     [refused] = [d for d in w.traces.of("decision") if d["node"] == "learn_dislike" and "ref" in d]
@@ -409,6 +413,15 @@ def test_learn_dislike_tool_refused_not_saved() -> None:
     w = World("I don't like mushrooms", household=FakeHousehold(dislike_result=ToolRefused("x")))
     [out] = w.step(w.user_message()).messages
     assert out.body["template"] == "dislike_not_saved"
+    assert out.body["params"] == {"admin": ADMIN_NAME}
+
+
+def test_learn_dislike_not_saved_without_an_admin() -> None:
+    # A household with no admin row still gets a renderable reply.
+    w = World("I'm allergic to nuts", admin_name=None)
+    [out] = w.step(w.user_message()).messages
+    assert out.body["template"] == "dislike_not_saved"
+    assert out.body["params"] == {"admin": cg.ADMIN_FALLBACK}
 
 
 def test_learn_dislike_tool_unavailable_fails_the_step() -> None:
@@ -675,3 +688,32 @@ def test_postgres_checkpointer_on_the_shared_pool(pg: str) -> None:
     assert first.finish == RunFinish("completed")
     assert replay == first
     assert w.runs_loaded == 1
+
+
+@pytest.mark.db
+def test_run_sql_reads_first_admin_name(pg: str) -> None:
+    # Experience EX-I2: the run query also reads the household's first admin by
+    # `household_members.created_at`; a later admin or a member is never named.
+    import psycopg
+    from psycopg.types.json import Jsonb
+
+    from tests.unit import api_world as aw
+
+    aw.seed(pg)
+    later_admin = uuid.uuid4()
+    run_id = uuid.uuid4()
+    with psycopg.connect(pg) as conn:
+        conn.execute(
+            "INSERT INTO runs (run_id, household_id, kind, trigger, modes)"
+            " VALUES (%s, %s, 'chat', %s, '{}')",
+            (run_id, aw.HOUSEHOLD_ID, Jsonb({"text": "hi"})),
+        )
+        conn.execute("UPDATE users SET display_name = 'Asha' WHERE user_id = %s", (aw.ADMIN,))
+        conn.execute("INSERT INTO users (user_id, display_name) VALUES (%s, 'Bo')", (later_admin,))
+        conn.execute(
+            "INSERT INTO household_members (household_id, user_id, role, created_at)"
+            " VALUES (%s, %s, 'admin', now() + interval '1 hour')",
+            (aw.HOUSEHOLD_ID, later_admin),
+        )
+        row = conn.execute(cg._RUN_SQL, (run_id,)).fetchone()
+    assert row == (aw.HOUSEHOLD_ID, "hi", "Asha")

@@ -63,7 +63,7 @@ def test_parse_shortfall_button_refuses_malformed(payload: str) -> None:
 
 
 def test_already_decided_has_its_text() -> None:
-    assert sender.TEXTS[ALREADY_DECIDED] == "Already decided."
+    assert sender.TEXTS[ALREADY_DECIDED] == "That's already been decided."
 
 
 # --- ingest ---------------------------------------------------------------------------------

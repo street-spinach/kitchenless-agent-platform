@@ -53,6 +53,7 @@ from dataclasses import asdict
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Literal
+from zoneinfo import ZoneInfo
 
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import CallToolResult, TextContent
@@ -83,6 +84,7 @@ __all__ = [
     "choose_shortfall_option",
     "create_order",
     "decide_approval",
+    "format_reply_by",
     "get_budget",
     "get_constraints",
     "get_household_allergens",
@@ -401,6 +403,20 @@ def _approval_ttl_seconds(overrides: Any) -> int:
     return seconds if seconds > 0 else get_settings().approval_ttl_seconds
 
 
+_WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+
+def format_reply_by(due_at: datetime, now: datetime, tz: ZoneInfo) -> str:
+    """The `approval_request` reply-by time in the household's time zone (experience
+    EX-I2): "6:30 pm", or "Sat 6:30 pm" when `due_at` is not on today's date there."""
+    local = due_at.astimezone(tz)
+    hour = local.hour % 12 or 12
+    text = f"{hour}:{local.minute:02d} {'am' if local.hour < 12 else 'pm'}"
+    if local.date() != now.astimezone(tz).date():
+        text = f"{_WEEKDAYS[local.weekday()]} {text}"
+    return text
+
+
 async def _start_approval_wait(
     conn: AsyncConnection,
     ctx: CallContext,
@@ -412,18 +428,29 @@ async def _start_approval_wait(
     """The rest of §8 "request_approval", in the tool's transaction: the `approval_expiry`
     timer, `run_timeout` paused, and the approver's WhatsApp prompt with two buttons."""
     cur = await conn.execute(
-        "SELECT trigger->'overrides' FROM runs WHERE run_id = %s", (ctx.run_id,)
+        "SELECT r.trigger->'overrides', h.timezone FROM runs r"
+        " JOIN households h ON h.household_id = r.household_id WHERE r.run_id = %s",
+        (ctx.run_id,),
     )
-    (overrides,) = await cur.fetchone() or (None,)
-    await conn.execute(
+    row = await cur.fetchone()
+    if row is None:
+        raise RuntimeError(f"run {ctx.run_id} has no household")
+    overrides, timezone = row
+    cur = await conn.execute(
         "INSERT INTO timers (kind, run_id, due_at, ref)"
-        " VALUES ('approval_expiry', %s, now() + make_interval(secs => %s::float8), %s)",
+        " VALUES ('approval_expiry', %s, now() + make_interval(secs => %s::float8), %s)"
+        " RETURNING due_at, now()",
         (
             ctx.run_id,
             _approval_ttl_seconds(overrides),
             Jsonb({"approval_id": str(approval_id), "order_id": str(order_id)}),
         ),
     )
+    timer = await cur.fetchone()
+    if timer is None:
+        raise RuntimeError("the approval_expiry timer was not created")
+    due_at, now = timer
+    reply_by = format_reply_by(due_at, now, ZoneInfo(timezone))
     await runs.pause_timeout(conn, ctx.run_id)
     await outbox.send(
         conn,
@@ -437,7 +464,7 @@ async def _start_approval_wait(
         body={
             "user_id": approver,
             "template": APPROVAL_PROMPT_TEMPLATE,
-            "params": {"amount": money_format(money, "en")},
+            "params": {"amount": money_format(money, "en"), "reply_by": reply_by},
             "buttons": [
                 {"payload": ids.approval_button(approval_id, "approved"), "title": "Approve"},
                 {"payload": ids.approval_button(approval_id, "rejected"), "title": "Reject"},

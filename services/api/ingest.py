@@ -11,7 +11,7 @@
     *   A payload starting `sf:` (agent-protocol §10 and P29, #70) is parsed as
         `sf:<shortfall_id>:<line>:<sku | drop>` and calls the household tool
         `choose_shortfall_option` with the `api` service token, in a `RunContext` for the
-        shortfall's run. On `already_decided` the member gets "Already decided."; nothing
+        shortfall's run. On `already_decided` the member gets `already_decided`; nothing
         else is sent, because the tool sends `shortfall_closed` when the last line is
         picked. A malformed payload, an unknown shortfall or a refused call starts nothing.
         If the tool is unavailable the error propagates, so the transaction rolls back and
@@ -26,7 +26,7 @@
 4.  Text equal to "retry", any case: if `runs.retry_target` finds a run, start a new run
     with `retry_of` and send the original request again as `user_message`. Otherwise it is
     normal text.
-5.  Media: reply "Photos and voice notes aren't supported yet." in a `chat` run that is
+5.  Media: reply `media_not_supported` in a `chat` run that is
     finished `completed` at once, since every agent message needs a run.
 6.  Anything else: `runs.start(...)` and send `user_message` to the member's consumer agent.
 
@@ -82,11 +82,12 @@ RETRY_TEXT = "retry"
 SHORTFALL_PREFIX = "sf:"
 HOUSEHOLD_SERVER = "household"
 CHOOSE_SHORTFALL_OPTION = "choose_shortfall_option"
-# The `whatsapp_out` template for "Already decided." (agent-protocol §10).
+# The `whatsapp_out` template for "That's already been decided." (agent-protocol §10).
 ALREADY_DECIDED = "already_decided"
 # The take-turns tap (agents §10): `tt:<order_id>:on|off`.
 SET_TAKE_TURNS = "set_take_turns"
 TAKE_TURNS_SAVED = "take_turns_saved"
+TAKE_TURNS_NOT_APPROVER = "take_turns_not_approver"
 
 
 @dataclass(frozen=True)
@@ -283,6 +284,14 @@ async def ingest(
     return started
 
 
+# The household approver's display name (experience EX-I2).
+_APPROVER_NAME_SQL = """
+SELECT u.display_name FROM approval_rules r
+JOIN users u ON u.user_id = r.approver_user_id
+WHERE r.household_id = %s
+"""
+
+
 async def _take_turns_tap(
     conn: AsyncConnection,
     run_id: uuid.UUID,
@@ -294,23 +303,31 @@ async def _take_turns_tap(
     call_tool: CallTool,
 ) -> None:
     """Steps 2 to 5 of the take-turns tap (agents §10): `set_take_turns` with `api`'s
-    service token in the new run; `take_turns_saved` only if the setting changed; any
-    refusal is logged and sends nothing; the run ends `completed`.
+    service token in the new run; `take_turns_saved` only if the setting changed; a
+    `wrong_approver` refusal replies `take_turns_not_approver` with the approver's name
+    (experience EX-I2); any other refusal is logged and sends nothing; the run ends
+    `completed`.
 
     If the tool cannot be reached the error propagates, nothing is sent and the run is
     left to its `run_timeout`. The tap can simply be sent again.
     """
     args = {"order_id": str(order_id), "on": on, "user_id": str(member.user_id)}
     ctx = RunContext(run_id=run_id, agent_id=API_AGENT, conversation_id=None)
+    reason: str | None = None
     try:
         result = await call_tool(
             HOUSEHOLD_SERVER, SET_TAKE_TURNS, args, ctx=ctx, token=_service_token()
         )
     except ToolRefused as refused:
         log.info("take-turns tap refused: %s", refused.reason)
-        result = {}
+        result, reason = {}, refused.reason
     async with conn.transaction():
-        if result.get("changed") is True:
+        if reason == WRONG_APPROVER:
+            cur = await conn.execute(_APPROVER_NAME_SQL, (member.household_id,))
+            (name,) = await cur.fetchone() or (None,)
+            params = {"approver": name or "the approver"}
+            await _reply(conn, run_id, member, inbound, TAKE_TURNS_NOT_APPROVER, params)
+        elif result.get("changed") is True:
             state = {"state": "on" if result.get("take_turns") else "off"}
             await _reply(conn, run_id, member, inbound, TAKE_TURNS_SAVED, state)
         await runs.finish(conn, run_id, API_AGENT, "completed", SET_TAKE_TURNS)
@@ -387,7 +404,7 @@ async def _approval_tap(
     *   Decided (now, or by an earlier tap of the approver): send `approval_decision` to
         the household agent, cancel the `approval_expiry` timer and give the run a new
         `run_timeout` (§4 timers).
-    *   Expired: reply "This approval has already expired." (CUJ 3).
+    *   Expired: reply `approval_expired` (CUJ 3).
     *   Not the approver: reply "Only <approver> can approve this." The guard has written
         the refused `tool_result` row (CUJ 7).
     Anything else (an unknown approval, another refusal) changes nothing.

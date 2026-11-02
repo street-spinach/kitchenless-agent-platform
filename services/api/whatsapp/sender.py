@@ -85,44 +85,82 @@ REQUEST_TIMEOUT_SECONDS = 8.0
 # WhatsApp reply buttons: at most 3 per message.
 MAX_BUTTONS = 3
 
-# The texts the designs fix (architecture §9 and item 33). Other wording belongs to the
-# agents and experience designs, which add their templates here; until then such a
-# message is not sent (fails closed).
+# The message catalog (experience §6). `{x}` is a `params` value; lists are passed already
+# joined, as one string param. A key that is not here is not sent (fails closed).
 TEXTS: dict[str, str] = {
-    "retry_prompt": "I couldn't finish this. Reply *retry* to try again.",
-    "media_not_supported": "Photos and voice notes aren't supported yet.",
+    "retry_prompt": "I couldn't finish that. Reply *retry* and I'll try again.",
+    "media_not_supported": "I can't read photos or voice notes yet. Please type it.",
     # Agent-protocol §10 "Replies".
-    "already_decided": "Already decided.",
-    # Approvals (architecture §8, CUJs 3 and 7, item 33; #63). `{name}` is a `params` value.
-    # Neutral wording (agents AG-A14): an approval is not always about the budget.
-    "approval_request": "Your agent wants to spend {amount} and needs your approval. Approve?",
-    "approval_expired": "This approval has already expired.",
+    "already_decided": "That's already been decided.",
+    # Approvals (architecture §8, CUJs 3 and 7). Neutral wording (agents AG-A14): an
+    # approval is not always about the budget. `reply_by` is the expiry time (EX-I2).
+    "approval_request": (
+        "Your agent wants to spend {amount} and needs your approval. Reply by {reply_by}."
+    ),
+    "approval_expired": "This approval has expired, so the order was cancelled.",
     "approval_not_approver": "Only {approver} can approve this.",
-    "approval_cancelled": "Order cancelled: no approval.",
-    # Agents §11. Lists are passed already joined, as one string param.
+    "approval_cancelled": "Order cancelled: it wasn't approved.",
+    # Agents §11.
     "chat_reply": "{text}",
     "order_summary": "{text}",
-    "no_offers": "No store could fill this order right now.",
-    "off_topic_reply": ("I can only help with food: planning meals, groceries and dinner orders."),
+    "no_offers": "No store could fill this order right now. Reply *retry* to try again.",
+    "off_topic_reply": "I can only help with food: meals, groceries and dinner orders.",
     "dislike_saved": (
-        "Saved: you dislike {value}. This is a dislike, not an allergy; "
-        "your household admin sets allergies."
+        "Saved: you don't like {value}. I'll avoid it when I can. "
+        "Allergies are set by your household admin."
     ),
-    "dislike_removed": "Done: {value} is no longer on your dislikes.",
+    "dislike_removed": "Done: {value} is off your dislikes.",
     "dislike_not_removed": (
-        "I can only forget dislikes you told me. Ask your household admin to change the others."
+        "I can only forget dislikes you told me. Your household admin can change the others."
     ),
-    "dislike_not_saved": "I can't save that. Allergies and diets are set by your household admin.",
+    "dislike_not_saved": "Allergies and diets are saved by {admin}. Ask them to tell me.",
     "take_turns_offer": (
-        "One person's dislike ({values}) was in tonight's dinner. "
-        "Want me to take turns on whose dislikes come first for household dinners?"
+        "Tonight's dinner had something one person doesn't like ({values}). "
+        "Want me to take turns on whose dislikes come first?"
     ),
     "take_turns_offer_off": (
-        "One person's dislike ({values}) was in tonight's dinner. Take turns is on; tap to stop it."
+        "Tonight's dinner had something one person doesn't like ({values}). Take turns is on."
     ),
     "take_turns_saved": "Take turns is now {state}.",
-    # Pantry §6: a weekly order with everything at home (PT-OD5).
+    "take_turns_not_approver": "Only {approver} can change take turns.",
+    # Agent-protocol §10: model-written shortfall text, buttons built by code.
+    "shortfall_prompt": "{text}",
+    "shortfall_result": "{text}",
+    # Pantry §6: a weekly order with everything at home (PT-OD5). Its experience §6
+    # wording lands with pantry P5's sender, not here (EX-I1).
     "nothing_needed": "Nothing to order this week. Already at home: {items}.",
+    # Onboarding by chat (experience §9).
+    "setup_ask": (
+        "Let's set up your household. Tell me who lives with you (and the phone number of "
+        "each adult who'll use WhatsApp), any allergies or diets, and your weekly food budget."
+    ),
+    "setup_restate": "I'll save: {lines}. {unmatched}Nothing else is saved.",
+    "setup_remove_confirm": "Remove {value} for {name}? Orders could then include it.",
+    "setup_saved": "Saved.",
+    "setup_complete": "You're set up. Tell me when you'd like your first order.",
+    "setup_discarded": "OK, nothing was saved.",
+    "setup_not_admin": "Only {admin} can change this.",
+    "setup_expired": "That expired. Send it again and I'll restate it.",
+    "setup_not_understood": (
+        "I didn't catch that. Try one person at a time, for example: Kavi is allergic to peanuts."
+    ),
+    "setup_phone_taken": "{phone} is already in another household, so I didn't add it.",
+    "join_link": "Send this to {name}. It works only from {phone}: {link}",
+    "joined": "Welcome, {name}. You're in {household}. Tell me anything you don't like to eat.",
+    # The /me pages (experience §8).
+    "me_link": "Here's your page. The link works for 10 minutes: {link}",
+    # Held items (experience §5).
+    "held_cancelled_line": (
+        "While you were away, the order for {amount} was cancelled because it wasn't "
+        "approved in time."
+    ),
+    # Reminders (experience §10).
+    "reminder_delivery_today": (
+        "Groceries from {store} arrive today, {window}. Nothing needed from you."
+    ),
+    "reminder_pantry_summary": "At home by our records: {at_home}. Not sure about: {unsure}.",
+    "reminders_off": "Reminders are off. Write *reminders on* to turn them back on.",
+    "reminders_on": "Reminders are on.",
 }
 
 
