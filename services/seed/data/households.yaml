@@ -2,6 +2,9 @@
 # Phones here are fictional 555-01xx numbers. us-1's real numbers come from
 # SEED_US1_PHONES at seed time; no real number is ever committed (test_seed.py).
 # Member roles: the approver is `admin`; a child is `child`; everyone else `member`.
+# `keycloak_user_id` is the member's fixed Keycloak user id (identity-authz §3, I27): the
+# realm file services/identity/realm/kitchenless.json uses the same ids
+# (tests/unit/test_realm_file.py).
 
 defaults: &us
   region: us
@@ -22,9 +25,11 @@ households:
       postal_code: "45202"
       country: US
     members:
-      - {member_id: us-1-a, role: admin, approver: true}
-      - {member_id: us-1-b, role: member}
-      - {member_id: us-1-c, role: child, allergies: [tree_nuts]}
+      - {member_id: us-1-a, keycloak_user_id: 4ec40af4-f3ed-45f8-aece-861a4bca8cdb, role: admin,
+         approver: true}
+      - {member_id: us-1-b, keycloak_user_id: 5edc0c8a-872c-4913-8acd-dd725978804e, role: member}
+      - {member_id: us-1-c, keycloak_user_id: 254a0ad1-1a33-4595-974a-e77712478340, role: child,
+         allergies: [tree_nuts]}
     # Three phones, in member order, from SEED_US1_PHONES; channel_mode 'real'.
     phones_from_env: SEED_US1_PHONES
 
@@ -37,8 +42,10 @@ households:
       <<: *addr
       line1: 200 Main Street
     members:
-      - {member_id: us-2-a, role: admin, approver: true, phone: "+15550100001"}
-      - {member_id: us-2-b, role: member, phone: "+15550100002"}
+      - {member_id: us-2-a, keycloak_user_id: ee21d97a-1d0a-47e1-bcf2-a78f8261a2b5, role: admin,
+         approver: true, phone: "+15550100001"}
+      - {member_id: us-2-b, keycloak_user_id: 575f5395-98b6-4832-8a99-0ecc93f14017, role: member,
+         phone: "+15550100002"}
 
   - household_id: us-1-eval
     name: US household 1 (eval)
@@ -49,9 +56,12 @@ households:
       <<: *addr
       line1: 101 Main Street
     members:
-      - {member_id: us-1-a-eval, role: admin, approver: true, phone: "+15550100101"}
-      - {member_id: us-1-b-eval, role: member, phone: "+15550100102"}
-      - {member_id: us-1-c-eval, role: child, allergies: [tree_nuts], phone: "+15550100103"}
+      - {member_id: us-1-a-eval, keycloak_user_id: d8908afd-9847-4d66-823c-4fd581578df4,
+         role: admin, approver: true, phone: "+15550100101"}
+      - {member_id: us-1-b-eval, keycloak_user_id: c365e5d4-6d30-410c-b43c-51c9f7904ad7,
+         role: member, phone: "+15550100102"}
+      - {member_id: us-1-c-eval, keycloak_user_id: 0c4be7f4-133f-4168-ba33-4f74862e892f,
+         role: child, allergies: [tree_nuts], phone: "+15550100103"}
 
   - household_id: us-2-eval
     name: US household 2 (eval)
@@ -62,8 +72,10 @@ households:
       <<: *addr
       line1: 201 Main Street
     members:
-      - {member_id: us-2-a-eval, role: admin, approver: true, phone: "+15550100104"}
-      - {member_id: us-2-b-eval, role: member, phone: "+15550100105"}
+      - {member_id: us-2-a-eval, keycloak_user_id: a5efaafb-175d-4ab9-a340-44d77e4e6517,
+         role: admin, approver: true, phone: "+15550100104"}
+      - {member_id: us-2-b-eval, keycloak_user_id: 9c5274b0-7830-4a19-a409-74aea9d50663,
+         role: member, phone: "+15550100105"}
 
   # Agent-protocol P34: the buyer household of `a2a_demo` runs. One address, no members.
   - household_id: a2a-demo

@@ -191,3 +191,12 @@ def test_inbound_id_is_deterministic_per_channel_and_external_id() -> None:
 
 def test_new_run_id_is_fresh() -> None:
     assert ids.new_run_id() != ids.new_run_id()
+
+
+def test_keycloak_client_id_replaces_the_class_separator() -> None:
+    assert ids.keycloak_client_id("household:us-1") == "household.us-1"
+    assert ids.keycloak_client_id("consumer:us-1-a") == "consumer.us-1-a"
+    assert ids.keycloak_client_id("grocery:square-us") == "grocery.square-us"
+    for bad in ("", "household", "household:", "consumer:hh-1:2"):
+        with pytest.raises(ValueError):
+            ids.keycloak_client_id(bad)
