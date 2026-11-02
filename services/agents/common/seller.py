@@ -100,6 +100,8 @@ LIVE = ("open", "countered")
 PLACED_OR_LATER = frozenset(
     {"placed", "courier_booked", "in_delivery", "delivered", "failed", "cancelled", "expired"}
 )
+# End states reached only before `placed` (architecture §8 order states).
+NEVER_PLACED = frozenset({"cancelled", "expired"})
 HANDLED_TYPES = frozenset(
     {
         "quote_request",
@@ -749,7 +751,9 @@ class SellerHandler:
     async def _cancel(self, step: _Step) -> None:
         quote = await self._quote_of(step)
         order = await self.store.order(quote.order_id)
-        if order is None or order.state in PLACED_OR_LATER:
+        # An order that ended before `placed` (`expired` approval, `cancelled`) still closes
+        # its open quote (CUJ 3); only a placed order answers `already_placed`.
+        if order is None or order.state in PLACED_OR_LATER - NEVER_PLACED:
             step.reject(quote, "already_placed")
             return
         if quote.status in (*LIVE, "accepted"):

@@ -42,6 +42,40 @@ class Graph:
         )
 
 
+def test_approval_prompt_renders_amount_and_buttons() -> None:
+    # #63: the approver's prompt names the amount and carries Approve and Reject.
+    graph = Graph(200)
+    approval = uuid.uuid4()
+    buttons = [
+        {"payload": f"ap:{approval}:approved", "title": "Approve"},
+        {"payload": f"ap:{approval}:rejected", "title": "Reject"},
+    ]
+    params = {"amount": "$76.00"}
+    body = {**RETRY, "template": "approval_request", "params": params, "buttons": buttons}
+    asyncio.run(graph.sender()(PHONE, body))
+    sent = json.loads(graph.requests[0].content)
+    assert sent["interactive"]["body"]["text"] == (
+        "Your agent wants to spend $76.00, over this week's budget. Approve?"
+    )
+    titles = [b["reply"]["title"] for b in sent["interactive"]["action"]["buttons"]]
+    assert titles == ["Approve", "Reject"]
+
+
+@pytest.mark.parametrize(
+    ("template", "params", "text"),
+    [
+        ("approval_expired", {}, "This approval has already expired."),
+        ("approval_not_approver", {"approver": "Asha"}, "Only Asha can approve this."),
+        ("approval_cancelled", {}, "Order cancelled: no approval."),
+    ],
+)
+def test_approval_reply_texts(template: str, params: dict[str, str], text: str) -> None:
+    # Architecture CUJs 3 and 7 fix these texts (#63).
+    payload = s.graph_payload(PHONE, {**RETRY, "template": template, "params": params})
+    assert payload is not None
+    assert payload["text"]["body"] == text
+
+
 def test_first_attempt_succeeds_sends_one_text_message() -> None:
     graph = Graph(200)
     asyncio.run(graph.sender()(PHONE, RETRY))

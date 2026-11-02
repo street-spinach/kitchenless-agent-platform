@@ -406,6 +406,22 @@ def test_cancel_after_placed_rejected(pg: str) -> None:
     assert w.quote()["status"] == "accepted"
 
 
+def test_cancel_after_approval_expired_closes_quote(pg: str) -> None:
+    # CUJ 3 (#63): the sweeper set the order `expired`; the household's `cancel` closes the
+    # open quote instead of answering `already_placed`.
+    w = World(pg)
+    w.request()
+    w.execute("UPDATE orders SET state = 'expired' WHERE order_id = %s", (w.order_id,))
+    mid = w.step(
+        "cancel",
+        w.decision_body(reason="buyer_cancelled"),
+        conversation_id=w.quote()["conversation_id"],
+    )
+    assert w.sent("reject", cause=mid) == []
+    q = w.quote()
+    assert (q["status"], q["closed_by"]) == ("rejected", "buyer")
+
+
 def test_no_courier_rejects_accepted_quote(pg: str) -> None:
     w = World(pg)
     w.request()

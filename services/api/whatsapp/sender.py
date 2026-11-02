@@ -91,13 +91,29 @@ MAX_BUTTONS = 3
 TEXTS: dict[str, str] = {
     "retry_prompt": "I couldn't finish this. Reply *retry* to try again.",
     "media_not_supported": "Photos and voice notes aren't supported yet.",
+    # Approvals (architecture §8, CUJs 3 and 7, item 33; #63). `{name}` is a `params` value.
+    "approval_request": "Your agent wants to spend {amount}, over this week's budget. Approve?",
+    "approval_expired": "This approval has already expired.",
+    "approval_not_approver": "Only {approver} can approve this.",
+    "approval_cancelled": "Order cancelled: no approval.",
 }
+
+
+def _render(template: str, params: Any) -> str | None:
+    text = TEXTS.get(template)
+    if text is None:
+        return None
+    try:
+        return text.format_map(dict(params or {}))
+    except (KeyError, IndexError, ValueError, TypeError):
+        return None  # a missing param: not sent (fails closed)
 
 
 def graph_payload(phone: str, body: dict[str, Any]) -> dict[str, Any] | None:
     """The Graph API `/messages` request for a `whatsapp_out` body, or `None` if its
-    template has no text here or it has more buttons than WhatsApp allows."""
-    text = TEXTS.get(body.get("template", ""))
+    template has no text here, a param it names is missing, or it has more buttons than
+    WhatsApp allows."""
+    text = _render(body.get("template", ""), body.get("params"))
     buttons = body.get("buttons") or []
     if text is None or len(buttons) > MAX_BUTTONS:
         return None
