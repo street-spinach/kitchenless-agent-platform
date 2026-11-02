@@ -29,6 +29,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from services.agents import sweeper
+from services.agents.consumer import graph as consumer_graph
 from services.common import db, directory, runs
 from services.common import logging as app_logging
 from services.common.config import get_settings
@@ -61,7 +62,7 @@ Backlog = dict[str, dict[str, Any]]
 
 # One handler per agent class (`handle(msg, card) -> StepResult`, architecture items 28-30).
 # The graphs and business handlers register here as their build steps land.
-HANDLERS: dict[str, ClassHandler] = {}
+HANDLERS: dict[str, ClassHandler] = {"consumer": consumer_graph.handle}
 
 _BACKLOG_SQL = """
 SELECT to_host,

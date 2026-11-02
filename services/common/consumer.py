@@ -53,6 +53,7 @@ __all__ = [
     "InjectedFailure",
     "Outgoing",
     "QuoteUpdate",
+    "RunFinish",
     "ShortfallUpdate",
     "StaleUpdate",
     "StepFailed",
@@ -226,13 +227,26 @@ class TimerCancel:
 
 
 @dataclass(frozen=True)
+class RunFinish:
+    """`runs.finish(status, reason)` for the inbound message's run, by its receiver."""
+
+    status: str
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
 class StepResult:
-    """What a step commits in its one final transaction (architecture §4, A18)."""
+    """What a step commits in its one final transaction (architecture §4, A18).
+
+    `finish` ends the run after the step's messages are sent, in the same transaction (a
+    `chat` run's reply, architecture item 28).
+    """
 
     messages: Sequence[Outgoing] = ()
     timers: Sequence[TimerCreate | TimerCancel] = ()
     quote_updates: Sequence[QuoteUpdate] = ()
     shortfall_updates: Sequence[ShortfallUpdate] = ()
+    finish: RunFinish | None = None
 
 
 Handler = Callable[[Inbound], Awaitable[StepResult]]
@@ -242,7 +256,7 @@ class FinishRun(Protocol):
     """The shape of `runs.finish` (architecture item 24), called by the poison rule."""
 
     async def __call__(
-        self, conn: AsyncConnection, run_id: UUID, agent_id: str, status: str, reason: str
+        self, conn: AsyncConnection, run_id: UUID, agent_id: str, status: str, reason: str | None
     ) -> bool: ...
 
 
@@ -465,6 +479,10 @@ class Consumer:
             )
         for t in r.timers:
             await _apply_timer(conn, t, row.run_id)
+        if r.finish is not None:
+            if self.finish_run is None:
+                raise RuntimeError("the step finishes its run but no finish_run is configured")
+            await self.finish_run(conn, row.run_id, row.to_agent, r.finish.status, r.finish.reason)
         cur = await conn.execute(_PROCESSED_SQL, (row.message_id,))
         if cur.rowcount != 1:
             raise StaleUpdate(f"message {row.message_id} is no longer processing")

@@ -524,6 +524,41 @@ def test_failed_conditional_update_rolls_back_step(pg: str) -> None:
     assert w.query("SELECT 1 FROM timers WHERE run_id = %s", (w.run_id,)) == []
 
 
+def test_step_finish_ends_run_in_the_step_commit(pg: str) -> None:
+    from services.common import runs
+
+    w = World(pg)
+    mid = w.insert()
+
+    async def handle(msg: c.Inbound) -> c.StepResult:
+        return c.StepResult(messages=[_confirm(w, msg)], finish=c.RunFinish("completed"))
+
+    step_once(pg, handle, finish_run=runs.finish)
+    assert w.message(mid)["status"] == "processed"
+    [run] = w.query("SELECT status, reason FROM runs WHERE run_id = %s", (w.run_id,))
+    assert (run["status"], run["reason"]) == ("completed", None)
+    [outcome] = w.query(
+        "SELECT agent_id, payload FROM agent_traces WHERE run_id = %s AND kind = 'outcome'",
+        (w.run_id,),
+    )
+    assert outcome["agent_id"] == GROCERY
+    assert outcome["payload"]["status"] == "completed"
+    assert len(w.query("SELECT 1 FROM agent_messages WHERE type = 'order_confirm'")) == 1
+
+
+def test_step_finish_without_finish_run_retries(pg: str) -> None:
+    w = World(pg)
+    mid = w.insert()
+
+    async def handle(msg: c.Inbound) -> c.StepResult:
+        return c.StepResult(finish=c.RunFinish("completed"))
+
+    step_once(pg, handle)
+    assert w.message(mid)["status"] == "pending"
+    [run] = w.query("SELECT status FROM runs WHERE run_id = %s", (w.run_id,))
+    assert run["status"] == "running"
+
+
 # Eval-only hooks (agent-protocol P12). -------------------------------------------------
 
 
