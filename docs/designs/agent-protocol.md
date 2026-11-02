@@ -2,7 +2,7 @@
 
 *   **Author:** madushankaf
 *   **Status:** Approved; amended 2026-11-01 (identity-authz I-P1: per-message tokens
-    closed)
+    closed); amended 2026-11-02 (adapters, #146)
 *   **Date:** 2026-10-31
 *   **Path:** `docs/designs/agent-protocol.md`
 *   **Builds on:** `docs/designs/architecture.md` (approved; amended 2026-10-31, commit
@@ -1637,6 +1637,10 @@ Makefile (P44).
 *   **Type / Scope**: Mock adapters.
 *   **Proposed Changes**: `amend_order` updates the `mock_orders` body under the key. The
     real Square and Kroger adapters return an `unsupported` refusal (adapters design).
+*   *Amended 2026-11-02 (adapters, #146):* there is no real Kroger adapter (Kroger is
+    simulated). The Square classes leave `amend_order` out of their `OPERATIONS`, and the
+    seller tool refuses with `refused / unsupported / retryable=false` before the key claim
+    (adapters.md §8).
 
 ##### P28. `services/safety/limits.py` (Create, *critical*; extends architecture item 51)
 

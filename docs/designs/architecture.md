@@ -4,7 +4,7 @@
 *   **Status:** Approved; amended 2026-10-31 (bounded model calls for business agents);
     amended 2026-10-31 (agent-protocol); amended 2026-10-31 (build step 1 ports and smoke);
     amended 2026-11-01 (MCP client contract); amended 2026-11-01 (identity-authz);
-    amended 2026-11-01 (tool_errors signature)
+    amended 2026-11-01 (tool_errors signature); amended 2026-11-02 (adapters, #146)
 *   **Date:** 2026-10-31
 *   **Path:** `docs/designs/architecture.md`
 
@@ -270,6 +270,9 @@ Each goal has a test, an eval or a measurement in the Verification Plan.
         sandbox in the adapters design.
     *   Whether DoorDash signs webhooks is also unverified (see Risks).
 
+    *Amended 2026-11-02 (adapters, #146):* restated. Q6 closes when the first real courier key exists (adapters.md §12).
+    It blocks no build step. DoorDash Drive is simulated until then.
+
 ## Critical User Journeys (CUJs)
 
 ### CUJ 1: Weekly grocery order, within budget
@@ -356,6 +359,9 @@ Each goal has a test, an eval or a measurement in the Verification Plan.
         retry message.
     *   The operator can switch `MODEL_MODE` to `stub` for the rest of the demo (§6).
 
+*Amended 2026-11-02 (adapters, #146):* DoorDash is simulated (adapters.md). The vendor failure in this journey happens on
+the Square card: the operator switches `square_retail` or `square_restaurant` to `mock`.
+
 ### CUJ 6: Busy-night dinner
 
 *   **Given**: household `us-1`, and restaurant agents `restaurant:square-us` and
@@ -399,6 +405,7 @@ The brief's decisions are numbered D1–D24 and its data requirements R1–R13
 | Brief §2.8 step 6 (delivery handoff) | "Store B hands off to a delivery agent" | The seller agent sends `delivery_request` with an `address_ref`. The delivery agent calls `book_delivery`. | Keeps the address out of every agent message (G5). |
 | ENGINEERING_PROCESS §11, §13.2 (deploys) | Build images on the VM (`up --build`) | Build in GitHub Actions, push to GHCR, pull on the VM. Roll back by image tag. | A Docker build next to the running stack can run out of memory on 4 GB. |
 | ENGINEERING_PROCESS §12.7 (model in CI) | Real model for `eval-fast` in CI and for the deploy scenario | `MODEL_MODE=stub` in CI and deploy checks. The real model runs nightly and in rehearsal. | Cost, and a provider outage would block merges and roll back good code. |
+| Brief D15, §4.7, §7 (vendors) | DoorDash Drive and Kroger as real integrations | Square sandbox is the one real vendor; DoorDash Drive, Uber Direct and a Kroger-modelled store are simulated on the mocks (adapters.md, amended 2026-11-02, #146) | Kroger's developer site and DoorDash's sign-up are not reachable from the owner's location. |
 
 ### 2. Services
 
@@ -482,6 +489,10 @@ Later designs use these identifiers and must not redefine them.
 
 That is 14 logical agents in the live environment, plus 7 eval copies of the consumer and
 household agents. The business agents are shared between environments.
+
+*Amended 2026-11-02 (adapters, #146):* agent ids are unchanged. `grocery:kroger-us` is shown as "Hillcrest Market
+(simulated)", `delivery:doordash-us` as "DoorDash Drive (simulated)" and `delivery:mock-us`
+as "Uber Direct (simulated)"; only the two Square cards can be real (adapters.md §6).
 
 ### 4. Agent runtime
 
@@ -629,6 +640,9 @@ outbox and marks the timer `done`.
 | `/mcp/household` | Orders, constraints, pantry, budget, approvals | Consumer and household agents | Postgres only |
 | `/mcp/knowledge` | Allergens, substitutions, explanations | Consumer and household agents | Neo4j, seeded from Open Food Facts |
 
+*Amended 2026-11-02 (adapters, #146):* Square retail and Square restaurant are the only real adapters (sandbox). Kroger
+and DoorDash are mock; there is no Kroger catalog sync (adapters.md §3, §7).
+
 **Tool traces.** Every tool call is traced on the server side. Guarded tools are traced by the
 guard; unguarded tools by a `traced` wrapper. Agents never write `tool_call` rows
 themselves, so each call has exactly one writer.
@@ -689,6 +703,12 @@ call.
 A refusal at any step raises `GuardRefused(reason)` and writes a `tool_result` row with
 `refused=true`.
 
+*Amended 2026-11-02 (adapters, #146):* step 4 also takes over a same-hash `in_progress` key that the **same run**
+claimed, at any age. Step 7 stores the result only while the key is `in_progress`; a later
+call gets the stored result, skips the state change and returns it (adapters.md §9, #156).
+Seller tools refuse an operation their adapter class does not support with `unsupported`
+at step 3 (adapters.md §8).
+
 **The address path (G5).**
 
 1.  The seller collects delivery quotes, then writes `orders.delivery_agent_id` through
@@ -714,6 +734,11 @@ keys are `kroger_catalog`, `kroger_ordering`, `square_retail`, `square_restauran
 `kroger_ordering` is always mock. `runs.start()` resolves the modes once and stores them in
 `runs.modes`. Every tool call in that run uses those modes. Real or simulated WhatsApp is not
 a mode; it comes from `channel_identities.channel_mode` for each phone number.
+
+*Amended 2026-11-02 (adapters, #146):* every vendor key with no real adapter class (`kroger_catalog`, `kroger_ordering`,
+`doordash`) is always mock. A key missing from a non-empty `runs.modes` means `mock`; an
+empty `runs.modes` raises. Runs of `eval` households pin every key to `mock` (adapters.md
+§3).
 
 **Mock backends.**
 
@@ -949,6 +974,9 @@ the user and the control panel. There are no holds: an open quote simply expires
 | mock or DoorDash `delivered` | `delivered` |
 | mock `failed`; DoorDash `cancelled` | `failed`. The run ends with `status=error, reason=delivery_failed`. |
 
+*Amended 2026-11-02 (adapters, #146):* only the mock names apply. The DoorDash column is kept for a future real courier
+(adapters.md Future Improvements).
+
 **Approval.**
 
 *   An approval is required exactly when the order total is greater than the remaining
@@ -990,6 +1018,9 @@ the user and the control panel. There are no holds: an open quote simply expires
 | Trace write fails before a guarded call | Exception | 1 | The adapter is not called; `status=error` | Retry message |
 | Seed fails during deploy | `make seed` exit code | 1 | The deploy fails and rolls back (§11) | Nothing |
 | Protocol errors, expired offers, shortfalls and A2A client errors | See agent-protocol §12 | | | |
+
+*Amended 2026-11-02 (adapters, #146):* each adapter call runs inside one 10 s deadline (3 s to connect), below the
+client's 15 s timeout, so the first attempt has ended before the retry (adapters.md §7).
 
 **Retry.**
 
@@ -1127,6 +1158,9 @@ runs end with `reason=model_unavailable`, the nightly workflow titles the issue 
 evals: model unavailable" instead of "Eval regression".
 
 ### 13. Provisional contracts owned by later designs
+
+*Amended 2026-11-02 (adapters, #146):* the MCP tool names and arguments are fixed as listed in item 43, with the
+additions in adapters.md §10.
 
 This design needs a minimum shape for some contracts that SITEMAP.md gives to later designs.
 The later designs may add fields and values. They must not rename or remove the ones below
@@ -1324,6 +1358,9 @@ without changing this design too.
 *   **Cons**: Sign-up is limited by region and may not work from Sri Lanka.
 *   **Reason for Rejection**: The mock courier is the second courier.
 
+*Amended 2026-11-02 (adapters, #146):* this stands. Uber Direct is simulated on the mock courier card
+(`delivery:mock-us`), not added as a card (adapters.md AD2).
+
 ### Alternative W: Everyone on real WhatsApp
 
 *   **Pros**: The most realistic demo.
@@ -1443,6 +1480,9 @@ provisional shapes in §13 are enough to start every step in mock mode.
 7.  **Real adapters.** Square retail and restaurant, DoorDash Drive and its webhook, and the
     Kroger catalog sync, each with contract tests. Then the restaurant handler and the
     busy-night dinner. Blocked by: step 6, the adapters design, and Q6.
+    *Amended 2026-11-02 (adapters, #146):* narrowed to the Square adapters and vendor labels (adapters.md build
+    steps 2–7). DoorDash Drive, its webhook and the Kroger catalog sync are not built.
+    Blocked by: step 6 and the adapters design.
 8.  **Deploy changes.** The GHCR build, deploy by pull, rollback by tag, the freeze file,
     memory limits, backups, and the G6 measurement. Blocked by: step 7. Memory limits may
     land earlier if the VM runs short.
@@ -2180,6 +2220,8 @@ and values; none of these may be renamed or dropped.
     *   `POST /webhooks/doordash/{secret}`: compares `{secret}` with `DOORDASH_WEBHOOK_PATH_SECRET`
         (404 on mismatch), and verifies the signature too if DoorDash provides one (Q6).
         Deduplicates on the event id through `inbound_messages`.
+        *Amended 2026-11-02 (adapters, #146):* the route stays reserved and returns 404 until a real courier
+        exists.
     *   `apply_delivery_status(conn, external_delivery_id, status)`:
         *   maps the status with `orders.COURIER_STATUS_MAP`;
         *   applies a forward-only `orders.transition`;
@@ -2322,6 +2364,9 @@ and values; none of these may be renamed or dropped.
         return the same minimal typed results (§5).
     *   Square uses two sandbox seller accounts. Account ids and location ids come from
         `agent_cards.config`; tokens come from the environment.
+*   *Amended 2026-11-02 (adapters, #146):* `KrogerCatalogAdapter` and `DoorDashDriveAdapter` are not built.
+    The Square adapters are in adapters.md §7: one or two sandbox accounts, with tokens and
+    location ids from `mcp` Settings.
 
 #### Mocks (`services/mocks/`)
 
@@ -2403,6 +2448,8 @@ and values; none of these may be renamed or dropped.
     files.
 *   **Amended 2026-11-02 (reset scope, #50).** `reset` follows the §7 rule (deletion order,
     `shortfalls`, `sim_outbound` by eval phone, and the `mock_stock_rows("eval")` re-seed).
+*   *Amended 2026-11-02 (adapters, #146):* `inject_event` refuses a `shortfall` event whose order's run pinned
+    the seller's vendor key to `real` (adapters.md §8).
 
 ##### 48. `services/mocks/panel.py` (Keep)
 
@@ -2532,6 +2579,8 @@ and values; none of these may be renamed or dropped.
         `agent:delivery:* can_deliver_for household:*` for each courier and household in
         the same zone.
     *   The Kroger catalog sync into `catalog_items`, only when `MODE_KROGER_CATALOG=real`.
+        *Amended 2026-11-02 (adapters, #146):* not built. The Kroger card seeds from the mock catalog, and
+        `KROGER_LOCATION_ID` is no longer read (adapters.md §12).
     *   Mock stock for both `env` values.
     *   Agent-protocol P34: the `external:a2a-demo` card, the `a2a-demo` eval household,
         `config.description` and `config.card_version` on business cards, and the shortfall
