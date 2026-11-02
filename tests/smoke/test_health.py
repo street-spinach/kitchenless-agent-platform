@@ -67,11 +67,25 @@ def test_caddy_serves_health_over_https() -> None:
         ("GET", "/mcp/grocery"),
         ("POST", "/a2a/grocery-us-1"),
         ("GET", "/a2a/grocery-us-1/.well-known/agent-card.json"),
+        ("POST", "/webhooks/doordash/x"),
     ],
 )
 def test_internal_routes_not_public(method: str, path: str) -> None:
     # These live on api, mcp and agents but must only be reachable inside the Compose network.
     assert caddy_status_line(method, path).startswith(b"HTTP/1.1 404")
+
+
+def test_caddy_routes_whatsapp_webhook_to_api() -> None:
+    # A wrong verify token is refused by api (403), so the request got past Caddy.
+    path = "/webhooks/whatsapp?hub.mode=subscribe&hub.verify_token=wrong&hub.challenge=1"
+    assert caddy_status_line("GET", path).startswith(b"HTTP/1.1 403")
+
+
+@pytest.mark.parametrize("path", ["/me/", "/app/"])
+def test_caddy_routes_me_and_app_to_api(path: str) -> None:
+    # api answers these: the reserved 501 today, a page once identity-authz's routes land.
+    status = caddy_status_line("GET", path)
+    assert status.startswith(b"HTTP/1.1 ") and not status.startswith(b"HTTP/1.1 404")
 
 
 def test_caddy_routes_hello_run_to_api() -> None:

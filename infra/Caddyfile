@@ -14,6 +14,18 @@
 	handle /hello* {
 		reverse_proxy api:8000
 	}
+	# Meta's WhatsApp webhook: verify challenge and signed messages (architecture item 34).
+	handle /webhooks/whatsapp {
+		reverse_proxy api:8000
+	}
+	# Owner app backend on api (architecture item 57; identity-authz I-A14, routes/app.py).
+	handle /app/* {
+		reverse_proxy api:8000
+	}
+	# Magic-link, consent and history pages on api (architecture item 57; identity-authz I-A14, routes/me.py).
+	handle /me/* {
+		reverse_proxy api:8000
+	}
 	# Control panel routes on api, behind basic auth (architecture items 39 and 57).
 	# PANEL_USER and PANEL_PASSWORD_HASH come from docker-compose.yml.
 	handle /panel* {
@@ -28,6 +40,8 @@
 	}
 	# Anything else is not routed. In particular /internal/*, /runs*, /mcp* and the agents
 	# service's /a2a endpoint stay private (tests/smoke test_internal_routes_not_public).
+	# /webhooks/doordash/* stays unrouted until a real courier exists (adapters amendment,
+	# 2026-11-02).
 	handle {
 		respond "Not found" 404
 	}
