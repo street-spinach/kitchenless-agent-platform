@@ -3,6 +3,7 @@
 import psycopg
 import pytest
 
+import authz.apply
 from migrations import apply, checkpointer
 
 TABLES = {"checkpoint_migrations", "checkpoints", "checkpoint_blobs", "checkpoint_writes"}
@@ -61,8 +62,10 @@ def test_apply_main_runs_checkpointer_after_sql(monkeypatch: pytest.MonkeyPatch)
     calls: list[str] = []
     monkeypatch.setenv("DATABASE_URL", "postgresql://unused")
     monkeypatch.setattr(apply, "apply", lambda dsn: calls.append("sql") or [])
+    # The OpenFGA model is applied after the SQL migrations (identity-authz I8).
+    monkeypatch.setattr(authz.apply, "main", lambda: calls.append("authz"))
     monkeypatch.setattr(checkpointer, "main", lambda: calls.append("checkpointer"))
 
     apply.main()
 
-    assert calls == ["sql", "checkpointer"]
+    assert calls == ["sql", "authz", "checkpointer"]

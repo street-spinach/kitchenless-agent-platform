@@ -1,0 +1,61 @@
+# `fga model test --tests authz/model.fga.yaml` (identity-authz I7; `make fga-test`).
+name: kitchenless
+model_file: ./model.fga
+tuples:
+  - user: agent:household.h-1
+    relation: acts_for
+    object: household:h-1
+  - user: agent:household.h-1
+    relation: can_spend
+    object: budget:h-1
+  - user: agent:grocery.mock-us
+    relation: member_of
+    object: org:mock
+  - user: user:admin-1
+    relation: admin
+    object: household:h-1
+  - user: user:member-1
+    relation: member
+    object: household:h-1
+  - user: user:child-1
+    relation: child
+    object: household:h-1
+tests:
+  - name: a household agent with can_spend may spend; a business agent has no acts_for
+    check:
+      - user: agent:household.h-1
+        object: budget:h-1
+        assertions:
+          can_spend: true
+      - user: agent:grocery.mock-us
+        object: budget:h-1
+        assertions:
+          can_spend: false
+      - user: agent:grocery.mock-us
+        object: household:h-1
+        assertions:
+          acts_for: false
+  - name: a user with only admin is guardian and member
+    check:
+      - user: user:admin-1
+        object: household:h-1
+        assertions:
+          admin: true
+          guardian: true
+          member: true
+  - name: a plain member is not guardian
+    check:
+      - user: user:member-1
+        object: household:h-1
+        assertions:
+          member: true
+          guardian: false
+          admin: false
+  - name: a child is member
+    check:
+      - user: user:child-1
+        object: household:h-1
+        assertions:
+          child: true
+          member: true
+          guardian: false

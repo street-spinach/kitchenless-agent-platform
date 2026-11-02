@@ -49,7 +49,6 @@ x-env-graph: &env-graph # mcp, testrunner
   NEO4J_USER: ${NEO4J_USER:-neo4j}
   NEO4J_PASSWORD: ${NEO4J_PASSWORD}
   OPENFGA_API_URL: ${OPENFGA_API_URL:-http://openfga:8080}
-  OPENFGA_STORE_ID: ${OPENFGA_STORE_ID:-}
   KROGER_CLIENT_ID: ${KROGER_CLIENT_ID:-}
   KROGER_CLIENT_SECRET: ${KROGER_CLIENT_SECRET:-}
   KROGER_LOCATION_ID: ${KROGER_LOCATION_ID:-}
@@ -61,6 +60,8 @@ x-env-identity: &env-identity # agents, api, mcp, testrunner
   ISSUER_URL: ${ISSUER_URL:-}
   DOMAIN: ${DOMAIN:-localhost}
   MOCK_SIGNING_KEY: ${MOCK_SIGNING_KEY:-}
+  # OpenFGA preshared key (I16c); migrate sets it too.
+  OPENFGA_PRESHARED_KEY: ${OPENFGA_PRESHARED_KEY:-}
 
 x-env-keycloak: &env-keycloak # agents, api, mcp (required live)
   KEYCLOAK_URL: ${KEYCLOAK_URL:-http://keycloak:8080/auth}
@@ -155,6 +156,9 @@ services:
       OPENFGA_DATASTORE_ENGINE: postgres
       OPENFGA_DATASTORE_URI: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/openfga?sslmode=disable
       OPENFGA_PLAYGROUND_ENABLED: "false"
+      # identity-authz §7 and I16c: one preshared key; the check cache stays off.
+      OPENFGA_AUTHN_METHOD: preshared
+      OPENFGA_AUTHN_PRESHARED_KEYS: ${OPENFGA_PRESHARED_KEY}
       OPENFGA_DATASTORE_MAX_OPEN_CONNS: "10"
     depends_on:
       openfga-migrate: { condition: service_completed_successfully }
@@ -199,8 +203,12 @@ services:
     environment:
       <<: *env-base
       SERVICE_NAME: migrate
+      # authz/apply.py writes the OpenFGA model (identity-authz I8, I16c).
+      OPENFGA_API_URL: ${OPENFGA_API_URL:-http://openfga:8080}
+      OPENFGA_PRESHARED_KEY: ${OPENFGA_PRESHARED_KEY:-}
     depends_on:
       postgres: { condition: service_healthy }
+      openfga: { condition: service_healthy }
 
   # api, mcp and agents (architecture item 56). The app ports are bound to 127.0.0.1 only;
   # Caddy reaches api over the Compose network. agents (8003, including the internal A2A

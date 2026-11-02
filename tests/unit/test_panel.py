@@ -61,7 +61,13 @@ CONSTRAINTS = {
 def _settings(monkeypatch: pytest.MonkeyPatch) -> None:
     w.patch_settings(monkeypatch)
     settings = Settings.from_env(
-        {"SERVICE_NAME": "migrate", "DATABASE_URL": "x", "LOG_LEVEL": "info"}
+        {
+            "SERVICE_NAME": "migrate",
+            "DATABASE_URL": "x",
+            "LOG_LEVEL": "info",
+            "OPENFGA_PRESHARED_KEY": "x",
+            "OPENFGA_API_URL": "x",
+        }
     )
     monkeypatch.setattr(control, "get_settings", lambda: settings)
 

@@ -25,7 +25,13 @@ ADDRESS = uuid.UUID("33333333-3333-4333-8333-333333333333")
 
 @pytest.fixture(autouse=True)
 def _settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
-    env = {"SERVICE_NAME": "migrate", "DATABASE_URL": "x", "LOG_LEVEL": "info"}
+    env = {
+        "SERVICE_NAME": "migrate",
+        "DATABASE_URL": "x",
+        "LOG_LEVEL": "info",
+        "OPENFGA_PRESHARED_KEY": "x",
+        "OPENFGA_API_URL": "x",
+    }
     settings = Settings.from_env(env)
     monkeypatch.setattr(runs, "get_settings", lambda: settings)
     monkeypatch.setattr(modes, "get_settings", lambda: settings)
@@ -127,7 +133,14 @@ def test_eval_household_run_pins_mock_under_mode_real(
     world: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Adapters §3: the Square sandbox is not split by env, so eval runs never pin `real`.
-    env = {"SERVICE_NAME": "migrate", "DATABASE_URL": "x", "LOG_LEVEL": "info", "MODE": "real"}
+    env = {
+        "SERVICE_NAME": "migrate",
+        "DATABASE_URL": "x",
+        "LOG_LEVEL": "info",
+        "OPENFGA_PRESHARED_KEY": "x",
+        "OPENFGA_API_URL": "x",
+        "MODE": "real",
+    }
     settings = Settings.from_env(env)
     monkeypatch.setattr(runs, "get_settings", lambda: settings)
     monkeypatch.setattr(modes, "get_settings", lambda: settings)

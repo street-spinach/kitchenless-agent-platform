@@ -1,0 +1,76 @@
+{
+  "schema_version": "1.1",
+  "type_definitions": [
+    {
+      "type": "user",
+      "relations": {
+        "acts_for": {"this": {}}
+      },
+      "metadata": {
+        "relations": {
+          "acts_for": {"directly_related_user_types": [{"type": "agent"}]}
+        }
+      }
+    },
+    {
+      "type": "agent",
+      "relations": {},
+      "metadata": null
+    },
+    {
+      "type": "household",
+      "relations": {
+        "admin": {"this": {}},
+        "child": {"this": {}},
+        "member": {
+          "union": {
+            "child": [
+              {"this": {}},
+              {"computedUserset": {"relation": "admin"}},
+              {"computedUserset": {"relation": "child"}}
+            ]
+          }
+        },
+        "guardian": {"computedUserset": {"relation": "admin"}},
+        "acts_for": {"this": {}},
+        "can_deliver_for": {"this": {}}
+      },
+      "metadata": {
+        "relations": {
+          "admin": {"directly_related_user_types": [{"type": "user"}]},
+          "child": {"directly_related_user_types": [{"type": "user"}]},
+          "member": {"directly_related_user_types": [{"type": "user"}]},
+          "guardian": {"directly_related_user_types": []},
+          "acts_for": {"directly_related_user_types": [{"type": "agent"}]},
+          "can_deliver_for": {"directly_related_user_types": [{"type": "agent"}]}
+        }
+      }
+    },
+    {
+      "type": "org",
+      "relations": {
+        "owner": {"this": {}},
+        "member_of": {"this": {}}
+      },
+      "metadata": {
+        "relations": {
+          "owner": {"directly_related_user_types": [{"type": "user"}]},
+          "member_of": {"directly_related_user_types": [{"type": "agent"}]}
+        }
+      }
+    },
+    {
+      "type": "budget",
+      "relations": {
+        "household": {"this": {}},
+        "can_spend": {"this": {}}
+      },
+      "metadata": {
+        "relations": {
+          "household": {"directly_related_user_types": [{"type": "household"}]},
+          "can_spend": {"directly_related_user_types": [{"type": "agent"}]}
+        }
+      }
+    }
+  ]
+}

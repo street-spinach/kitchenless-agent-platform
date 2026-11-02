@@ -38,7 +38,7 @@ def _settings(monkeypatch: pytest.MonkeyPatch) -> None:
     w.patch_settings(monkeypatch)
     monkeypatch.setattr(household, "get_settings", runs.get_settings)  # the patched settings
     monkeypatch.setattr(tokens, "_secret", lambda: SECRET)
-    monkeypatch.setattr(fga, "check", lambda user, relation, object: True)
+    monkeypatch.setattr(fga, "check", lambda user, relation, object: (True, "model-1"))
 
 
 @pytest.fixture

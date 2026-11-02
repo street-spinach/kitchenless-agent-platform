@@ -42,9 +42,9 @@ def _auth(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, str]]:
     monkeypatch.setattr(courier, "get_settings", lambda: settings)
     checks: list[tuple[str, str, str]] = []
 
-    def check(user: str, relation: str, object: str) -> bool:
+    def check(user: str, relation: str, object: str) -> tuple[bool, str]:
         checks.append((user, relation, object))
-        return True
+        return True, "model-1"
 
     monkeypatch.setattr(fga, "check", check)
     return checks
