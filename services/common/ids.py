@@ -86,6 +86,11 @@ def conversation_id(opening_message_id: UUID) -> UUID:
     return uuid5(opening_message_id, "conversation")
 
 
+def order_id(run_id: UUID) -> UUID:
+    """The order a household run creates at `start_order` (one order per run, item 29)."""
+    return uuid5(UUID(_require("run_id", run_id)), "order")
+
+
 def shortfall_id(order_id: UUID) -> UUID:
     """An order has at most one shortfall."""
     return uuid5(order_id, "shortfall")
