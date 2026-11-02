@@ -1,8 +1,10 @@
 """Mock control functions behind `/panel/*` (architecture item 47 and §7, agent-protocol P33).
 
-*   `reset(conn, env)`: deletes the rows of `eval` runs and the `eval` mock state in one
-    transaction, children first, then re-inserts `services.seed.mock_stock_rows("eval")`
-    (§7 reset scope, amended 2026-11-02). It refuses any other `env`.
+*   `reset(conn, env, setup=None, household_id="us-1-eval")`: deletes the rows of `eval`
+    runs and the `eval` mock state in one transaction, children first, then re-inserts
+    `services.seed.mock_stock_rows("eval")` (§7 reset scope, amended 2026-11-02). It then
+    undoes every `SETUP_KEYS` entry for all eval households and applies `setup` to
+    `household_id` (evals.md §4, E-A8). It refuses any other `env`.
 *   `inject_event(...)`: writes a `mock_events` row and returns its id. A `shortfall`
     event needs `params = {order_id, skus}`, with 1 to `SHORTFALL_MAX_LINES` SKUs, each a
     line of the order (agent-protocol §10). It is refused when the order's run pinned the
@@ -15,7 +17,8 @@ The route checks that belong to `/panel/events` (the order is `courier_booked` a
 shortfall, then `shortfall_detected`) are agent-protocol P31 and live in the route.
 """
 
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
@@ -25,11 +28,14 @@ from psycopg.types.json import Jsonb
 from services.common import directory, vendors
 from services.common.config import get_settings
 from services.common.modes import ALWAYS_MOCK, VENDORS
-from services.seed import mock_stock_rows
+from services.seed import household_envs, mock_stock_rows, seeded_limits
 
 __all__ = [
+    "DEFAULT_EVAL_HOUSEHOLD",
     "EVENT_KINDS",
+    "SETUP_KEYS",
     "ControlRefused",
+    "SetupKey",
     "expire_approval",
     "inject_event",
     "reset",
@@ -101,15 +107,110 @@ _RESET_SQL: tuple[tuple[str, str], ...] = (
 )
 
 
-async def reset(conn: AsyncConnection, env: str) -> dict[str, int]:
-    """Delete `eval` run rows and `eval` mock state, then re-seed `eval` mock stock.
+# --- setup keys (evals.md §4, E-A8) ----------------------------------------------------------
+
+DEFAULT_EVAL_HOUSEHOLD = "us-1-eval"
+
+
+@dataclass(frozen=True)
+class SetupKey:
+    """One eval setup key: its value type, how it is applied to one eval household, and how
+    the next reset undoes it for an eval household from `services.seed.seeded_limits()`."""
+
+    type: type
+    apply: Callable[[AsyncConnection, str, Any], Awaitable[None]]
+    undo: Callable[[AsyncConnection, str, Mapping[str, int | None]], Awaitable[None]]
+
+
+# Every statement is limited to eval households in SQL as well as in Python.
+_EVAL_ONLY = "household_id IN (SELECT household_id FROM households WHERE env = 'eval')"
+
+
+async def _apply_budget(conn: AsyncConnection, household_id: str, value: int) -> None:
+    cur = await conn.execute(
+        "UPDATE budgets SET amount_minor = %s"
+        f" WHERE household_id = %s AND period = 'weekly' AND {_EVAL_ONLY}",
+        (value, household_id),
+    )
+    if cur.rowcount != 1:
+        raise ControlRefused(f"budget_minor: {household_id} has no weekly budget")
+
+
+async def _undo_budget(
+    conn: AsyncConnection, household_id: str, seeded: Mapping[str, int | None]
+) -> None:
+    value = seeded["weekly_budget_minor"]
+    if value is None:  # the seed writes no budget row, and apply never creates one
+        return
+    await conn.execute(
+        "UPDATE budgets SET amount_minor = %s"
+        f" WHERE household_id = %s AND period = 'weekly' AND {_EVAL_ONLY}",
+        (value, household_id),
+    )
+
+
+async def _apply_per_order(conn: AsyncConnection, household_id: str, value: int) -> None:
+    cur = await conn.execute(
+        f"UPDATE approval_rules SET per_order_minor = %s WHERE household_id = %s AND {_EVAL_ONLY}",
+        (value, household_id),
+    )
+    if cur.rowcount != 1:
+        raise ControlRefused(f"per_order_minor: {household_id} has no approval rules")
+
+
+async def _undo_per_order(
+    conn: AsyncConnection, household_id: str, seeded: Mapping[str, int | None]
+) -> None:
+    await conn.execute(
+        f"UPDATE approval_rules SET per_order_minor = %s WHERE household_id = %s AND {_EVAL_ONLY}",
+        (seeded["per_order_minor"], household_id),
+    )
+
+
+SETUP_KEYS: Mapping[str, SetupKey] = {
+    "budget_minor": SetupKey(int, _apply_budget, _undo_budget),
+    "per_order_minor": SetupKey(int, _apply_per_order, _undo_per_order),
+}
+
+
+def _validate_setup(setup: Mapping[str, Any] | None, household_id: str) -> dict[str, Any]:
+    if household_envs().get(household_id) != "eval":
+        raise ControlRefused(f"household must be a seeded eval household, got {household_id!r}")
+    if setup is None:
+        return {}
+    if not isinstance(setup, Mapping):
+        raise ControlRefused("setup must be an object")
+    for name, value in setup.items():
+        key = SETUP_KEYS.get(name)
+        if key is None:
+            raise ControlRefused(f"unknown setup key {name!r}")
+        # bool is an int subclass; a setup value of true is never an amount.
+        if isinstance(value, bool) or not isinstance(value, key.type):
+            raise ControlRefused(f"setup key {name!r} must be {key.type.__name__}")
+        if key.type is int and value < 0:
+            raise ControlRefused(f"setup key {name!r} must not be negative")
+    return dict(setup)
+
+
+async def reset(
+    conn: AsyncConnection,
+    env: str,
+    setup: Mapping[str, Any] | None = None,
+    household_id: str = DEFAULT_EVAL_HOUSEHOLD,
+) -> dict[str, int]:
+    """Delete `eval` run rows and `eval` mock state, re-seed `eval` mock stock, undo every
+    setup key for the eval households, then apply `setup` to `household_id`.
 
     One transaction. Returns the number of rows deleted per table. Raises `ControlRefused`
-    unless `env == "eval"`.
+    unless `env == "eval"`, for a `household_id` that is not a seeded eval household, and
+    for an unknown setup key or a value of the wrong type; nothing is written then.
     """
     if env != "eval":
         raise ControlRefused(f"reset is allowed for env 'eval' only, got {env!r}")
+    applied = _validate_setup(setup, household_id)
     stock = mock_stock_rows("eval")
+    limits = seeded_limits()
+    eval_households = sorted(h for h, e in household_envs().items() if e == "eval")
     deleted: dict[str, int] = {}
     async with conn.transaction():
         cur = await conn.execute(_EVAL_RUNS_SQL)
@@ -122,6 +223,11 @@ async def reset(conn: AsyncConnection, env: str) -> dict[str, int]:
                 "INSERT INTO mock_stock (env, agent_id, sku, qty) VALUES (%s, %s, %s, %s)",
                 stock,
             )
+        for key in SETUP_KEYS.values():
+            for hid in eval_households:
+                await key.undo(conn, hid, limits[hid])
+        for name, value in applied.items():
+            await SETUP_KEYS[name].apply(conn, household_id, value)
     return deleted
 
 

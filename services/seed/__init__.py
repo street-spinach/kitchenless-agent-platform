@@ -3,6 +3,9 @@
 `mock_stock_rows` is the one builder of `mock_stock` rows. The seed's stock writer and
 `services.mocks.control.reset` both use it, so the two never drift (architecture §7,
 amended 2026-11-02).
+
+`seeded_limits` and `household_envs` read `households.yaml` the same way, so the reset's
+setup keys restore the seeded values and only ever touch eval households (evals.md §4).
 """
 
 from collections.abc import Mapping
@@ -11,7 +14,14 @@ from typing import Any
 
 import yaml
 
-__all__ = ["DATA_DIR", "MOCK_STOCK_ENVS", "MOCK_STOCK_QTY", "mock_stock_rows"]
+__all__ = [
+    "DATA_DIR",
+    "MOCK_STOCK_ENVS",
+    "MOCK_STOCK_QTY",
+    "household_envs",
+    "mock_stock_rows",
+    "seeded_limits",
+]
 
 DATA_DIR = Path(__file__).parent / "data"
 MOCK_STOCK_ENVS = ("live", "eval")
@@ -43,3 +53,29 @@ def mock_stock_rows(
         for agent_id, group in groups.items()
         for item in group
     ]
+
+
+def _load_households(data_dir: Path) -> list[dict[str, Any]]:
+    with (data_dir / "households.yaml").open() as f:
+        households: list[dict[str, Any]] = yaml.safe_load(f)["households"]
+    return households
+
+
+def seeded_limits(data_dir: Path = DATA_DIR) -> dict[str, dict[str, int | None]]:
+    """`{household_id: {weekly_budget_minor, per_order_minor}}` as the seed writes them.
+
+    `None` means the seed writes no value: no `budgets` row, or a NULL
+    `approval_rules.per_order_minor` (evals.md §4, file 9a).
+    """
+    return {
+        hh["household_id"]: {
+            "weekly_budget_minor": hh.get("weekly_budget_minor"),
+            "per_order_minor": hh.get("per_order_minor"),
+        }
+        for hh in _load_households(data_dir)
+    }
+
+
+def household_envs(data_dir: Path = DATA_DIR) -> dict[str, str]:
+    """`{household_id: env}` for every seeded household."""
+    return {hh["household_id"]: hh["env"] for hh in _load_households(data_dir)}

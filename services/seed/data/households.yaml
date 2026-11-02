@@ -58,8 +58,9 @@ households:
     members:
       - {member_id: us-1-a-eval, keycloak_user_id: d8908afd-9847-4d66-823c-4fd581578df4,
          role: admin, approver: true, phone: "+15550100101"}
+      # evals.md E-A9: the eval copy of us-1-b has a peanut allergy; us-1-b does not.
       - {member_id: us-1-b-eval, keycloak_user_id: c365e5d4-6d30-410c-b43c-51c9f7904ad7,
-         role: member, phone: "+15550100102"}
+         role: member, allergies: [peanuts], phone: "+15550100102"}
       - {member_id: us-1-c-eval, keycloak_user_id: 0c4be7f4-133f-4168-ba33-4f74862e892f,
          role: child, allergies: [tree_nuts], phone: "+15550100103"}
 

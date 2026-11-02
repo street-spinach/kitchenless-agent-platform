@@ -6,6 +6,7 @@ import re
 import psycopg
 import pytest
 
+import services.seed as seed_pkg
 from services.common import directory, ids, modes, vendors
 from services.seed import __main__ as seed_mod
 
@@ -226,3 +227,59 @@ def test_a2a_demo_card_seeded(pg: str) -> None:
             return found
 
     assert "external:a2a-demo" not in asyncio.run(find())
+
+
+# --- seeded_limits and the eval allergy fixture (evals.md §4, E-A9, file 9a; issue #224) ---
+
+
+def _members(env: str) -> dict[str, list[str]]:
+    return {
+        m["member_id"]: sorted(m.get("allergies", []))
+        for hh in seed_mod.load_data()["households"]
+        if hh["env"] == env
+        for m in hh["members"]
+    }
+
+
+def test_seeded_limits_returns_the_yaml_values() -> None:
+    limits = seed_pkg.seeded_limits()
+    assert limits == {
+        hh["household_id"]: {
+            "weekly_budget_minor": hh.get("weekly_budget_minor"),
+            "per_order_minor": hh.get("per_order_minor"),
+        }
+        for hh in seed_mod.load_data()["households"]
+    }
+    assert limits["us-1-eval"] == {"weekly_budget_minor": 15000, "per_order_minor": None}
+    assert limits["us-2-eval"]["weekly_budget_minor"] == 15000
+    assert limits["a2a-demo"] == {"weekly_budget_minor": None, "per_order_minor": None}
+    assert seed_pkg.household_envs()["us-1-eval"] == "eval"
+    assert seed_pkg.household_envs()["us-1"] == "live"
+
+
+def test_eval_member_b_has_peanuts_and_live_members_unchanged() -> None:
+    assert _members("eval")["us-1-b-eval"] == ["peanuts"]
+    assert _members("live") == {
+        "us-1-a": [],
+        "us-1-b": [],
+        "us-1-c": ["tree_nuts"],
+        "us-2-a": [],
+        "us-2-b": [],
+    }
+
+
+@pytest.mark.db
+def test_seed_writes_eval_peanut_allergy_only(pg: str) -> None:
+    with psycopg.connect(pg) as conn:
+        _seed(conn)
+        rows = conn.execute(
+            "SELECT user_id, value FROM member_constraints WHERE kind = 'allergy'"
+        ).fetchall()
+    by_user: dict[str, set[str]] = {}
+    for user_id, value in rows:
+        by_user.setdefault(user_id, set()).add(value)
+    assert by_user.get(ids.seed_user_id("us-1-b-eval")) == {"peanuts"}
+    assert ids.seed_user_id("us-1-b") not in by_user
+    assert "peanuts" not in set().union(
+        *(v for u, v in by_user.items() if u not in {ids.seed_user_id("us-1-b-eval")})
+    )
