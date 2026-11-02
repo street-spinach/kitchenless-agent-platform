@@ -96,6 +96,12 @@ def shortfall_conversation_id(shortfall_id: UUID) -> UUID:
     return uuid5(shortfall_id, "conversation")
 
 
+def shortfall_closed_id(shortfall_id: UUID) -> UUID:
+    """`message_id` of the `shortfall_closed` for `shortfall_id`. A shortfall closes once
+    (the close is a conditional update), whoever closes it (agent-protocol §10)."""
+    return uuid5(shortfall_id, "shortfall_closed")
+
+
 def order_status_id(order_id: UUID, state: str) -> UUID:
     """`message_id` of the `order_status` sent when a courier event moves `order_id` to
     `state` (architecture item 37). An order enters each state at most once, so a repeated

@@ -17,13 +17,23 @@ others use `@traced`. Every tool body runs inside `meta.tool_errors()`.
 *   `decide_approval(approval_id, decision, user_id)` *guarded*, `api` service token.
 *   `record_delivery(order_id)` *guarded*: one pantry event per SKU of a delivered order.
 
-The shortfall tools (agent-protocol P25) are added by #68. The household is always the
-run's household (`runs.household_id`), never an argument.
+The shortfall tools (agent-protocol §10 and P25, #68):
+
+*   `open_shortfall(shortfall_id, order_id, seller, lines, due_at)` and
+    `get_shortfall(shortfall_id)` (`@traced`).
+*   `choose_shortfall_option(shortfall_id, line, pick, user_id)` *guarded*, `api` service
+    token: the first valid pick per line wins; the last pick closes the row and sends
+    `shortfall_closed {reason: all_picked}` from `system:api` in the same transaction.
+*   `authorize_amendment(order_id, shortfall_id, picks)` *guarded*: the
+    `limits.authorize_amendment` result `{picks, refused}`.
+
+The household is always the run's household (`runs.household_id`), never an argument.
 """
 
 import json
 import uuid
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from decimal import Decimal
 from typing import Any, Literal
 
@@ -31,11 +41,12 @@ from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import CallToolResult, TextContent
 from psycopg import AsyncConnection
 from psycopg.rows import dict_row
-from pydantic import BaseModel
+from psycopg.types.json import Jsonb
+from pydantic import BaseModel, ValidationError
 
-from services.common import db, ids, orders
+from services.common import db, ids, orders, outbox
 from services.common.money import Money
-from services.common.protocol.schemas import Currency, OrderLine
+from services.common.protocol.schemas import Currency, OrderLine, ShortfallLine
 from services.common.trace import TraceStore
 from services.mcp.knowledge.adapters.neo4j_knowledge import AllergenCheck
 from services.mcp.knowledge.server import get_knowledge
@@ -47,12 +58,16 @@ from services.safety.guard import GuardRefused, run_guarded
 __all__ = [
     "SETTABLE_STATES",
     "MoneyArg",
+    "authorize_amendment",
     "authorize_spend",
+    "choose_shortfall_option",
     "create_order",
     "decide_approval",
     "get_budget",
     "get_constraints",
     "get_pantry",
+    "get_shortfall",
+    "open_shortfall",
     "record_delivery",
     "request_approval",
     "server",
@@ -76,6 +91,8 @@ INVALID_ITEMS = "invalid_items"
 INVALID_KIND = "invalid_kind"
 INVALID_DECISION = "invalid_decision"
 NO_APPROVER = "no_approver"
+# `open_shortfall`: the id is not the order's shortfall, or the lines or `due_at` are invalid.
+INVALID_SHORTFALL = "invalid_shortfall"
 
 server = MCPServer(name=AREA)
 
@@ -526,6 +543,176 @@ async def record_delivery(ctx: CallContext, *, order_id: uuid.UUID) -> dict[str,
     )
 
 
+def _notice_pick_allowed(lines: Sequence[Any], line: int, pick: str) -> bool:
+    """Whether `pick` is `drop` or one of `line`'s substitute SKUs in the notice."""
+    for notice in lines or []:
+        if int(notice["line"]) == line:
+            return pick == limits.DROP or pick in {
+                str(s["sku"]) for s in notice.get("substitutes") or []
+            }
+    return False
+
+
+async def choose_shortfall_option(
+    ctx: CallContext, *, shortfall_id: uuid.UUID, line: int, pick: str, user_id: uuid.UUID
+) -> dict[str, Any]:
+    """A member's pick for one shortfall line, from `api` with its service token (§10).
+
+    `user_id` must be a member of the order's household and `pick` one of the line's
+    substitute SKUs or `drop`. One conditional update sets the pick only while the row is
+    `pending` and the line has none, so the first valid pick per line wins. When that
+    pick completes every line, the same transaction closes the row and sends
+    `shortfall_closed {reason: all_picked}` from `system:api`. The result's `outcome` is
+    `chosen` or `already_decided`.
+    """
+
+    async def check(conn: AsyncConnection) -> None:
+        if ctx.agent_id != API_AGENT:
+            raise GuardRefused(AUTHZ_DENIED)
+        cur = await conn.execute(
+            "SELECT s.lines, o.household_id FROM shortfalls s"
+            " JOIN orders o ON o.order_id = s.order_id WHERE s.shortfall_id = %s",
+            (shortfall_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise limits.ShortfallNotFound()
+        lines, household = row
+        cur = await conn.execute(
+            "SELECT 1 FROM household_members WHERE household_id = %s AND user_id = %s",
+            (household, user_id),
+        )
+        if await cur.fetchone() is None:
+            raise GuardRefused(AUTHZ_DENIED)
+        if not _notice_pick_allowed(lines, line, pick):
+            raise limits.PickNotInNotice(line)
+
+    async def call() -> dict[str, Any]:
+        async with db.get_pool().connection() as conn, conn.transaction():
+            cur = await conn.execute(
+                "UPDATE shortfalls SET picks = picks || jsonb_build_object(%s::text, %s::text)"
+                " WHERE shortfall_id = %s AND status = 'pending' AND NOT (picks ? %s)"
+                " RETURNING run_id, order_id, lines, picks",
+                (str(line), pick, shortfall_id, str(line)),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                cur = await conn.execute(
+                    "SELECT status FROM shortfalls WHERE shortfall_id = %s", (shortfall_id,)
+                )
+                (status,) = await cur.fetchone() or (None,)
+                return {
+                    "shortfall_id": str(shortfall_id),
+                    "line": line,
+                    "pick": pick,
+                    "outcome": "already_decided",
+                    "status": status,
+                }
+            run_id, order_id, lines, picks = row
+            status = "pending"
+            if all(str(int(n["line"])) in picks for n in lines):
+                cur = await conn.execute(
+                    "UPDATE shortfalls SET status = 'closed', closed_at = now()"
+                    " WHERE shortfall_id = %s AND status = 'pending'",
+                    (shortfall_id,),
+                )
+                if cur.rowcount == 1:
+                    status = "closed"
+                    cur = await conn.execute(
+                        "SELECT household_id FROM orders WHERE order_id = %s", (order_id,)
+                    )
+                    (household,) = await cur.fetchone() or (None,)
+                    await outbox.send(
+                        conn,
+                        message_id=ids.shortfall_closed_id(shortfall_id),
+                        run_id=run_id,
+                        conversation_id=ids.shortfall_conversation_id(shortfall_id),
+                        causation_id=None,
+                        from_agent=API_AGENT,
+                        to_agent=f"household:{household}",
+                        type="shortfall_closed",
+                        body={
+                            "shortfall_id": str(shortfall_id),
+                            "order_id": str(order_id),
+                            "reason": "all_picked",
+                        },
+                    )
+        return {
+            "shortfall_id": str(shortfall_id),
+            "line": line,
+            "pick": pick,
+            "outcome": "chosen",
+            "status": status,
+        }
+
+    return await run_guarded(
+        ctx,
+        tool=f"{AREA}.choose_shortfall_option",
+        relation=None,
+        limits=check,
+        key=None,
+        request={
+            "shortfall_id": str(shortfall_id),
+            "line": line,
+            "pick": pick,
+            "user_id": str(user_id),
+        },
+        call=call,
+        apply=None,
+    )
+
+
+async def authorize_amendment(
+    ctx: CallContext,
+    *,
+    order_id: uuid.UUID,
+    shortfall_id: uuid.UUID,
+    picks: Mapping[Any, str],
+) -> dict[str, Any]:
+    """Check the closed shortfall's picks (§10 "Applying"); returns `{picks, refused}`.
+
+    Relation `agent acts_for household:<run household>`; key
+    `idempotency_key(order_id, "authorize_amendment", <agent>, scope=shortfall_id)`, the
+    key `amend_order` reads. The limits are `limits.authorize_amendment`: each refused
+    substitute becomes a drop in the result.
+    """
+    household = await _run_household(ctx)
+    given = {str(int(line)): str(pick) for line, pick in picks.items()}
+    result: list[dict[str, Any]] = []
+
+    async def check(conn: AsyncConnection) -> None:
+        h = _require_household(household)
+        await _order(conn, order_id, h)
+        result.append(
+            await limits.authorize_amendment(
+                conn,
+                order_id=order_id,
+                shortfall_id=shortfall_id,
+                picks=given,
+                member_allergens=await _member_allergens(conn, h),
+                knowledge=_LazyKnowledge(),
+            )
+        )
+
+    async def call() -> dict[str, Any]:
+        return {"order_id": str(order_id), "shortfall_id": str(shortfall_id), **result[0]}
+
+    return await run_guarded(
+        ctx,
+        tool=f"{AREA}.authorize_amendment",
+        relation=_household_relation("acts_for", household),
+        limits=check,
+        key=ids.idempotency_key(order_id, "authorize_amendment", ctx.agent_id, scope=shortfall_id),
+        request={
+            "order_id": str(order_id),
+            "shortfall_id": str(shortfall_id),
+            "picks": given,
+        },
+        call=call,
+        apply=None,
+    )
+
+
 # --- unguarded tools ------------------------------------------------------------------
 
 
@@ -591,6 +778,110 @@ async def get_budget(ctx: CallContext) -> dict[str, Any]:
         "household_id": household,
         "weekly": {"amount_minor": int(row[0]), "currency": str(row[1]).strip()},
         "remaining": {"amount_minor": remaining.amount_minor, "currency": remaining.currency},
+    }
+
+
+def _uuid(value: str) -> uuid.UUID:
+    try:
+        return uuid.UUID(value)
+    except (TypeError, ValueError):
+        raise GuardRefused(AUTHZ_DENIED) from None
+
+
+def _shortfall_lines(lines: Sequence[Any]) -> list[dict[str, Any]]:
+    """The notice lines as stored, or `invalid_shortfall` (none, duplicates or bad shape)."""
+    try:
+        parsed = [ShortfallLine.model_validate(line) for line in lines]
+    except ValidationError:
+        raise GuardRefused(INVALID_SHORTFALL) from None
+    if not parsed or len({line.line for line in parsed}) != len(parsed):
+        raise GuardRefused(INVALID_SHORTFALL)
+    return [line.model_dump(mode="json") for line in parsed]
+
+
+def _aware(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        raise GuardRefused(INVALID_SHORTFALL) from None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise GuardRefused(INVALID_SHORTFALL)
+    return parsed
+
+
+@traced(AREA)
+async def open_shortfall(
+    ctx: CallContext,
+    *,
+    shortfall_id: str,
+    order_id: str,
+    seller: str,
+    lines: list[dict[str, Any]],
+    due_at: str,
+) -> dict[str, Any]:
+    """Insert the `pending` shortfall row from a `shortfall_notice` (§10); once per id.
+
+    The order must be the run household's, `shortfall_id` its shortfall
+    (`ids.shortfall_id`) and `seller` its `seller_agent_id`. A replay inserts nothing;
+    `opened` says whether this call inserted the row.
+    """
+    sf_uuid, order_uuid = _uuid(shortfall_id), _uuid(order_id)
+    household = _require_household(await _run_household(ctx))
+    stored = _shortfall_lines(lines)
+    due = _aware(due_at)
+    if sf_uuid != ids.shortfall_id(order_uuid):
+        raise GuardRefused(INVALID_SHORTFALL)
+    async with db.get_pool().connection() as conn, conn.transaction():
+        await _order(conn, order_uuid, household)
+        cur = await conn.execute(
+            "SELECT seller_agent_id FROM orders WHERE order_id = %s", (order_uuid,)
+        )
+        (order_seller,) = await cur.fetchone() or (None,)
+        if order_seller is None or order_seller != seller:
+            raise GuardRefused(AUTHZ_DENIED)
+        cur = await conn.execute(
+            "INSERT INTO shortfalls (shortfall_id, run_id, order_id, seller_agent_id, lines,"
+            " due_at) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+            (sf_uuid, ctx.run_id, order_uuid, seller, Jsonb(stored), due),
+        )
+        opened = cur.rowcount == 1
+        cur = await conn.execute(
+            "SELECT status FROM shortfalls WHERE shortfall_id = %s", (sf_uuid,)
+        )
+        (status,) = await cur.fetchone() or (None,)
+    return {
+        "shortfall_id": shortfall_id,
+        "order_id": order_id,
+        "status": status,
+        "opened": opened,
+    }
+
+
+@traced(AREA)
+async def get_shortfall(ctx: CallContext, *, shortfall_id: str) -> dict[str, Any]:
+    """The run household's shortfall row: lines, picks (`line` → SKU or `drop`) and status."""
+    sf_uuid = _uuid(shortfall_id)
+    household = _require_household(await _run_household(ctx))
+    async with db.get_pool().connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT s.order_id, s.seller_agent_id, s.lines, s.picks, s.status, s.due_at,"
+                " s.closed_at, o.household_id FROM shortfalls s"
+                " JOIN orders o ON o.order_id = s.order_id WHERE s.shortfall_id = %s",
+                (sf_uuid,),
+            )
+            row = await cur.fetchone()
+    if row is None or row["household_id"] != household:
+        raise GuardRefused(AUTHZ_DENIED)
+    return {
+        "shortfall_id": shortfall_id,
+        "order_id": str(row["order_id"]),
+        "seller_agent_id": row["seller_agent_id"],
+        "lines": row["lines"],
+        "picks": row["picks"],
+        "status": row["status"],
+        "due_at": row["due_at"].isoformat(),
+        "closed_at": None if row["closed_at"] is None else row["closed_at"].isoformat(),
     }
 
 
@@ -676,3 +967,51 @@ async def _decide_approval_tool(
 @server.tool(name="record_delivery")
 async def _record_delivery_tool(order_id: uuid.UUID, ctx: Context) -> CallToolResult:
     return await _serve(ctx, record_delivery, order_id=order_id)
+
+
+@server.tool(name="open_shortfall")
+async def _open_shortfall_tool(
+    shortfall_id: uuid.UUID,
+    order_id: uuid.UUID,
+    seller: str,
+    lines: list[ShortfallLine],
+    due_at: datetime,
+    ctx: Context,
+) -> CallToolResult:
+    return await _serve(
+        ctx,
+        open_shortfall,
+        shortfall_id=str(shortfall_id),
+        order_id=str(order_id),
+        seller=seller,
+        lines=[line.model_dump(mode="json") for line in lines],
+        due_at=due_at.isoformat(),
+    )
+
+
+@server.tool(name="get_shortfall")
+async def _get_shortfall_tool(shortfall_id: uuid.UUID, ctx: Context) -> CallToolResult:
+    return await _serve(ctx, get_shortfall, shortfall_id=str(shortfall_id))
+
+
+@server.tool(name="choose_shortfall_option")
+async def _choose_shortfall_option_tool(
+    shortfall_id: uuid.UUID, line: int, pick: str, user_id: uuid.UUID, ctx: Context
+) -> CallToolResult:
+    return await _serve(
+        ctx,
+        choose_shortfall_option,
+        shortfall_id=shortfall_id,
+        line=line,
+        pick=pick,
+        user_id=user_id,
+    )
+
+
+@server.tool(name="authorize_amendment")
+async def _authorize_amendment_tool(
+    order_id: uuid.UUID, shortfall_id: uuid.UUID, picks: dict[int, str], ctx: Context
+) -> CallToolResult:
+    return await _serve(
+        ctx, authorize_amendment, order_id=order_id, shortfall_id=shortfall_id, picks=picks
+    )
