@@ -49,6 +49,9 @@ class FakeSeller:
     stock: dict[str, int] = field(default_factory=lambda: {k: v[3] for k, v in CATALOG.items()})
     calls: list[dict[str, Any]] = field(default_factory=list)
     refuse_place: str | None = None
+    # The `amend_order` result to return, or the reason to refuse it with.
+    amend_result: dict[str, Any] | None = None
+    refuse_amend: str | None = None
 
     def of(self, tool: str) -> list[dict[str, Any]]:
         return [c for c in self.calls if c["tool"] == tool]
@@ -94,6 +97,11 @@ class FakeSeller:
                 "total_minor": 0,
                 "currency": "USD",
             }
+        if tool == "amend_order":
+            if self.refuse_amend:
+                raise ToolRefused(self.refuse_amend)
+            assert self.amend_result is not None
+            return dict(self.amend_result)
         raise AssertionError(f"unexpected tool {tool}")
 
 

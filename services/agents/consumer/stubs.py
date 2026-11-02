@@ -10,7 +10,15 @@ from typing import Any
 
 from services.agents.common.model import ModelResult
 
-__all__ = ["CHAT_REPLY", "FOOD_WORDS", "STUBS", "reply_to_user", "understand_message"]
+__all__ = [
+    "CHAT_REPLY",
+    "FOOD_WORDS",
+    "SHORTFALL_TEXT",
+    "STUBS",
+    "relay_shortfall",
+    "reply_to_user",
+    "understand_message",
+]
 
 # A text that mentions any of these (and not "dinner") is a weekly order.
 FOOD_WORDS = frozenset(
@@ -62,7 +70,16 @@ def reply_to_user(state: Mapping[str, Any]) -> ModelResult:
     return ModelResult(text=CHAT_REPLY)
 
 
+SHORTFALL_TEXT = "The store is out of an item in your order. Pick a substitute or skip it."
+
+
+def relay_shortfall(state: Mapping[str, Any]) -> ModelResult:
+    """Fixed text (agent-protocol P22); the buttons are built in code."""
+    return ModelResult(text=SHORTFALL_TEXT)
+
+
 STUBS: Mapping[str, Callable[[Mapping[str, Any]], ModelResult]] = {
     "understand_message": understand_message,
     "reply_to_user": reply_to_user,
+    "relay_shortfall": relay_shortfall,
 }

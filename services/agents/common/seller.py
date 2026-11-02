@@ -1,7 +1,8 @@
-"""The grocery and restaurant handler: quote, counter, accept and the courier round.
+"""The grocery and restaurant handler: quote, counter, accept, the courier round and the
+shortfall.
 
-Architecture item 30 (amended by agent-protocol A8) and agent-protocol §7 and P23 (the
-non-shortfall parts). `services/agents/grocery/handler.py` and
+Architecture item 30 (amended by agent-protocol A8) and agent-protocol §7, §10 and P23.
+`services/agents/grocery/handler.py` and
 `services/agents/restaurant/handler.py` each bind one `SellerHandler` to their area.
 
 The handler is stateless (architecture §4): each step reads the `quotes` row it needs,
@@ -28,6 +29,15 @@ sends the same message ids and changes nothing twice.
     courier: `rejected`, `closed_by = seller` and `reject {reason: no_courier}`.
 *   A step that rejects a quote whose buyer is `external:a2a-demo` also finishes the run
     `cancelled` (`a2a_demo_closed`, §11).
+*   `shortfall_detected` (§10): for each missing order line, `search_items` with the
+    allergen and diet codes saved on the accepted quote, one `quote` call, and only
+    candidates whose `qty × unit_minor` is at most the line's `line_total_minor`; one
+    `choose(rank_substitutes)` call keeps up to 2 per line. A line with no candidate is
+    offered as drop only. Sends `shortfall_notice` with `reply_by = now() +
+    SHORTFALL_REPLY_SECONDS` (the run override wins).
+*   `shortfall_decision`: one `amend_order` call, then `order_confirm` with the resulting
+    lines; `state=failed, reason=nothing_to_deliver` when no line remains. A refused
+    `amend_order` changes nothing (a `decision` trace only).
 *   `protocol_error`: a `decision` trace only.
 
 **Model proposes, code decides** (architecture §4). Each choice point computes its allowed
@@ -40,6 +50,7 @@ import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any, Protocol
 from uuid import UUID
 
@@ -93,6 +104,10 @@ A2A_CLOSED = "a2a_demo_closed"
 COURIER_ROUND_SECONDS = 10
 # Substitute candidates per missing item (architecture §4 `rank_substitutes`).
 MAX_SUBSTITUTES = 3
+# Substitutes per shortfall line: 2 plus "Skip it" fit WhatsApp's 3 buttons (§10).
+MAX_SHORTFALL_SUBSTITUTES = 2
+SHORTFALL_REPLY_OVERRIDE = "SHORTFALL_REPLY_SECONDS"
+NOTHING_TO_DELIVER = "nothing_to_deliver"
 # `quotes.round` is 0-2 in the protocol schema (P2).
 MAX_ROUND = 2
 _COUNTER_TEMPLATE = TEMPLATES["respond_to_counter"]
@@ -110,6 +125,8 @@ HANDLED_TYPES = frozenset(
         "reject",
         "cancel",
         "quote_round_closed",
+        "shortfall_detected",
+        "shortfall_decision",
         "protocol_error",
     }
 )
@@ -189,6 +206,10 @@ class SellerStore(Protocol):
     async def rules(self, agent_id: str) -> Mapping[str, Any]: ...
 
     async def couriers(self, region: str, zone_id: str, currency: str) -> Sequence[str]: ...
+
+    async def order_lines(self, order_id: UUID) -> Sequence[Mapping[str, Any]]: ...
+
+    async def overrides(self, run_id: UUID) -> Mapping[str, Any]: ...
 
 
 CallTool = Callable[..., Awaitable[dict[str, Any]]]
@@ -299,6 +320,13 @@ def _order_lines(lines: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
+@dataclass(frozen=True)
+class _Want:
+    """A line `_price` prices candidates for: only its quantity."""
+
+    qty: int
+
+
 def _substitute_query(item: str) -> str | None:
     """The broader query for a missing item's substitutes: its last word, if different."""
     words = item.split()
@@ -376,6 +404,7 @@ class SellerHandler:
         issue_token: IssueToken = _mock_token,
         clock: Clock = _now,
         offer_ttl_seconds: int | None = None,
+        shortfall_reply_seconds: int | None = None,
     ) -> None:
         self.area = area
         self.model = model
@@ -389,6 +418,7 @@ class SellerHandler:
             if offer_ttl_seconds is not None
             else get_settings().offer_ttl_seconds
         )
+        self._shortfall_reply_seconds = shortfall_reply_seconds
 
     async def __call__(self, msg: Inbound, card: AgentCard) -> StepResult:
         t = msg.row.type
@@ -557,9 +587,17 @@ class SellerHandler:
         )
 
     async def _price(
-        self, step: _Step, items: Sequence[Any], hits: Sequence[Sequence[Mapping[str, Any]]]
+        self,
+        step: _Step,
+        items: Sequence[Any],
+        hits: Sequence[Sequence[Mapping[str, Any]]],
+        currency: str | None = None,
     ) -> list[list[dict[str, Any]]]:
-        """One `quote` call for every (line, candidate) pair; priced candidates per line."""
+        """One `quote` call for every (line, candidate) pair; priced candidates per line.
+
+        `items` need a `qty`; `currency` defaults to the inbound `quote_request`'s."""
+        if currency is None:
+            currency = step.msg.body.currency  # type: ignore[attr-defined]
         wanted = [
             (line, str(h["sku"]), item.qty)
             for line, (item, found) in enumerate(zip(items, hits, strict=True))
@@ -579,7 +617,7 @@ class SellerHandler:
                 p.get("sku") == sku
                 and bool(p.get("available"))
                 and isinstance(p.get("unit_minor"), int)
-                and result.get("currency") == step.msg.body.currency  # type: ignore[attr-defined]
+                and result.get("currency") == currency
             )
             out[line].append({**p, "available": ok})
         return out
@@ -847,6 +885,133 @@ class SellerHandler:
             conversation_id=chosen.conversation_id,
         )
 
+    # The shortfall (§10) ---------------------------------------------------------------
+
+    async def _reply_seconds(self, run_id: UUID) -> int:
+        override = (await self.store.overrides(run_id)).get(SHORTFALL_REPLY_OVERRIDE)
+        if isinstance(override, int) and not isinstance(override, bool) and override > 0:
+            return override
+        if self._shortfall_reply_seconds is not None:
+            return self._shortfall_reply_seconds
+        return get_settings().shortfall_reply_seconds
+
+    async def _shortfall_detected(self, step: _Step) -> None:
+        body = step.msg.body
+        order_id: UUID = body.order_id  # type: ignore[attr-defined]
+        quote = await self.store.accepted_quote(order_id, step.card.agent_id)
+        if quote is None:
+            raise StepFailed("handler", "quote_not_accepted")
+        by_sku = {str(row["sku"]): row for row in await self.store.order_lines(order_id)}
+        skus = list(dict.fromkeys(str(s) for s in body.skus))  # type: ignore[attr-defined]
+        if not skus or any(sku not in by_sku for sku in skus):
+            # `api` checked every SKU is a line of the order; fail closed anyway.
+            raise StepFailed("handler", "unknown_line")
+        missing = [by_sku[sku] for sku in skus]
+
+        # The household's codes, saved on the accepted quote: never its members' profiles.
+        items = quote.items if isinstance(quote.items, Mapping) else {}
+        constraints = quote.constraints or {}
+        filters = {
+            "allergen_codes": sorted(str(a) for a in constraints.get("allergens") or []),
+            "diet_codes": sorted(str(d) for d in constraints.get("diets") or []),
+            "zone_id": str(items.get("zone_id") or ""),
+        }
+        requested = {int(line["line"]): line.get("requested_item") for line in quote.lines}
+
+        notice: list[dict[str, Any]] = []
+        candidates: dict[str, list[str]] = {}
+        found_by_sku: dict[str, dict[str, Any]] = {}
+        for row in missing:
+            line = int(row["line"])
+            qty = int(Decimal(str(row["qty"])))
+            line_total = qty * int(row["unit_minor"])
+            item = str(requested.get(line) or row["name"])
+            query = _substitute_query(item) or item
+            found = await self._tool(step, "search_items", {"query": query, "filters": filters})
+            hits = [h for h in found.get("items") or [] if str(h["sku"]) not in by_sku]
+            priced = await self._price(
+                step, [_Want(qty)], [hits[:MAX_SUBSTITUTES]], currency=quote.currency
+            )
+            # The total can never rise: a substitute costs at most the line it replaces.
+            keep = [p for p in priced[0] if p["available"] and qty * p["unit_minor"] <= line_total]
+            candidates[str(line)] = [str(p["sku"]) for p in keep]
+            for p in keep:
+                found_by_sku[str(p["sku"])] = p
+            notice.append(
+                {
+                    "line": line,
+                    "sku": str(row["sku"]),
+                    "name": str(row["name"]),
+                    "qty_missing": qty,
+                    "line_total_minor": line_total,
+                }
+            )
+
+        allowed = PerItem({k: Subset(v, MAX_SHORTFALL_SUBSTITUTES) for k, v in candidates.items()})
+        default = {k: v[:MAX_SHORTFALL_SUBSTITUTES] for k, v in candidates.items()}
+        rules = await self.store.rules(step.card.agent_id)
+        choice = await self.model.choose(
+            self._ctx(step),
+            "rank_substitutes",
+            allowed,
+            default,
+            self._inputs(step, rules, allowed),
+        )
+        # Code decides: a pick outside the allowed set gives the rule default.
+        picks = choice.value if allowed.check(choice.value) else default
+        for entry in notice:
+            entry["substitutes"] = [
+                {
+                    "sku": sku,
+                    "name": str(found_by_sku[sku].get("name") or sku),
+                    "qty": entry["qty_missing"],
+                    "unit_minor": int(found_by_sku[sku]["unit_minor"]),
+                }
+                for sku in picks.get(str(entry["line"])) or []
+            ]
+
+        shortfall_id = ids.shortfall_id(order_id)
+        reply_by = self.clock() + timedelta(seconds=await self._reply_seconds(step.msg.row.run_id))
+        step.send(
+            quote.buyer_agent_id,
+            "shortfall_notice",
+            {
+                "order_id": str(order_id),
+                "shortfall_id": str(shortfall_id),
+                "lines": notice,
+                "reply_by": reply_by.isoformat(),
+            },
+            conversation_id=ids.shortfall_conversation_id(shortfall_id),
+        )
+
+    async def _shortfall_decision(self, step: _Step) -> None:
+        body = step.msg.body
+        order_id: UUID = body.order_id  # type: ignore[attr-defined]
+        shortfall_id: UUID = body.shortfall_id  # type: ignore[attr-defined]
+        picks = {str(line): str(pick) for line, pick in body.picks.items()}  # type: ignore[attr-defined]
+        conversation = ids.shortfall_conversation_id(shortfall_id)
+        try:
+            amended = await self._tool(
+                step,
+                "amend_order",
+                {"order_id": str(order_id), "shortfall_id": str(shortfall_id), "picks": picks},
+                conversation,
+            )
+        except ToolRefused as refused:
+            # Fails closed: the order is not changed.
+            await self._decision(step, "shortfall_decision", f"amend_refused_{refused.reason}")
+            return
+        confirm: dict[str, Any] = {
+            "order_id": str(order_id),
+            "state": amended["state"],
+            "lines": list(amended.get("lines") or []),
+            "total_minor": int(amended["total_minor"]),
+            "currency": amended["currency"],
+        }
+        if amended["state"] == "failed":
+            confirm["reason"] = NOTHING_TO_DELIVER
+        step.send(step.msg.row.from_agent, "order_confirm", confirm, conversation_id=conversation)
+
     # protocol_error -----------------------------------------------------------------------
 
     async def _protocol_error(self, step: _Step) -> None:
@@ -931,6 +1096,24 @@ class PgSellerStore:
         async with self._pool.connection() as conn:
             cards = await directory.find(conn, "delivery", region, zone_id, currency)
         return [c.agent_id for c in cards]
+
+    async def order_lines(self, order_id: UUID) -> list[dict[str, Any]]:
+        from psycopg.rows import dict_row
+
+        async with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT line, sku, name, qty, unit_minor, substituted_for FROM order_items"
+                " WHERE order_id = %s ORDER BY line",
+                (order_id,),
+            )
+            return list(await cur.fetchall())
+
+    async def overrides(self, run_id: UUID) -> dict[str, Any]:
+        row = await self._one(
+            "SELECT trigger->'overrides' AS overrides FROM runs WHERE run_id = %s", (run_id,)
+        )
+        value = None if row is None else row["overrides"]
+        return value if isinstance(value, dict) else {}
 
 
 def build_default(area: str) -> SellerHandler:

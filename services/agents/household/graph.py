@@ -36,6 +36,14 @@ routed by its type and the order's phase:
 *   `order_confirm`, `delivery_booked`, `order_status` → `track_order`; on `delivered`,
     `record_delivery` (weekly orders only) → `finish` (`completed` and a summary
     `whatsapp_out`).
+*   The shortfall (agent-protocol §10, P21): `shortfall_notice` → `handle_shortfall`
+    (`open_shortfall`, the `shortfall_expiry` timer at the notice's `reply_by`, one
+    `shortfall_relay` per member with a WhatsApp identity) → `wait_shortfall`.
+    `shortfall_closed` → `apply_shortfall` (`get_shortfall`, every line without a pick
+    becomes a drop, `authorize_amendment`, then `shortfall_decision` with the returned
+    picks). The seller's next `order_confirm` → `shortfall_result`: one `whatsapp_out` per
+    relayed member listing what was substituted and dropped; with `state=failed` the run
+    ends `error, nothing_to_deliver`.
 
 **Replay safety (agent-protocol §7).** Decision nodes never write to Postgres or send:
 they put the step's outgoing messages, timer changes and run outcome into graph state. A
@@ -118,6 +126,9 @@ SCOPES: Mapping[str, tuple[str, ...]] = {
     "get_pantry": ("pantry:read",),
     "get_budget": (),
     "set_order_state": ("orders:place",),
+    "open_shortfall": (),
+    "get_shortfall": (),
+    "authorize_amendment": ("orders:place",),
 }
 HANDLED_TYPES = frozenset(
     {
@@ -132,6 +143,8 @@ HANDLED_TYPES = frozenset(
         "order_status",
         "reject",
         "protocol_error",
+        "shortfall_notice",
+        "shortfall_closed",
     }
 )
 # agent-protocol §6 step 4: what the household does when one of its messages is refused.
@@ -140,6 +153,15 @@ END_RUN_ON_REFUSAL = frozenset({"accept", "cancel"})
 SUMMARY_TEMPLATE = "order_summary"
 NO_OFFERS_TEMPLATE = "no_offers"
 APPROVAL_CANCELLED_TEMPLATE = "approval_cancelled"
+SHORTFALL_RESULT_TEMPLATE = "shortfall_result"
+DROP = "drop"
+NOTHING_TO_DELIVER = "nothing_to_deliver"
+# `state.shortfall.status`: waiting for `shortfall_closed`, `shortfall_decision` sent, the
+# seller's `order_confirm` told the members, or `authorize_amendment` refused.
+SF_PENDING = "pending"
+SF_DECIDED = "decided"
+SF_APPLIED = "applied"
+SF_REFUSED = "refused"
 
 # Phases of the household's order, kept in graph state.
 NEW = "new"
@@ -200,6 +222,9 @@ class HouseholdState(TypedDict, total=False):
     accepts: int  # `accept` messages decided so far
     accept_delay_rounds: int  # the run override `STUB_ACCEPT_DELAY_ROUNDS`
     offer_ttl_seconds: int
+    # The order's shortfall (agent-protocol §10): id, seller, lines, picks, status, the
+    # members it was relayed to, the refused lines and the amended order.
+    shortfall: dict[str, Any] | None
     # The inbound message of the current invocation.
     message_id: str
     message_type: str
@@ -364,8 +389,13 @@ def build_graph(
     find_sellers: FindSellers,
     clock: Clock = _now,
     sleep: Sleep = asyncio.sleep,
+    load_whatsapp_members: LoadMembers | None = None,
 ) -> StateGraph:
-    """The household graph's nodes and edges, before `compile(checkpointer=...)`."""
+    """The household graph's nodes and edges, before `compile(checkpointer=...)`.
+
+    `load_whatsapp_members` gives the members with a WhatsApp identity, the ones a
+    shortfall is relayed to; without it nobody is asked (fails closed: every line drops).
+    """
 
     async def tool(
         state: HouseholdState, name: str, args: dict[str, Any], conversation_id: str | None = None
@@ -777,6 +807,9 @@ def build_graph(
         return {"decision": "ignore"}
 
     async def track_order(state: HouseholdState) -> dict[str, Any]:
+        sf = state.get("shortfall") or {}
+        if state["message_type"] == "order_confirm" and sf.get("status") == SF_DECIDED:
+            return {"decision": "shortfall_result"}
         delivered = state["message_type"] == "order_status" and (
             state["body"]["state"] == "delivered"
         )
@@ -786,14 +819,133 @@ def build_graph(
         await tool(state, "record_delivery", {"order_id": state["order_id"]})
         return {}
 
+    # The shortfall (agent-protocol §10) ------------------------------------------------
+
+    async def handle_shortfall(state: HouseholdState) -> dict[str, Any]:
+        body = state["body"]
+        shortfall_id = str(body["shortfall_id"])
+        conversation = str(ids.shortfall_conversation_id(UUID(shortfall_id)))
+        notice = {
+            "order_id": state["order_id"],
+            "shortfall_id": shortfall_id,
+            "lines": list(body["lines"]),
+            "reply_by": body["reply_by"],
+        }
+        await tool(
+            state,
+            "open_shortfall",
+            {
+                "shortfall_id": shortfall_id,
+                "order_id": state["order_id"],
+                "seller": state["from_agent"],
+                "lines": notice["lines"],
+                "due_at": notice["reply_by"],
+            },
+            conversation,
+        )
+        relay: dict[str, str] = {}
+        if load_whatsapp_members is not None:
+            relay = dict(await load_whatsapp_members(state["household_id"]))
+        out = list(state.get("outgoing") or [])
+        for agent_id in sorted(relay):
+            _add(state, out, agent_id, "shortfall_relay", notice, conversation_id=conversation)
+        timer = {
+            "kind": "shortfall_expiry",
+            "due_at": notice["reply_by"],
+            "ref": {"shortfall_id": shortfall_id, "order_id": state["order_id"]},
+        }
+        return {
+            "shortfall": {
+                "id": shortfall_id,
+                "seller": state["from_agent"],
+                "lines": notice["lines"],
+                "picks": {},
+                "status": SF_PENDING,
+                "users": [relay[a] for a in sorted(relay)],
+                "refused": [],
+            },
+            "outgoing": out,
+            "timers": [*(state.get("timers") or []), timer],
+        }
+
+    async def wait_shortfall(state: HouseholdState) -> dict[str, Any]:
+        """The thread waits here until `shortfall_closed` arrives (§10)."""
+        return {}
+
+    async def apply_shortfall(state: HouseholdState) -> dict[str, Any]:
+        sf = dict(state["shortfall"] or {})
+        conversation = str(ids.shortfall_conversation_id(UUID(sf["id"])))
+        row = await tool(state, "get_shortfall", {"shortfall_id": sf["id"]}, conversation)
+        picks = row.get("picks") or {}
+        # Lines without a pick are dropped (§10 "Closing early").
+        given = {
+            str(line["line"]): str(picks.get(str(line["line"])) or DROP)
+            for line in row.get("lines") or sf["lines"]
+        }
+        try:
+            result = await tool(
+                state,
+                "authorize_amendment",
+                {"order_id": state["order_id"], "shortfall_id": sf["id"], "picks": given},
+                conversation,
+            )
+        except ToolRefused as refused:
+            # Fails closed: no decision is sent, so the order is not amended.
+            await trace_decision(state, "apply_shortfall", f"amendment_refused_{refused.reason}")
+            return {"shortfall": {**sf, "status": SF_REFUSED}}
+        final = {str(k): str(v) for k, v in (result.get("picks") or {}).items()}
+        decision = {"order_id": state["order_id"], "shortfall_id": sf["id"], "picks": final}
+        out = list(state.get("outgoing") or [])
+        _add(state, out, sf["seller"], "shortfall_decision", decision, conversation_id=conversation)
+        sf.update(
+            status=SF_DECIDED,
+            picks=final,
+            refused=[int(line) for line in result.get("refused") or []],
+        )
+        return {"shortfall": sf, "outgoing": out}
+
+    async def shortfall_result(state: HouseholdState) -> dict[str, Any]:
+        """The seller's `order_confirm` after the decision: tell every relayed member."""
+        body = state["body"]
+        sf = dict(state["shortfall"] or {})
+        failed = body.get("state") == "failed"
+        text = _shortfall_text(state["order_id"], sf, failed)
+        out = list(state.get("outgoing") or [])
+        for user_id in sf.get("users") or []:
+            notice = {
+                "user_id": user_id,
+                "template": SHORTFALL_RESULT_TEMPLATE,
+                "params": {"text": text},
+                "buttons": [],
+            }
+            _add(state, out, WHATSAPP, "whatsapp_out", notice)
+        sf.update(
+            status=SF_APPLIED,
+            amended={
+                "lines": list(body.get("lines") or []),
+                "total_minor": body.get("total_minor"),
+                "currency": body.get("currency"),
+            },
+        )
+        update: dict[str, Any] = {"shortfall": sf, "outgoing": out}
+        if failed:
+            update.update(phase=DONE, finish={"status": "error", "reason": NOTHING_TO_DELIVER})
+        return update
+
     async def finish(state: HouseholdState) -> dict[str, Any]:
         out = list(state.get("outgoing") or [])
         offer = _chosen(state)
         if state.get("user_id"):
+            count = len([x for x in offer["lines"] if x.get("offered_sku")])
+            total, currency = offer["total_minor"], offer["currency"]
+            amended = (state.get("shortfall") or {}).get("amended")
+            if amended:
+                # The order the shortfall left (§10): the final lines and total.
+                count, total = len(amended["lines"]), amended["total_minor"]
+                currency = amended["currency"] or currency
             text = (
                 f"Your order {state['order_id'][:8]} was delivered: "
-                f"{len([x for x in offer['lines'] if x.get('offered_sku')])} items, "
-                f"{offer['total_minor']} {offer['currency']} minor units."
+                f"{count} items, {total} {currency} minor units."
             )
             body = {
                 "user_id": state["user_id"],
@@ -838,6 +990,19 @@ def build_graph(
             return "approval_decided" if phase == AWAITING_APPROVAL else "ignore"
         if t in ("order_confirm", "delivery_booked", "order_status"):
             return "track_order" if phase == PLACING else "ignore"
+        if t == "shortfall_notice":
+            # One shortfall per order (§10), and only once the order is placed.
+            return (
+                "handle_shortfall" if phase == PLACING and not state.get("shortfall") else "ignore"
+            )
+        if t == "shortfall_closed":
+            sf = state.get("shortfall") or {}
+            fits = (
+                phase == PLACING
+                and sf.get("status") == SF_PENDING
+                and sf.get("id") == str(state["body"].get("shortfall_id"))
+            )
+            return "apply_shortfall" if fits else "ignore"
         if t in ("reject", "protocol_error"):
             if phase in (NEW, CONSTRAINTS, DONE):
                 return "ignore"
@@ -875,6 +1040,8 @@ def build_graph(
         return "negotiate" if state.get("decision") == "negotiate" else "send"
 
     def after_track(state: HouseholdState) -> str:
+        if state.get("decision") == "shortfall_result":
+            return "shortfall_result"
         if state.get("decision") != "delivered":
             return "send"
         return "record_delivery" if state.get("kind") == "grocery" else "finish"
@@ -900,6 +1067,10 @@ def build_graph(
         "protocol_error": protocol_error,
         "record_delivery": record_delivery,
         "finish": finish,
+        "handle_shortfall": handle_shortfall,
+        "wait_shortfall": wait_shortfall,
+        "apply_shortfall": apply_shortfall,
+        "shortfall_result": shortfall_result,
         "send": send,
     }
     for name, fn in nodes.items():
@@ -914,6 +1085,8 @@ def build_graph(
         "track_order",
         "seller_rejected",
         "protocol_error",
+        "handle_shortfall",
+        "apply_shortfall",
     ]
     g.add_conditional_edges(START, route_message, {n: n for n in entries})
     g.add_edge("ignore", "send")
@@ -931,7 +1104,13 @@ def build_graph(
     g.add_edge("request_approval", "send")
     g.add_conditional_edges("approval_decided", after_approval, ["authorize", "send"])
     g.add_edge("authorize", "send")
-    g.add_conditional_edges("track_order", after_track, ["record_delivery", "finish", "send"])
+    g.add_conditional_edges(
+        "track_order", after_track, ["record_delivery", "finish", "shortfall_result", "send"]
+    )
+    g.add_edge("handle_shortfall", "wait_shortfall")
+    g.add_edge("wait_shortfall", "send")
+    g.add_edge("apply_shortfall", "send")
+    g.add_edge("shortfall_result", "send")
     g.add_conditional_edges(
         "seller_rejected", after_rejected, ["requote", "choose_offer", "no_offers", "send"]
     )
@@ -949,6 +1128,32 @@ def _chosen(state: HouseholdState) -> dict[str, Any]:
         if offer.get("quote_id") == chosen:
             return offer
     raise LookupError(f"chosen quote {chosen} is not in state")
+
+
+def _shortfall_text(order_id: str, sf: Mapping[str, Any], failed: bool) -> str:
+    """What the shortfall changed, written in code from the notice and the final picks."""
+    notice = {str(line["line"]): line for line in sf.get("lines") or []}
+    refused = {str(line) for line in sf.get("refused") or []}
+    substituted: list[str] = []
+    dropped: list[str] = []
+    for line, pick in sorted((sf.get("picks") or {}).items(), key=lambda kv: int(kv[0])):
+        entry = notice.get(line) or {}
+        name = str(entry.get("name") or entry.get("sku") or line)
+        if pick == DROP:
+            dropped.append(f"{name} (substitute refused)" if line in refused else name)
+            continue
+        subs = {str(s["sku"]): s for s in entry.get("substitutes") or []}
+        sub = str((subs.get(pick) or {}).get("name") or pick)
+        substituted.append(f"{sub} for {name}")
+    head = f"Order {order_id[:8]}"
+    if failed:
+        return f"{head}: every item was missing, so nothing will be delivered."
+    parts = [f"{head} changed."]
+    if substituted:
+        parts.append("Substituted: " + "; ".join(substituted) + ".")
+    if dropped:
+        parts.append("Dropped: " + "; ".join(dropped) + ".")
+    return " ".join(parts)
 
 
 def _seller_of(state: HouseholdState, quote_id: str) -> str:
@@ -975,11 +1180,20 @@ class HouseholdGraph:
         clock: Clock = _now,
         sleep: Sleep = asyncio.sleep,
         offer_ttl_seconds: int = OFFER_TTL_SECONDS,
+        load_whatsapp_members: LoadMembers | None = None,
     ) -> None:
         self._load_run = load_run
         self._offer_ttl_seconds = offer_ttl_seconds
         self.builder = build_graph(
-            model, traces, call_tool, issue_token, load_members, find_sellers, clock, sleep
+            model,
+            traces,
+            call_tool,
+            issue_token,
+            load_members,
+            find_sellers,
+            clock,
+            sleep,
+            load_whatsapp_members,
         )
         self.graph = self.builder.compile(checkpointer=checkpointer)
 
@@ -1041,6 +1255,7 @@ class HouseholdGraph:
                 offer_ttl_seconds=_int(
                     run.overrides.get("OFFER_TTL_SECONDS"), self._offer_ttl_seconds
                 ),
+                shortfall=None,
                 sent={},
             )
         state = await self.graph.ainvoke(inbound, config)
@@ -1064,7 +1279,14 @@ class HouseholdGraph:
             for m in entry.get("messages") or []
         ]
         timers = [
-            TimerCreate(kind=t["kind"], due_at=timedelta(seconds=t["seconds"]), ref=t["ref"])
+            TimerCreate(
+                kind=t["kind"],
+                # An absolute `due_at` (the shortfall's `reply_by`), else seconds from now.
+                due_at=datetime.fromisoformat(t["due_at"])
+                if t.get("due_at")
+                else timedelta(seconds=t["seconds"]),
+                ref=t["ref"],
+            )
             for t in entry.get("timers") or []
         ]
         fin = entry.get("finish")
@@ -1083,6 +1305,15 @@ SELECT c.agent_id, m.user_id::text
 FROM household_members m
 JOIN agent_cards c ON c.class = 'consumer' AND c.enabled AND c.owner_ref = 'user:' || m.user_id
 WHERE m.household_id = %s
+ORDER BY c.agent_id
+"""
+# The members a shortfall is relayed to: those with a WhatsApp identity (§10).
+_WHATSAPP_MEMBERS_SQL = """
+SELECT c.agent_id, m.user_id::text
+FROM household_members m
+JOIN agent_cards c ON c.class = 'consumer' AND c.enabled AND c.owner_ref = 'user:' || m.user_id
+WHERE m.household_id = %s
+  AND EXISTS (SELECT 1 FROM channel_identities ci WHERE ci.user_id = m.user_id)
 ORDER BY c.agent_id
 """
 _default: HouseholdGraph | None = None
@@ -1113,6 +1344,11 @@ def _build_default() -> HouseholdGraph:
             cur = await conn.execute(_MEMBERS_SQL, (household_id,))
             return {agent_id: user_id for agent_id, user_id in await cur.fetchall()}
 
+    async def load_whatsapp_members(household_id: str) -> Members:
+        async with pool.connection() as conn:
+            cur = await conn.execute(_WHATSAPP_MEMBERS_SQL, (household_id,))
+            return {agent_id: user_id for agent_id, user_id in await cur.fetchall()}
+
     async def find_sellers(cls: str, region: str, zone_id: str, currency: str) -> list[str]:
         async with pool.connection() as conn:
             cards = await directory.find(conn, cls, region, zone_id, currency)
@@ -1126,6 +1362,7 @@ def _build_default() -> HouseholdGraph:
         load_members=load_members,
         find_sellers=find_sellers,
         offer_ttl_seconds=get_settings().offer_ttl_seconds,
+        load_whatsapp_members=load_whatsapp_members,
     )
 
 

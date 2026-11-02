@@ -8,10 +8,12 @@ resulting message through the outbox and marks the timer `done`:
     to `expired` and send `approval_decision(expired)` to the household agent.
 *   `run_timeout`: `runs.finish(status=timeout)`, which sends the retry prompt.
 *   `quote_round`: send `quote_round_closed` to the agent named in `ref.to`.
+*   `shortfall_expiry` (agent-protocol §10, P17): close the shortfall if still `pending`;
+    if it changed, send `shortfall_closed {reason: timeout}` to the household agent.
 
-Kinds the sweeper does not know (`shortfall_expiry` until #69) are never claimed and stay
-`pending` (agent-protocol §4). A timer whose action raises is rolled back to its savepoint,
-stays `pending` and is tried again on the next sweep.
+Kinds the sweeper does not know are never claimed and stay `pending` (agent-protocol §4).
+A timer whose action raises is rolled back to its savepoint, stays `pending` and is tried
+again on the next sweep.
 """
 
 import asyncio
@@ -49,6 +51,17 @@ UPDATE approvals SET status = 'expired', decided_at = now()
 WHERE approval_id = %s AND status = 'pending'
 RETURNING order_id
 """
+
+# Agent-protocol §10 "Closing early": only a `pending` row closes, so this timer and the
+# courier's `picked_up` never both send `shortfall_closed`.
+_CLOSE_SHORTFALL_SQL = """
+UPDATE shortfalls s SET status = 'closed', closed_at = now()
+FROM orders o
+WHERE s.shortfall_id = %s AND s.status = 'pending' AND o.order_id = s.order_id
+RETURNING s.order_id, s.run_id, o.household_id
+"""
+# The `shortfall_closed` reason when nobody answered in time (agent-protocol §10).
+TIMEOUT = "timeout"
 
 _DONE_SQL = "UPDATE timers SET status = 'done' WHERE timer_id = %s"
 
@@ -97,10 +110,31 @@ async def _quote_round(conn: AsyncConnection, timer: Mapping[str, Any]) -> None:
     )
 
 
+async def _shortfall_expiry(conn: AsyncConnection, timer: Mapping[str, Any]) -> None:
+    shortfall_id = UUID(str(timer["ref"]["shortfall_id"]))
+    cur = await conn.execute(_CLOSE_SHORTFALL_SQL, (shortfall_id,))
+    row = await cur.fetchone()
+    if row is None:
+        return  # already closed: the last pick or the pickup won
+    order_id, run_id, household_id = row
+    await outbox.send(
+        conn,
+        message_id=ids.shortfall_closed_id(shortfall_id),
+        run_id=run_id,
+        conversation_id=ids.shortfall_conversation_id(shortfall_id),
+        causation_id=None,
+        from_agent=SWEEPER,
+        to_agent=f"household:{household_id}",
+        type="shortfall_closed",
+        body={"shortfall_id": str(shortfall_id), "order_id": str(order_id), "reason": TIMEOUT},
+    )
+
+
 _ACTIONS: Mapping[str, Callable[[AsyncConnection, Mapping[str, Any]], Awaitable[None]]] = {
     "approval_expiry": _approval_expiry,
     "run_timeout": _run_timeout,
     "quote_round": _quote_round,
+    "shortfall_expiry": _shortfall_expiry,
 }
 KINDS = frozenset(_ACTIONS)
 

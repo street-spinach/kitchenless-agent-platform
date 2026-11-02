@@ -33,6 +33,8 @@ MEMBERS = {
     "consumer:us-1-b": "22222222-2222-4222-8222-222222222222",
 }
 STARTER_AGENT = "consumer:us-1-a"
+# Only the starter has a WhatsApp identity (`channel_identities`).
+WHATSAPP_MEMBERS = frozenset({STARTER_AGENT})
 APPROVER = MEMBERS["consumer:us-1-b"]
 SELLERS = ["grocery:mock-us", "grocery:square-us"]
 NOW = datetime(2026, 11, 2, 12, 0, tzinfo=UTC)
@@ -56,6 +58,10 @@ class FakeHousehold:
         self.remaining_minor = remaining_minor
         self.calls: list[dict[str, Any]] = []
         self.refuse: dict[str, str] = {}
+        # The shortfall row `get_shortfall` returns, and the lines `authorize_amendment`
+        # turns into drops.
+        self.shortfall: dict[str, Any] = {}
+        self.refuse_lines: list[int] = []
 
     def of(self, tool: str) -> list[dict[str, Any]]:
         return [c for c in self.calls if c["tool"] == tool]
@@ -87,6 +93,17 @@ class FakeHousehold:
             }
         if tool == "record_delivery":
             return {"order_id": args["order_id"], "recorded": 4}
+        if tool == "open_shortfall":
+            self.shortfall = {"lines": args["lines"], "picks": {}, "status": "pending"}
+            return {"shortfall_id": args["shortfall_id"], "status": "pending", "opened": True}
+        if tool == "get_shortfall":
+            return {"shortfall_id": args["shortfall_id"], **self.shortfall}
+        if tool == "authorize_amendment":
+            picks = {
+                line: "drop" if int(line) in self.refuse_lines else pick
+                for line, pick in args["picks"].items()
+            }
+            return {"picks": picks, "refused": sorted(self.refuse_lines)}
         raise AssertionError(f"unexpected tool {tool}")
 
 
@@ -141,7 +158,12 @@ class World:
             ),
             clock=lambda: NOW,
             sleep=self.sleep,
+            load_whatsapp_members=self.load_whatsapp_members,
         )
+
+    async def load_whatsapp_members(self, household_id: str) -> dict[str, str]:
+        assert household_id == "us-1"
+        return {a: u for a, u in MEMBERS.items() if a in WHATSAPP_MEMBERS}
 
     async def sleep(self, seconds: float) -> None:
         self.slept.append(seconds)
@@ -800,3 +822,221 @@ def test_no_accept_delay_without_the_override() -> None:
 
 def test_host_registers_the_household_handler() -> None:
     assert host.HANDLERS["household"] is hg.handle
+
+
+# The shortfall (agent-protocol §10, P21; #69) ---------------------------------------------
+
+SELLER = "grocery:square-us"
+REPLY_BY = NOW + timedelta(minutes=15)
+REPLY_BY_WIRE = "2026-11-02T12:15:00Z"  # `reply_by` as the validated body serializes it
+SUB = "SQ-MILK-2PCT"
+
+
+def _notice_lines() -> list[dict[str, Any]]:
+    return [
+        {
+            "line": 1,
+            "sku": f"{SELLER}-MILK",
+            "name": "Whole milk",
+            "qty_missing": 1,
+            "line_total_minor": 2100,
+            "substitutes": [{"sku": SUB, "name": "2% milk", "qty": 1, "unit_minor": 1999}],
+        },
+        {
+            "line": 2,
+            "sku": "SQ-EGGS",
+            "name": "Eggs",
+            "qty_missing": 1,
+            "line_total_minor": 300,
+            "substitutes": [],
+        },
+    ]
+
+
+def _booked(w: World) -> None:
+    """The cheaper offer accepted, placed and its courier booked."""
+    w.accepted()
+    w.order_update("order_confirm", "placed", SELLER)
+    w.order_update("delivery_booked", "courier_booked", "delivery:mock-us")
+
+
+def _shortfall_id(w: World) -> str:
+    return str(ids.shortfall_id(uuid.UUID(w.order_id)))
+
+
+def _notice(w: World) -> StepResult:
+    body = {
+        "order_id": w.order_id,
+        "shortfall_id": _shortfall_id(w),
+        "lines": _notice_lines(),
+        "reply_by": REPLY_BY.isoformat(),
+    }
+    conversation = ids.shortfall_conversation_id(uuid.UUID(_shortfall_id(w)))
+    msg = w.inbound("shortfall_notice", body, from_agent=SELLER, conversation=conversation)
+    return w.step(msg)
+
+
+def _closed(w: World, reason: str, sender: str = "system:api") -> StepResult:
+    body = {"shortfall_id": _shortfall_id(w), "order_id": w.order_id, "reason": reason}
+    conversation = ids.shortfall_conversation_id(uuid.UUID(_shortfall_id(w)))
+    return w.step(w.inbound("shortfall_closed", body, from_agent=sender, conversation=conversation))
+
+
+def _confirm(w: World, state: str, lines: list[dict[str, Any]], total: int) -> StepResult:
+    body = {
+        "order_id": w.order_id,
+        "state": state,
+        "lines": lines,
+        "total_minor": total,
+        "currency": "USD",
+    }
+    if state == "failed":
+        body["reason"] = "nothing_to_deliver"
+    return w.step(w.inbound("order_confirm", body, from_agent=SELLER))
+
+
+def test_shortfall_relayed_to_whatsapp_members() -> None:
+    w = World()
+    _booked(w)
+    result = _notice(w)
+    shortfall_id = _shortfall_id(w)
+    conversation = ids.shortfall_conversation_id(uuid.UUID(shortfall_id))
+
+    [opened] = w.household.of("open_shortfall")
+    assert opened["args"] == {
+        "shortfall_id": shortfall_id,
+        "order_id": w.order_id,
+        "seller": SELLER,
+        "lines": _notice_lines(),
+        "due_at": REPLY_BY_WIRE,
+    }
+    # Only the member with a WhatsApp identity is asked; the other has no channel.
+    [relay] = result.messages
+    assert (relay.type, relay.to_agent) == ("shortfall_relay", STARTER_AGENT)
+    assert relay.conversation_id == conversation
+    assert relay.body == {
+        "order_id": w.order_id,
+        "shortfall_id": shortfall_id,
+        "lines": _notice_lines(),
+        "reply_by": REPLY_BY_WIRE,
+    }
+    # The expiry timer is due exactly at the notice's `reply_by`.
+    assert result.timers == [
+        TimerCreate(
+            kind="shortfall_expiry",
+            due_at=REPLY_BY,
+            ref={"shortfall_id": shortfall_id, "order_id": w.order_id},
+        )
+    ]
+    assert result.finish is None
+    assert w.saved()["shortfall"]["status"] == "pending"
+
+    # An order has one shortfall: a second notice is ignored.
+    again = _notice(w)
+    assert (list(again.messages), list(again.timers)) == ([], [])
+    assert len(w.household.of("open_shortfall")) == 1
+
+
+def test_shortfall_notice_before_placement_ignored() -> None:
+    w = World()
+    w.to_quoting()
+    result = _notice(w)
+    assert (list(result.messages), list(result.timers)) == ([], [])
+    assert w.household.of("open_shortfall") == []
+
+
+def test_shortfall_applied_on_closed() -> None:
+    w = World()
+    _booked(w)
+    _notice(w)
+    # Line 1 was picked; nobody answered for line 2.
+    w.household.shortfall["picks"] = {"1": SUB}
+    w.household.shortfall["status"] = "closed"
+    result = _closed(w, "timeout", sender="system:sweeper")
+
+    [authorize] = w.household.of("authorize_amendment")
+    assert authorize["args"] == {
+        "order_id": w.order_id,
+        "shortfall_id": _shortfall_id(w),
+        "picks": {"1": SUB, "2": "drop"},
+    }
+    claims = tokens.validate(authorize["token"])
+    assert (claims.sub, claims.act, claims.scopes) == (
+        f"user:{STARTER}",
+        HOUSEHOLD,
+        ("orders:place",),
+    )
+    [decision] = result.messages
+    assert (decision.type, decision.to_agent) == ("shortfall_decision", SELLER)
+    assert decision.body == {
+        "order_id": w.order_id,
+        "shortfall_id": _shortfall_id(w),
+        "picks": {"1": SUB, "2": "drop"},
+    }
+    assert decision.conversation_id == ids.shortfall_conversation_id(uuid.UUID(_shortfall_id(w)))
+    assert result.finish is None
+
+    # The shortfall closes once: a later `shortfall_closed` (the pickup) is ignored.
+    late = _closed(w, "picked_up")
+    assert list(late.messages) == []
+    assert len(w.household.of("authorize_amendment")) == 1
+
+    # The seller's amended `order_confirm`: each relayed member is told what changed.
+    amended = [
+        {
+            "line": 1,
+            "sku": SUB,
+            "name": "2% milk",
+            "qty": 1,
+            "unit_minor": 1999,
+            "substituted_for": f"{SELLER}-MILK",
+        }
+    ]
+    told = _confirm(w, "courier_booked", amended, 1999)
+    [notice] = told.messages
+    assert (notice.type, notice.to_agent) == ("whatsapp_out", hg.WHATSAPP)
+    assert notice.body["user_id"] == STARTER
+    assert notice.body["template"] == hg.SHORTFALL_RESULT_TEMPLATE
+    text = notice.body["params"]["text"]
+    assert "Substituted: 2% milk for Whole milk." in text
+    assert "Dropped: Eggs." in text
+    assert told.finish is None
+
+    # Delivered: the pantry is recorded and the summary uses the amended order.
+    w.order_update("order_status", "in_delivery", "system:api")
+    done = w.order_update("order_status", "delivered", "system:api")
+    assert len(w.household.of("record_delivery")) == 1
+    assert done.finish == RunFinish("completed")
+    [summary] = done.messages
+    assert "1 items, 1999 USD" in summary.body["params"]["text"]
+
+
+def test_shortfall_refused_substitute_dropped_and_told() -> None:
+    w = World()
+    _booked(w)
+    _notice(w)
+    w.household.shortfall["picks"] = {"1": SUB, "2": "drop"}
+    w.household.refuse_lines = [1]  # e.g. an allergen conflict
+    result = _closed(w, "all_picked")
+    [decision] = result.messages
+    assert decision.body["picks"] == {"1": "drop", "2": "drop"}
+    told = _confirm(w, "failed", [], 0)
+    assert told.finish == RunFinish("error", "nothing_to_deliver")
+    [notice] = told.messages
+    assert notice.body["user_id"] == STARTER
+    assert "nothing will be delivered" in notice.body["params"]["text"]
+    assert w.saved()["phase"] == hg.DONE
+
+
+def test_shortfall_amendment_refused_sends_nothing() -> None:
+    w = World()
+    _booked(w)
+    _notice(w)
+    w.household.refuse["authorize_amendment"] = "wrong_order_state"
+    result = _closed(w, "timeout", sender="system:sweeper")
+    assert (list(result.messages), result.finish) == ([], None)
+    decision = w.traces.of("decision")[-1]
+    assert (decision["node"], decision["choice"]) == (
+        "apply_shortfall",
+        "amendment_refused_wrong_order_state",
+    )
