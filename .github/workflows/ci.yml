@@ -72,12 +72,15 @@ jobs:
   evals:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # Stub only: no model key in any CI job (evals.md EG1, architecture item 63).
+    env:
+      MODEL_MODE: stub
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
       - id: changed
         run: |
-          if git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -qE '^(services/agents/|services/mcp/|services/safety/|services/identity/|authz/|migrations/|evals/)'; then
+          if git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -qE '^(services/agents/|services/mcp/|services/safety/|services/common/|services/api/|services/seed/|migrations/|evals/)'; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
@@ -89,9 +92,23 @@ jobs:
           cp infra/.env.example infra/.env
           docker compose -f infra/docker-compose.yml --env-file infra/.env --profile ci up -d --wait
           uv sync --frozen
+          make seed SEED_ARGS="--env eval"
           make eval-fast
         env:
           MODE: mock
-          MUSE_API_KEY: ${{ secrets.MUSE_API_KEY }}
+      - if: always() && steps.changed.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-results
+          path: evals/results/
+          if-no-files-found: warn
+      - if: always() && steps.changed.outputs.run == 'true'
+        run: |
+          latest=$(ls -t evals/results/*.md 2>/dev/null | head -n 1 || true)
+          if [ -n "$latest" ]; then
+            cat "$latest" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No eval results were written." >> "$GITHUB_STEP_SUMMARY"
+          fi
       - if: steps.changed.outputs.run == 'false'
         run: echo "No agent behavior changed. Evals skipped."
