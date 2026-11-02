@@ -1070,7 +1070,9 @@ async def get_pantry(ctx: CallContext) -> dict[str, Any]:
     async with db.get_pool().connection() as conn:
         cur = await conn.execute(
             "SELECT item, unit, sum(delta) FROM pantry_events WHERE household_id = %s"
-            " GROUP BY item, unit HAVING sum(delta) > 0 ORDER BY item, unit",
+            # COLLATE "C": the order is byte order on every database, whatever its locale.
+            " GROUP BY item, unit HAVING sum(delta) > 0"
+            ' ORDER BY item COLLATE "C", unit COLLATE "C"',
             (household,),
         )
         rows = await cur.fetchall()
