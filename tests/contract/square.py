@@ -28,7 +28,14 @@ LOCATION_ID = "LOCATION_ID"
 TOKEN = "replay-token"
 REAL = os.environ.get("REAL") == "1"
 
-_BASE_ENV = {"SERVICE_NAME": "migrate", "DATABASE_URL": "x", "LOG_LEVEL": "info"}
+# `migrate` also requires the OpenFGA settings since #114 (identity-authz I16c).
+_BASE_ENV = {
+    "SERVICE_NAME": "migrate",
+    "DATABASE_URL": "x",
+    "LOG_LEVEL": "info",
+    "OPENFGA_PRESHARED_KEY": "x",
+    "OPENFGA_API_URL": "x",
+}
 _SQUARE_VARS = (
     "SQUARE_ENV",
     "SQUARE_RETAIL_TOKEN",
