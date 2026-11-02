@@ -8,7 +8,8 @@ LAST_GREEN=$(cat .last_green 2>/dev/null || echo "")
 
 echo "Deploying $SHA (last green: ${LAST_GREEN:-none})"
 # `up --wait` is part of verification: an unhealthy service must roll back, not exit under set -e.
-if "${COMPOSE[@]}" up -d --build --remove-orphans --wait && make smoke && make scenario; then
+# `make seed` is an idempotent upsert (architecture §11 step 5); a seed failure rolls back (§9).
+if "${COMPOSE[@]}" up -d --build --remove-orphans --wait && make seed && make smoke && make scenario; then
   echo "$SHA" > .last_green
   docker image prune -f >/dev/null
   echo "Deploy $SHA verified."
