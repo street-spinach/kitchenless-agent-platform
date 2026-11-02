@@ -94,10 +94,33 @@ TEXTS: dict[str, str] = {
     # Agent-protocol §10 "Replies".
     "already_decided": "Already decided.",
     # Approvals (architecture §8, CUJs 3 and 7, item 33; #63). `{name}` is a `params` value.
-    "approval_request": "Your agent wants to spend {amount}, over this week's budget. Approve?",
+    # Neutral wording (agents AG-A14): an approval is not always about the budget.
+    "approval_request": "Your agent wants to spend {amount} and needs your approval. Approve?",
     "approval_expired": "This approval has already expired.",
     "approval_not_approver": "Only {approver} can approve this.",
     "approval_cancelled": "Order cancelled: no approval.",
+    # Agents §11. Lists are passed already joined, as one string param.
+    "chat_reply": "{text}",
+    "order_summary": "{text}",
+    "no_offers": "No store could fill this order right now.",
+    "off_topic_reply": ("I can only help with food: planning meals, groceries and dinner orders."),
+    "dislike_saved": (
+        "Saved: you dislike {value}. This is a dislike, not an allergy; "
+        "your household admin sets allergies."
+    ),
+    "dislike_removed": "Done: {value} is no longer on your dislikes.",
+    "dislike_not_removed": (
+        "I can only forget dislikes you told me. Ask your household admin to change the others."
+    ),
+    "dislike_not_saved": "I can't save that. Allergies and diets are set by your household admin.",
+    "take_turns_offer": (
+        "One person's dislike ({values}) was in tonight's dinner. "
+        "Want me to take turns on whose dislikes come first for household dinners?"
+    ),
+    "take_turns_offer_off": (
+        "One person's dislike ({values}) was in tonight's dinner. Take turns is on; tap to stop it."
+    ),
+    "take_turns_saved": "Take turns is now {state}.",
 }
 
 

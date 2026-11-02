@@ -263,6 +263,8 @@ class UserMessage(_Body):
 
 class StartOrder(_Body):
     kind: Literal["grocery", "dinner"]
+    # agents AG-A4: additive with a default, so no `schema_version` bump.
+    scope: Literal["household", "solo"] = "household"
 
 
 class ConstraintsRequest(_Body):

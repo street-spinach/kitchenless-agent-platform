@@ -130,3 +130,13 @@ def test_quote_id_required_on_decisions(samples, type_):
     with pytest.raises(ValidationError) as exc:
         SCHEMAS[type_].model_validate(body)
     assert ("quote_id",) in [e["loc"] for e in exc.value.errors()]
+
+
+@pytest.mark.parametrize("type_", ["start_weekly_order", "start_dinner"])
+def test_start_order_scope_defaults_to_household(samples, type_):
+    # Agents AG-A4: `scope` is additive with a default, so a body without it still parses.
+    body = {k: v for k, v in samples[type_].items() if k != "scope"}
+    assert SCHEMAS[type_].model_validate(body).scope == "household"
+    assert SCHEMAS[type_].model_validate({**body, "scope": "solo"}).scope == "solo"
+    with pytest.raises(ValidationError):
+        SCHEMAS[type_].model_validate({**body, "scope": "everyone"})

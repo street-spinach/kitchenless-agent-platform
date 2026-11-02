@@ -125,6 +125,28 @@ def parse_approval_button(payload: str) -> tuple[UUID, str] | None:
         return None
 
 
+_TAKE_TURNS_STATES = {"on": True, "off": False}
+
+
+def take_turns_button(order_id: UUID, on: bool) -> str:
+    """The WhatsApp button payload that turns take-turns on or off for the household of
+    `order_id` (agents §10): `tt:<order_id>:on` or `tt:<order_id>:off`."""
+    return f"tt:{UUID(_require('order_id', order_id))}:{'on' if on else 'off'}"
+
+
+def parse_take_turns_button(payload: str) -> tuple[UUID, bool] | None:
+    """`(order_id, on)` from a take-turns button payload, or `None` if it is not one
+    (fails closed: an unknown payload changes nothing)."""
+    prefix, _, rest = (payload or "").partition(":")
+    raw_id, _, state = rest.partition(":")
+    if prefix != "tt" or state not in _TAKE_TURNS_STATES:
+        return None
+    try:
+        return UUID(raw_id), _TAKE_TURNS_STATES[state]
+    except ValueError:
+        return None
+
+
 def conversation_id(opening_message_id: UUID) -> UUID:
     """Conversation opened by `opening_message_id` (a negotiation or store-to-courier)."""
     return uuid5(opening_message_id, "conversation")

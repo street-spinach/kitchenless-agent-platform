@@ -55,7 +55,7 @@ def test_approval_prompt_renders_amount_and_buttons() -> None:
     asyncio.run(graph.sender()(PHONE, body))
     sent = json.loads(graph.requests[0].content)
     assert sent["interactive"]["body"]["text"] == (
-        "Your agent wants to spend $76.00, over this week's budget. Approve?"
+        "Your agent wants to spend $76.00 and needs your approval. Approve?"
     )
     titles = [b["reply"]["title"] for b in sent["interactive"]["action"]["buttons"]]
     assert titles == ["Approve", "Reject"]
@@ -74,6 +74,86 @@ def test_approval_reply_texts(template: str, params: dict[str, str], text: str) 
     payload = s.graph_payload(PHONE, {**RETRY, "template": template, "params": params})
     assert payload is not None
     assert payload["text"]["body"] == text
+
+
+@pytest.mark.parametrize(
+    ("template", "params", "text"),
+    [
+        ("chat_reply", {"text": "Try a lentil soup."}, "Try a lentil soup."),
+        ("order_summary", {"text": "Delivered."}, "Delivered."),
+        ("no_offers", {}, "No store could fill this order right now."),
+        (
+            "off_topic_reply",
+            {},
+            "I can only help with food: planning meals, groceries and dinner orders.",
+        ),
+        (
+            "dislike_saved",
+            {"value": "olives"},
+            "Saved: you dislike olives. This is a dislike, not an allergy; "
+            "your household admin sets allergies.",
+        ),
+        ("dislike_removed", {"value": "olives"}, "Done: olives is no longer on your dislikes."),
+        (
+            "dislike_not_removed",
+            {},
+            "I can only forget dislikes you told me. "
+            "Ask your household admin to change the others.",
+        ),
+        (
+            "dislike_not_saved",
+            {},
+            "I can't save that. Allergies and diets are set by your household admin.",
+        ),
+        (
+            "take_turns_offer",
+            {"values": "olives, mushrooms"},
+            "One person's dislike (olives, mushrooms) was in tonight's dinner. "
+            "Want me to take turns on whose dislikes come first for household dinners?",
+        ),
+        (
+            "take_turns_offer_off",
+            {"values": "olives"},
+            "One person's dislike (olives) was in tonight's dinner. "
+            "Take turns is on; tap to stop it.",
+        ),
+        ("take_turns_saved", {"state": "on"}, "Take turns is now on."),
+        ("take_turns_saved", {"state": "off"}, "Take turns is now off."),
+    ],
+)
+def test_agents_template_texts(template: str, params: dict[str, str], text: str) -> None:
+    # Agents §11 templates; each renders with its params.
+    payload = s.graph_payload(PHONE, {**RETRY, "template": template, "params": params})
+    assert payload is not None
+    assert payload["text"]["body"] == text
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "chat_reply",
+        "order_summary",
+        "dislike_saved",
+        "dislike_removed",
+        "take_turns_offer",
+        "take_turns_offer_off",
+        "take_turns_saved",
+    ],
+)
+def test_agents_template_without_its_param_is_not_rendered(template: str) -> None:
+    # A missing param drops the message (fails closed).
+    assert s.graph_payload(PHONE, {**RETRY, "template": template, "params": {}}) is None
+
+
+def test_take_turns_offer_renders_its_button() -> None:
+    order = uuid.uuid4()
+    buttons = [{"payload": f"tt:{order}:on", "title": "Take turns"}]
+    params = {"values": "olives"}
+    body = {**RETRY, "template": "take_turns_offer", "params": params, "buttons": buttons}
+    payload = s.graph_payload(PHONE, body)
+    assert payload is not None
+    replies = payload["interactive"]["action"]["buttons"]
+    assert replies == [{"type": "reply", "reply": {"id": f"tt:{order}:on", "title": "Take turns"}}]
 
 
 def test_first_attempt_succeeds_sends_one_text_message() -> None:
