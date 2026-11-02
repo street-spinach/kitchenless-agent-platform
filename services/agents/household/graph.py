@@ -40,7 +40,9 @@ routed by its type and the order's phase:
     a `decision` trace.
 *   `order_confirm`, `delivery_booked`, `order_status` → `track_order`; on `delivered`,
     `record_delivery` (weekly orders only) → `finish` (`completed` and a summary
-    `whatsapp_out`: the delivered line, then the explanation, agents §11).
+    `whatsapp_out`: the delivered line, then the explanation, agents §11). A household
+    dinner with an unavoidable dislike also sends the approver the take-turns offer, and
+    `advance_turn` runs when take-turns was on (agents §10).
 *   The shortfall (agent-protocol §10, P21): `shortfall_notice` → `handle_shortfall`
     (`open_shortfall`, the `shortfall_expiry` timer at the notice's `reply_by`, one
     `shortfall_relay` per member with a WhatsApp identity) → `wait_shortfall`.
@@ -166,6 +168,7 @@ SCOPES: Mapping[str, tuple[str, ...]] = {
     "open_shortfall": (),
     "get_shortfall": (),
     "authorize_amendment": ("orders:place",),
+    "advance_turn": ("orders:place",),  # agents §10
 }
 HANDLED_TYPES = frozenset(
     {
@@ -191,6 +194,11 @@ SUMMARY_TEMPLATE = "order_summary"
 NO_OFFERS_TEMPLATE = "no_offers"
 APPROVAL_CANCELLED_TEMPLATE = "approval_cancelled"
 SHORTFALL_RESULT_TEMPLATE = "shortfall_result"
+# The take-turns message from `finish` and its one button (agents §10).
+TAKE_TURNS_OFFER_TEMPLATE = "take_turns_offer"
+TAKE_TURNS_OFFER_OFF_TEMPLATE = "take_turns_offer_off"
+TAKE_TURNS_TITLE = "Take turns"
+STOP_TAKING_TURNS_TITLE = "Stop taking turns"
 DROP = "drop"
 NOTHING_TO_DELIVER = "nothing_to_deliver"
 # `state.shortfall.status`: waiting for `shortfall_closed`, `shortfall_decision` sent, the
@@ -1293,6 +1301,34 @@ def build_graph(
                 "buttons": [],
             }
             _add(state, out, WHATSAPP, "whatsapp_out", body)
+        # Take-turns (agents §10, AG7): household dinners only, never solo or weekly.
+        household_dinner = (
+            state.get("kind") == "dinner" and (state.get("scope") or HOUSEHOLD_SCOPE) != SOLO_SCOPE
+        )
+        on = bool(state.get("take_turns"))
+        unavoidable = list(state.get("unavoidable_dislikes") or [])
+        approver = state.get("approver_user_id")
+        if household_dinner and unavoidable and approver:
+            # Filed with this step by `send`, so it goes out at most once per order. It
+            # names the dislike values, never the member.
+            offer = {
+                "user_id": approver,
+                "template": TAKE_TURNS_OFFER_OFF_TEMPLATE if on else TAKE_TURNS_OFFER_TEMPLATE,
+                "params": {"values": ", ".join(unavoidable)},
+                "buttons": [
+                    {
+                        "payload": ids.take_turns_button(UUID(state["order_id"]), not on),
+                        "title": STOP_TAKING_TURNS_TITLE if on else TAKE_TURNS_TITLE,
+                    }
+                ],
+            }
+            _add(state, out, WHATSAPP, "whatsapp_out", offer)
+            await trace_decision(state, "finish", "take_turns_offered", f"on={str(on).lower()}")
+        if household_dinner and on:
+            # A replay changes nothing (agents §10), so a retried step is safe.
+            result = await tool(state, "advance_turn", {"order_id": state["order_id"]})
+            if result.get("advanced"):
+                await trace_decision(state, "finish", "turn_advanced")
         return {"phase": DONE, "outgoing": out, "finish": {"status": "completed"}}
 
     async def send(state: HouseholdState) -> dict[str, Any]:

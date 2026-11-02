@@ -14,6 +14,7 @@ from services.api.ingest import (
     APPROVAL_EXPIRED,
     MEDIA_NOT_SUPPORTED,
     NOT_APPROVER,
+    TAKE_TURNS_SAVED,
     Content,
     ingest,
 )
@@ -151,8 +152,12 @@ async def _call_tool(server: str, tool: str, args: dict, *, ctx: RunContext, tok
         modes={},
         on_behalf_of=None,
     )
-    fn = {"decide_approval": household.decide_approval}[tool]
-    typed = {k: uuid.UUID(v) if k in ("approval_id", "user_id") else v for k, v in args.items()}
+    fn = {
+        "decide_approval": household.decide_approval,
+        "set_take_turns": household.set_take_turns,
+    }[tool]
+    uuids = ("approval_id", "user_id", "order_id")
+    typed = {k: uuid.UUID(v) if k in uuids else v for k, v in args.items()}
     try:
         return await fn(call, **typed)
     except GuardRefused as refused:
@@ -396,6 +401,165 @@ def test_unknown_approval_button_starts_nothing(
 def test_button_starts_nothing_until_approvals_are_built(world: str) -> None:
     assert _ingest(world, "wamid.b", Content("button", button="approve:1")) is None
     assert w.query(world, "SELECT * FROM runs") == []
+
+
+# The take-turns tap (agents §10, AG7; AG-CUJ 8) ------------------------------------------
+#
+# The tap goes through the real `set_take_turns`, in process on the test database.
+
+
+def _completed_dinner(pg: str) -> uuid.UUID:
+    """A household dinner that was delivered and whose run has ended; Asha approves."""
+    with psycopg.connect(pg) as conn:
+        conn.execute(
+            "INSERT INTO household_addresses"
+            " (address_ref, household_id, line1, city, region, postal_code, country)"
+            " VALUES (%s, %s, '1 Main St', 'Cincinnati', 'OH', '45202', 'US')",
+            (ids.seed_address_ref(w.HOUSEHOLD_ID), w.HOUSEHOLD_ID),
+        )
+        conn.execute(
+            "INSERT INTO approval_rules (household_id, approver_user_id) VALUES (%s, %s)",
+            (w.HOUSEHOLD_ID, w.ADMIN),
+        )
+
+    async def go(conn: psycopg.AsyncConnection) -> uuid.UUID:
+        trigger = {"user_id": w.ADMIN}
+        run_id = await runs.start(conn, household_id=w.HOUSEHOLD_ID, kind="dinner", trigger=trigger)
+        order_id = ids.order_id(run_id)
+        await conn.execute(
+            "INSERT INTO orders (order_id, run_id, household_id, kind, state, currency,"
+            " address_ref) VALUES (%s, %s, %s, 'dinner', 'delivered', 'USD', %s)",
+            (order_id, run_id, w.HOUSEHOLD_ID, ids.seed_address_ref(w.HOUSEHOLD_ID)),
+        )
+        assert await runs.finish(conn, run_id, HOUSEHOLD_AGENT, "completed")
+        await conn.commit()
+        return order_id
+
+    return w.run(pg, go)
+
+
+def _tt_tap(
+    pg: str,
+    monkeypatch: pytest.MonkeyPatch,
+    external_id: str,
+    button: str,
+    phone: str = w.ADMIN_PHONE,
+) -> uuid.UUID | None:
+    async def go(conn: psycopg.AsyncConnection) -> uuid.UUID | None:
+        return await ingest(
+            conn,
+            CHANNEL,
+            external_id,
+            phone,
+            Content("button", button=button),
+            call_tool=_call_tool,
+        )
+
+    return _with_pool(pg, monkeypatch, go)
+
+
+def _take_turns_row(pg: str) -> list[dict]:
+    return w.query(pg, "SELECT take_turns, set_by FROM household_rules")
+
+
+def _set_take_turns_traces(pg: str, run_id: uuid.UUID) -> list[dict]:
+    return w.query(
+        pg,
+        "SELECT payload FROM agent_traces WHERE run_id = %s AND kind = 'tool_result'"
+        " AND payload->>'tool' = 'set_take_turns'",
+        run_id,
+    )
+
+
+def test_tt_tap_after_order_completed_sets_rule(
+    world: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    order_id = _completed_dinner(world)
+    button = ids.take_turns_button(order_id, True)
+    tap_run = _tt_tap(world, monkeypatch, "wamid.tt", button)
+    assert tap_run is not None and tap_run != order_id
+    # A new `chat` run for the tapping member, ended `completed`.
+    run = _run_row(world, tap_run)
+    assert (run["kind"], run["household_id"], run["status"]) == (
+        "chat",
+        w.HOUSEHOLD_ID,
+        "completed",
+    )
+    assert run["trigger"]["user_id"] == str(w.ADMIN)
+    [inbound_row] = w.query(world, "SELECT run_id FROM inbound_messages")
+    assert inbound_row["run_id"] == tap_run
+    # One `set_take_turns` call, in the new run.
+    [call] = _set_take_turns_traces(world, tap_run)
+    assert call["payload"]["refused"] is False
+    assert _take_turns_row(world) == [{"take_turns": True, "set_by": w.ADMIN}]
+    # One `take_turns_saved` reply.
+    inbound = ids.inbound_id(CHANNEL, "wamid.tt")
+    [reply] = _messages(world, tap_run)
+    assert reply["message_id"] == ids.message_id(inbound, 0)
+    assert (reply["from_agent"], reply["to_agent"], reply["type"]) == (
+        API_AGENT,
+        w.WHATSAPP,
+        "whatsapp_out",
+    )
+    assert reply["body"] == {
+        "user_id": str(w.ADMIN),
+        "template": TAKE_TURNS_SAVED,
+        "params": {"state": "on"},
+        "buttons": [],
+    }
+    # A later "Stop taking turns" tap switches it back.
+    off = _tt_tap(world, monkeypatch, "wamid.tt2", ids.take_turns_button(order_id, False))
+    assert off is not None
+    [reply] = _messages(world, off)
+    assert reply["body"]["params"] == {"state": "off"}
+    assert _take_turns_row(world) == [{"take_turns": False, "set_by": w.ADMIN}]
+
+
+def test_tt_tap_unchanged_sends_nothing(world: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    order_id = _completed_dinner(world)
+    # Take-turns is off already (no row).
+    tap_run = _tt_tap(world, monkeypatch, "wamid.same", ids.take_turns_button(order_id, False))
+    assert tap_run is not None
+    assert _run_row(world, tap_run)["status"] == "completed"
+    assert len(_set_take_turns_traces(world, tap_run)) == 1
+    assert _messages(world, tap_run) == []
+
+
+def test_tt_tap_by_non_approver_sends_nothing(world: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    order_id = _completed_dinner(world)
+    button = ids.take_turns_button(order_id, True)
+    tap_run = _tt_tap(world, monkeypatch, "wamid.other", button, phone=w.MEMBER_PHONE)
+    assert tap_run is not None
+    assert _run_row(world, tap_run)["status"] == "completed"
+    [refusal] = _set_take_turns_traces(world, tap_run)
+    assert refusal["payload"]["refused"] is True
+    assert refusal["payload"]["reason"] == "wrong_approver"
+    assert _take_turns_row(world) == []
+    assert _messages(world, tap_run) == []
+
+
+def test_tt_tap_unknown_order_sends_nothing(world: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    _completed_dinner(world)
+    button = ids.take_turns_button(uuid.uuid4(), True)
+    tap_run = _tt_tap(world, monkeypatch, "wamid.unknown", button)
+    assert tap_run is not None
+    [refusal] = _set_take_turns_traces(world, tap_run)
+    assert refusal["payload"]["reason"] == "authz_denied"
+    assert _take_turns_row(world) == []
+    assert _messages(world, tap_run) == []
+
+
+@pytest.mark.parametrize("payload", ["tt:x:on", "tt:{order}:no", "tt:{order}", "tt:"])
+def test_malformed_tt_payload_ignored(
+    world: str, monkeypatch: pytest.MonkeyPatch, payload: str
+) -> None:
+    order_id = _completed_dinner(world)
+    before = w.query(world, "SELECT run_id FROM runs")
+    button = payload.format(order=order_id)
+    assert _tt_tap(world, monkeypatch, "wamid.bad", button) is None
+    assert w.query(world, "SELECT run_id FROM runs") == before
+    assert w.query(world, "SELECT * FROM agent_messages WHERE type = 'whatsapp_out'") == []
+    assert _take_turns_row(world) == []
 
 
 def test_retry_resends_original_request_in_new_run(world: str) -> None:
