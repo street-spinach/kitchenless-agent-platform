@@ -874,9 +874,11 @@ check.
         `env='eval'`.
     *   **Kept:** `agent_traces`, which evals read by `run_id`, and `inbound_messages`,
         which have no foreign keys.
-    *   **Re-seed:** `mock_stock` for `env='eval'` is rewritten by the seed's stock writer
-        (item 55, exposed as `services.seed.seed_mock_stock(conn, env)`), in the same
-        transaction. identity-authz step 9 widens this to the seed's whole eval part.
+    *   **Re-seed:** in the same transaction, `reset` inserts the rows from
+        `services.seed.mock_stock_rows(env="eval")`. That is a pure function over the
+        seed data files (item 55), returning `(env, agent_id, sku, qty)` tuples. The
+        seed's own stock writer uses it too, so the two never drift. identity-authz step
+        9 widens this to the seed's whole eval part.
 *   The deploy scenario test also uses `eval` households. The nightly eval run does nothing
     while `/opt/app/DEPLOY_FREEZE` exists.
 
@@ -2400,7 +2402,7 @@ and values; none of these may be renamed or dropped.
     `expire_approval(approval_id)`. `reset` re-seeds `eval` mock stock from the seed data
     files.
 *   **Amended 2026-11-02 (reset scope, #50).** `reset` follows the §7 rule (deletion order,
-    `shortfalls`, `sim_outbound` by eval phone, and `seed_mock_stock(conn, "eval")`).
+    `shortfalls`, `sim_outbound` by eval phone, and the `mock_stock_rows("eval")` re-seed).
 
 ##### 48. `services/mocks/panel.py` (Keep)
 
