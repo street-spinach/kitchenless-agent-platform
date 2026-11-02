@@ -15,8 +15,10 @@ from services.common.config import Settings
 from services.common.modes import ALWAYS_MOCK, VENDORS
 from services.mcp.delivery.adapters.mock_courier import MockCourierAdapter
 from services.mcp.grocery.adapters.mock_store import MockStoreAdapter
+from services.mcp.grocery.adapters.square import SquareRetailAdapter
 from services.mcp.meta import AdapterFailure
 from services.mcp.restaurant.adapters.mock_restaurant import MockRestaurantAdapter
+from services.mcp.restaurant.adapters.square import SquareRestaurantAdapter
 
 
 def _use_env(monkeypatch: pytest.MonkeyPatch, **env: str) -> None:
@@ -199,13 +201,17 @@ def test_empty_run_modes_raises() -> None:
         assert (e.value.reason, e.value.retryable) == ("adapter_not_configured", False)
 
 
-def test_square_real_is_not_configured_until_its_class_exists() -> None:
-    # The Square classes land in adapters build step 6; until then `real` fails closed.
+def test_square_real_resolves_square_class() -> None:
+    # Adapters build step 6 (file 27): `real` Square keys get the Square classes, never the
+    # mock. Without sandbox settings those classes refuse with `adapter_not_configured`
+    # (tests/contract/*/test_square_wire.py).
     mock = {vendor: "mock" for vendor in VENDORS}
-    for vendor in ("square_retail", "square_restaurant"):
-        with pytest.raises(AdapterFailure) as e:
-            modes.adapter_for(vendor, {**mock, vendor: "real"})
-        assert (e.value.reason, e.value.retryable) == ("adapter_not_configured", False)
+    retail = modes.adapter_for("square_retail", {**mock, "square_retail": "real"})
+    restaurant = modes.adapter_for("square_restaurant", {**mock, "square_restaurant": "real"})
+
+    assert retail is SquareRetailAdapter
+    assert restaurant is SquareRestaurantAdapter
+    assert frozenset({"place_order"}) == retail.OPERATIONS == restaurant.OPERATIONS
 
 
 def test_eval_env_pins_mock() -> None:

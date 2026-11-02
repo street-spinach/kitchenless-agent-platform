@@ -229,3 +229,49 @@ def test_tool_errors_error_row_has_where_attempt_and_on_behalf_of(
         on_behalf_of,
         ctx.conversation_id,
     )
+
+
+def test_adapter_failure_vendor_fields_default_to_none() -> None:
+    failure = AdapterFailure("adapter_5xx", retryable=True)
+    assert (failure.vendor, failure.http_status, failure.vendor_code) == (None, None, None)
+
+
+@pytest.mark.db
+def test_tool_errors_error_row_copies_vendor_fields_that_are_set(
+    pg: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Adapters §11: vendor, http_status and vendor_code reach the error row when set.
+    run_id = _seed(pg)
+    ctx = _ctx(run_id)
+
+    async def go() -> None:
+        for failure in (
+            AdapterFailure(
+                "adapter_rate_limited",
+                retryable=True,
+                vendor="square",
+                http_status=429,
+                vendor_code="RATE_LIMITED",
+            ),
+            AdapterFailure("adapter_timeout", retryable=True, vendor="square"),
+        ):
+            async with tool_errors(ctx, "grocery", "place_order"):
+                raise failure
+
+    _with_pool(pg, monkeypatch, go)
+
+    limited, timeout = _traces(pg, run_id)
+    assert limited["payload"] == {
+        "where": "grocery.place_order",
+        "reason": "adapter_rate_limited",
+        "attempt": 2,
+        "vendor": "square",
+        "http_status": 429,
+        "vendor_code": "RATE_LIMITED",
+    }
+    assert timeout["payload"] == {
+        "where": "grocery.place_order",
+        "reason": "adapter_timeout",
+        "attempt": 2,
+        "vendor": "square",
+    }

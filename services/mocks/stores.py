@@ -84,20 +84,34 @@ def _filter_codes(filters: Mapping[str, Any], name: str) -> list[str]:
 
 _SEARCH_SQL = """
 SELECT i.sku, i.name, i.brand, i.allergens, i.diets, i.price_minor, i.currency,
-       COALESCE(s.qty, 0) AS available_qty
+       {available} AS available_qty
 FROM {table} i
-LEFT JOIN mock_stock s ON s.env = %(env)s AND s.agent_id = i.agent_id AND s.sku = i.sku
+{stock_join}
 CROSS JOIN plainto_tsquery('simple', %(query)s) q
 WHERE i.agent_id = %(agent_id)s
   AND NOT (i.allergens && %(allergens)s::text[])
   AND i.diets @> %(diets)s::text[]
   AND (%(max_price)s::bigint IS NULL OR i.price_minor <= %(max_price)s::bigint)
-  AND COALESCE(s.qty, 0) > 0
+  AND {in_stock}
   AND NOT (i.sku = ANY(%(out_of_stock)s::text[]))
   AND (numnode(q) = 0 OR i.search @@ q)
 ORDER BY ts_rank(i.search, q) DESC, i.sku
 LIMIT %(limit)s
 """
+# Stock from `mock_stock` (the mocks), or from the items table's own `in_stock` flag (the
+# Square adapters, adapters §7). The flag has no count, so `available_qty` is then `None`.
+_MOCK_STOCK = {
+    "available": sql.SQL("COALESCE(s.qty, 0)"),
+    "stock_join": sql.SQL(
+        "LEFT JOIN mock_stock s ON s.env = %(env)s AND s.agent_id = i.agent_id AND s.sku = i.sku"
+    ),
+    "in_stock": sql.SQL("COALESCE(s.qty, 0) > 0"),
+}
+_TABLE_STOCK = {
+    "available": sql.SQL("NULL::bigint"),
+    "stock_join": sql.SQL(""),
+    "in_stock": sql.SQL("i.in_stock"),
+}
 
 
 async def search(
@@ -111,13 +125,15 @@ async def search(
     filters: Mapping[str, Any],
     out_of_stock: Sequence[str] = (),
     limit: int = SEARCH_LIMIT,
+    mock_stock: bool = True,
 ) -> list[dict[str, Any]]:
     """The card's items that pass every filter, best `ts_rank` match first.
 
     `filters` may hold `allergen_codes` (items with any of them are excluded),
     `diet_codes` (items must have all of them), `zone_id` (the card must cover it) and
-    `max_price_minor`. Only items with available stock are returned. An empty query
-    matches every item; otherwise an item must match the query.
+    `max_price_minor`. Only items with available stock are returned: by `mock_stock`, or
+    with `mock_stock=False` by the item's `in_stock` flag (`available_qty` is then
+    `None`). An empty query matches every item; otherwise an item must match the query.
     """
     zone_id = filters.get("zone_id")
     if zone_id is not None and zone_id not in zone_ids:
@@ -136,7 +152,8 @@ async def search(
         "limit": limit,
     }
     async with conn.cursor(row_factory=dict_row) as cur:
-        await cur.execute(sql.SQL(_SEARCH_SQL).format(table=_table(table)), params)
+        stock = _MOCK_STOCK if mock_stock else _TABLE_STOCK
+        await cur.execute(sql.SQL(_SEARCH_SQL).format(table=_table(table), **stock), params)
         rows = await cur.fetchall()
     return [
         {
@@ -147,7 +164,7 @@ async def search(
             "diets": list(r["diets"]),
             "unit_minor": int(r["price_minor"]),
             "currency": str(r["currency"]).strip(),
-            "available_qty": int(r["available_qty"]),
+            "available_qty": None if r["available_qty"] is None else int(r["available_qty"]),
         }
         for r in rows
     ]
