@@ -19,6 +19,7 @@ from services.common import directory, runs
 from services.common.consumer import Inbound, StepResult
 from services.common.directory import AgentCard
 from services.common.protocol.a2a import AgentMessageRow
+from tests.unit import model_fakes
 
 
 class _Body(BaseModel):
@@ -160,14 +161,39 @@ def test_health_reports_card_count_and_backlog_unreadable() -> None:
     async def no_backlog() -> None:
         return None
 
-    app = host.create_app(check_db, get_backlog=no_backlog, card_count=lambda: 3)
+    settings = model_fakes.settings(model_mode=None)
+    app = host.create_app(check_db, settings=settings, get_backlog=no_backlog, card_count=lambda: 3)
     assert TestClient(app).get("/health").json() == {
         "status": "ok",
         "service": "agents",
         "postgres": False,
         "cards": 3,
         "backlog": None,
+        "model_mode": "stub",  # an unset MODEL_MODE is stub
+        "model_name": "muse-spark",
+        "model_business_name": "Muse Glimmer",
     }
+
+
+def test_health_reports_real_model_mode_and_names() -> None:
+    """Evals EG6: eval-mode.sh and the runner confirm real mode from `/health`."""
+
+    async def check_db() -> bool:
+        return True
+
+    async def no_backlog() -> None:
+        return None
+
+    settings = model_fakes.settings(
+        model_mode="real", model_name="muse-spark", model_business_name="Muse Spark Lite"
+    )
+    app = host.create_app(check_db, settings=settings, get_backlog=no_backlog)
+    body = TestClient(app).get("/health").json()
+    assert (body["model_mode"], body["model_name"], body["model_business_name"]) == (
+        "real",
+        "muse-spark",
+        "Muse Spark Lite",
+    )
 
 
 @pytest.mark.db
@@ -195,7 +221,7 @@ def test_health_reports_backlog(pg: str, monkeypatch: pytest.MonkeyPatch) -> Non
                 (uuid.uuid4(), run_id, to_host, Jsonb({}), status, age),
             )
 
-    settings = type("S", (), {"database_url": pg})()
+    settings = model_fakes.settings(database_url=pg)
     monkeypatch.setattr(host, "get_settings", lambda: settings)
     body = TestClient(host.create_app(card_count=lambda: 2)).get("/health").json()
 

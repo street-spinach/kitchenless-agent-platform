@@ -10,7 +10,9 @@ Run with `python -m services.agents.host`. At startup it loads the enabled cards
 *   The consumer is given `finish_run=runs.finish`, so an exception after the last attempt
     finishes the run with `status=error`.
 *   `/health` reports Postgres reachability, the loaded card count and the message backlog
-    per host (`pending`, `processing`, `oldest_pending_seconds`), excluding `external`.
+    per host (`pending`, `processing`, `oldest_pending_seconds`), excluding `external`. It
+    also reports `model_mode`, `model_name` and `model_business_name` (evals E-A10), which
+    `infra/eval-mode.sh` and the eval runner read to confirm the mode (evals EG6).
 
 *   The A2A routes (agent-protocol P18, P19) are mounted on the same app and port.
 """
@@ -37,7 +39,7 @@ from services.agents.household import graph as household_graph
 from services.agents.restaurant import handler as restaurant_handler
 from services.common import db, directory, runs
 from services.common import logging as app_logging
-from services.common.config import get_settings
+from services.common.config import Settings, get_settings
 from services.common.consumer import Inbound, StepResult, consume_forever
 from services.common.directory import AgentCard
 
@@ -164,11 +166,15 @@ async def read_backlog() -> Backlog | None:
 def create_app(
     check_db: Callable[[], Awaitable[bool]] = postgres_reachable,
     *,
+    settings: Settings | None = None,
     get_backlog: Callable[[], Awaitable[Backlog | None]] = read_backlog,
     card_count: Callable[[], int] = lambda: 0,
     a2a_routes: Sequence[BaseRoute] = (),
 ) -> Starlette:
+    """The `/health` route plus `a2a_routes`; `settings` defaults to `get_settings()`."""
+
     async def health(request: Request) -> JSONResponse:
+        s = settings if settings is not None else get_settings()
         return JSONResponse(
             {
                 "status": "ok",
@@ -176,6 +182,10 @@ def create_app(
                 "postgres": await check_db(),
                 "cards": card_count(),
                 "backlog": await get_backlog(),
+                # An unset MODEL_MODE is stub, as in `ModelClient` (agents/common/model.py).
+                "model_mode": s.model_mode or "stub",
+                "model_name": s.model_name,
+                "model_business_name": s.model_business_name,
             }
         )
 

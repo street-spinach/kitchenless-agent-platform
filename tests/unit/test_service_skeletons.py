@@ -4,6 +4,7 @@ from starlette.testclient import TestClient
 from services.agents import host
 from services.api import main as api
 from services.mcp import app as mcp
+from tests.unit import model_fakes
 
 
 def test_api_health() -> None:
@@ -24,17 +25,28 @@ def test_agents_health_reports_postgres(reachable: bool) -> None:
     async def no_backlog() -> None:
         return None
 
-    resp = TestClient(host.create_app(check_db, get_backlog=no_backlog)).get("/health")
+    app = host.create_app(check_db, settings=model_fakes.settings(), get_backlog=no_backlog)
+    resp = TestClient(app).get("/health")
     assert (resp.status_code, resp.json()) == (
         200,
-        {"status": "ok", "service": "agents", "postgres": reachable, "cards": 0, "backlog": None},
+        {
+            "status": "ok",
+            "service": "agents",
+            "postgres": reachable,
+            "cards": 0,
+            "backlog": None,
+            "model_mode": "stub",
+            "model_name": "muse-spark",
+            "model_business_name": "Muse Glimmer",
+        },
     )
 
 
 def test_agents_postgres_unreachable_without_database_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(host, "get_settings", lambda: type("S", (), {"database_url": None})())
+    settings = model_fakes.settings(database_url=None)
+    monkeypatch.setattr(host, "get_settings", lambda: settings)
     resp = TestClient(host.create_app()).get("/health")
     assert resp.json()["postgres"] is False
 
