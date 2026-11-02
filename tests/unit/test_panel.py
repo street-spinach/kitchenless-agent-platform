@@ -223,7 +223,15 @@ def test_panel_routes_are_mounted_in_api() -> None:
         "/panel/approvals/{approval_id}/expire",
         "/panel/runs/live",
         "/panel/messages/{message_id}",
+        "/panel/evals",
     } <= paths
+
+
+def test_evals_page_counts_the_repo_case_files() -> None:
+    # The api image copies evals/ (infra/Dockerfile); M on /panel/evals counts these files.
+    modes = panel._case_modes(panel.EVAL_CASES_DIR)
+    assert "hello-run-completes" in modes
+    assert all(set(m) <= {"stub", "real"} for m in modes.values())
 
 
 @pytest.mark.parametrize(
