@@ -7,6 +7,9 @@ run out of `running`/`awaiting_approval` wins, and every later call changes noth
 that call ends the run with `error` or `timeout`, it also sends the retry prompt from
 `system:runs`, in the same transaction, unless the run is `a2a_demo` or the reason is in
 `NO_RETRY_PROMPT` (those callers send their own message).
+
+`pause_timeout` and `resume_timeout` stop and restart `run_timeout` around an approval
+(architecture §4 timer table; #63).
 """
 
 import json
@@ -29,6 +32,8 @@ __all__ = [
     "RUNS_AGENT",
     "finish",
     "is_ended",
+    "pause_timeout",
+    "resume_timeout",
     "retry_target",
     "start",
 ]
@@ -122,6 +127,39 @@ async def start(
         )
         await conn.execute(_INSERT_TIMER_SQL, (run_id, timeout))
     return run_id
+
+
+_PAUSE_TIMEOUT_SQL = """
+UPDATE timers SET status = 'cancelled'
+WHERE run_id = %s AND kind = 'run_timeout' AND status = 'pending'
+"""
+
+_RESUME_TIMEOUT_SQL = """
+INSERT INTO timers (kind, run_id, due_at)
+SELECT 'run_timeout', run_id, now() + make_interval(secs => %s::float8)
+FROM runs WHERE run_id = %s AND status IN ('running', 'awaiting_approval')
+  AND NOT EXISTS (SELECT 1 FROM timers WHERE run_id = %s AND kind = 'run_timeout'
+                  AND status = 'pending')
+"""
+
+
+async def pause_timeout(conn: AsyncConnection, run_id: uuid.UUID) -> None:
+    """Cancel the run's pending `run_timeout` while an approval is pending (§4 timers)."""
+    await conn.execute(_PAUSE_TIMEOUT_SQL, (run_id,))
+
+
+async def resume_timeout(conn: AsyncConnection, run_id: uuid.UUID) -> None:
+    """A new `run_timeout` once an approval is decided (§4 timers): the full timeout again,
+    for an open run with no pending one."""
+    cur = await conn.execute("SELECT kind FROM runs WHERE run_id = %s", (run_id,))
+    row = await cur.fetchone()
+    if row is None:
+        return
+    settings = get_settings()
+    timeout = (
+        settings.a2a_demo_timeout_seconds if row[0] == A2A_DEMO else settings.run_timeout_seconds
+    )
+    await conn.execute(_RESUME_TIMEOUT_SQL, (timeout, run_id, run_id))
 
 
 async def finish(

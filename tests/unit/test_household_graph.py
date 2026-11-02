@@ -33,6 +33,7 @@ MEMBERS = {
     "consumer:us-1-b": "22222222-2222-4222-8222-222222222222",
 }
 STARTER_AGENT = "consumer:us-1-a"
+APPROVER = MEMBERS["consumer:us-1-b"]
 SELLERS = ["grocery:mock-us", "grocery:square-us"]
 NOW = datetime(2026, 11, 2, 12, 0, tzinfo=UTC)
 CARD = AgentCard(
@@ -79,7 +80,11 @@ class FakeHousehold:
         if tool == "authorize_spend":
             return {"state": "authorized", "items_hash": "hash-" + args["quote_id"][:8]}
         if tool == "request_approval":
-            return {"approval_id": str(ids.approval_id(uuid.UUID(args["order_id"])))}
+            return {
+                "approval_id": str(ids.approval_id(uuid.UUID(args["order_id"]))),
+                "status": "pending",
+                "approver_user_id": APPROVER,
+            }
         if tool == "record_delivery":
             return {"order_id": args["order_id"], "recorded": 4}
         raise AssertionError(f"unexpected tool {tool}")
@@ -397,6 +402,63 @@ def test_rejected_approval_cancels_without_accepting() -> None:
     assert result.messages == []
     assert result.finish == RunFinish("cancelled", "approval_rejected")
     assert w.household.of("authorize_spend") == []
+
+
+def _awaiting_approval(w: World) -> None:
+    """Over budget: one counter, the store's reply is still over, approval is requested."""
+    w.to_quoting()
+    w.offer("grocery:square-us", 2500)
+    w.round_closed()
+    assert w.offer("grocery:square-us", 2250, round=1).messages == []
+    [_] = w.household.of("request_approval")
+
+
+def test_approval_interrupt_survives_restart_and_resumes() -> None:
+    # Architecture item 29 and CUJ 2 (#63): the thread waits in its checkpoint for the
+    # `approval_decision`, a redeploy loses nothing, and the tap resumes the run.
+    w = World(remaining_minor=2000)
+    _awaiting_approval(w)
+    saved = w.saved()
+    assert saved["phase"] == hg.AWAITING_APPROVAL
+    assert saved["approval_id"] == str(ids.approval_id(uuid.UUID(w.order_id)))
+    assert saved["approver_user_id"] == APPROVER
+
+    # While waiting, nothing else moves the order on.
+    assert w.round_closed().messages == []
+    assert w.offer("grocery:mock-us", 1000).messages == []
+    assert w.household.of("authorize_spend") == []
+
+    # A restart: a new graph on the same checkpointer resumes from the saved thread.
+    w.agent = w.build()
+    approved = w.approve()
+    [accept] = approved.messages
+    assert (accept.type, accept.to_agent) == ("accept", "grocery:square-us")
+    assert accept.body["total_minor"] == 2250
+    assert approved.finish is None
+    assert len(w.household.of("authorize_spend")) == 1
+    assert len(w.household.of("request_approval")) == 1
+
+
+def test_expired_approval_cancels_quote_and_tells_admin() -> None:
+    # CUJ 3 (#63): the sweeper's `approval_decision(expired)` ends the run `cancelled`, the
+    # seller's open quote is cancelled and the admin (the approver) is told.
+    w = World(remaining_minor=2000)
+    _awaiting_approval(w)
+    approval_id = str(ids.approval_id(uuid.UUID(w.order_id)))
+    body = {"approval_id": approval_id, "order_id": w.order_id, "status": "expired"}
+    result = w.step(w.inbound("approval_decision", body, from_agent="system:sweeper"))
+    assert result.finish == RunFinish("cancelled", "approval_expired")
+    cancel, notice = result.messages
+    assert (cancel.type, cancel.to_agent) == ("cancel", "grocery:square-us")
+    quote_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "grocery:square-us" + w.order_id))
+    assert cancel.body["quote_id"] == quote_id
+    assert cancel.body["reason"] == "buyer_cancelled"
+    assert (notice.type, notice.to_agent) == ("whatsapp_out", "channel:whatsapp")
+    assert notice.body["user_id"] == APPROVER
+    assert notice.body["template"] == hg.APPROVAL_CANCELLED_TEMPLATE
+    assert w.household.of("authorize_spend") == []
+    # A tap that the sweeper beat changes nothing more.
+    assert w.approve().messages == []
 
 
 def test_no_valid_offer_ends_the_run_no_offers() -> None:
