@@ -286,6 +286,35 @@ def test_failed_step_backs_off_then_poison_after_5(pg: str) -> None:
     assert finished == [(w.run_id, GROCERY, "error", "poison_message")]
 
 
+def test_step_failed_marks_failed_at_once_and_leaves_run(pg: str) -> None:
+    """A handler that gives up (the WhatsApp sender after 3 attempts, issue #73)."""
+    w = World(pg)
+    mid = w.insert()
+    finished: list[Any] = []
+
+    async def finish_run(*args: Any) -> bool:
+        finished.append(args)
+        return True
+
+    async def give_up(_: c.Inbound) -> c.StepResult:
+        raise c.StepFailed("whatsapp.sender", "whatsapp_send_failed")
+
+    step_once(pg, give_up, finish_run=finish_run)
+    row = w.message(mid)
+    assert (row["status"], row["attempts"]) == ("failed", 1)
+    assert row["last_error"] == "whatsapp_send_failed"
+    assert finished == []
+    [run] = w.query("SELECT status, ended_at FROM runs WHERE run_id = %s", (w.run_id,))
+    assert run == {"status": "running", "ended_at": None}
+    [trace] = w.query("SELECT agent_id, payload FROM agent_traces WHERE kind = 'error'")
+    assert trace["agent_id"] == GROCERY
+    assert trace["payload"]["where"] == "whatsapp.sender"
+    assert trace["payload"]["reason"] == "whatsapp_send_failed"
+    assert trace["payload"]["attempt"] == 1
+    assert trace["payload"]["ref_message_id"] == str(mid)
+    assert w.query("SELECT 1 FROM agent_messages WHERE type = 'protocol_error'") == []
+
+
 def test_stuck_processing_row_returned_to_pending(pg: str) -> None:
     w = World(pg)
     stuck = w.insert(status="processing", claimed_ago=121)

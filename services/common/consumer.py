@@ -16,6 +16,10 @@ Each claimed `agent_messages` row runs as one **step**:
     `shortfalls` updates, the outgoing messages, the timer changes and the `processed` mark.
     A conditional update that changes no row rolls the whole step back, and it is retried.
 
+A handler that gives up on a message raises `StepFailed`: the row is `failed` at once with
+an `error` trace, with no retry and no poison rule, so the run is unaffected (the WhatsApp
+sender, architecture §9).
+
 The whole step is capped at 75 seconds. Any other failure returns the row to `pending` with
 `available_at = now() + 2^attempts` seconds; after 5 attempts the row is `failed` and the
 run is finished with `status=error, reason=poison_message`.
@@ -51,6 +55,7 @@ __all__ = [
     "QuoteUpdate",
     "ShortfallUpdate",
     "StaleUpdate",
+    "StepFailed",
     "StepResult",
     "TimerCancel",
     "TimerCreate",
@@ -134,6 +139,15 @@ _TRACES = TraceStore(None)  # type: ignore[arg-type]
 
 class StaleUpdate(Exception):
     """A conditional `quotes` or `shortfalls` update changed no row (agent-protocol §7)."""
+
+
+class StepFailed(Exception):
+    """The handler gives up on this message: fail the row at once and leave the run alone."""
+
+    def __init__(self, where: str, reason: str) -> None:
+        super().__init__(f"{where}: {reason}")
+        self.where = where
+        self.reason = reason
 
 
 class InjectedFailure(RuntimeError):
@@ -405,6 +419,8 @@ class Consumer:
                     await self._step(row, attempts)
             except asyncio.CancelledError:
                 raise  # shutdown: the stuck-row rule replays it
+            except StepFailed as exc:
+                await self._give_up(row, attempts, exc)
             except Exception as exc:
                 await self._fail(row, attempts, exc)
 
@@ -521,6 +537,28 @@ class Consumer:
                 # The pair cannot carry a protocol_error (for example an unknown sender);
                 # the row is still failed and traced.
                 log.warning("protocol_error reply not sent for %s: %s", row.message_id, err)
+
+    async def _give_up(self, row: AgentMessageRow, attempts: int, exc: StepFailed) -> None:
+        """Mark the row `failed` with an `error` trace; no retry, and the run is not finished."""
+        log.warning("step gave up on %s: %s", row.message_id, exc)
+        async with self.pool.connection() as conn, conn.transaction():
+            cur = await conn.execute(_FAILED_SQL, (exc.reason, row.message_id))
+            if cur.rowcount != 1:
+                return
+            await _TRACES.write(
+                row.run_id,
+                row.to_agent,
+                "error",
+                {
+                    "where": exc.where,
+                    "reason": exc.reason,
+                    "attempt": attempts,
+                    "ref_message_id": str(row.message_id),
+                },
+                on_behalf_of=await _on_behalf_of(conn, row.to_agent),
+                conversation_id=row.conversation_id,
+                conn=conn,
+            )
 
     async def _fail(self, row: AgentMessageRow, attempts: int, exc: BaseException) -> None:
         """Back off and retry, or after the last attempt mark `failed` and finish the run."""
