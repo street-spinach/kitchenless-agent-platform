@@ -1,6 +1,10 @@
-"""Adapter mode resolution (architecture §5 and item 5; issue #29)."""
+"""Adapter mode resolution (architecture §5 and item 5; issue #29; adapters §3 and §4,
+issue #165)."""
 
 import asyncio
+import dataclasses
+import re
+from pathlib import Path
 from typing import Any
 
 import psycopg
@@ -8,7 +12,7 @@ import pytest
 
 from services.common import modes
 from services.common.config import Settings
-from services.common.modes import VENDORS
+from services.common.modes import ALWAYS_MOCK, VENDORS
 from services.mcp.delivery.adapters.mock_courier import MockCourierAdapter
 from services.mcp.grocery.adapters.mock_store import MockStoreAdapter
 from services.mcp.meta import AdapterFailure
@@ -84,7 +88,8 @@ def test_vendor_env_beats_global_mode(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert resolved["doordash"] == "mock"
     assert resolved["square_retail"] == "real"
-    assert resolved["kroger_catalog"] == "real"
+    # No real Kroger class (adapters §3): always mock, whatever MODE says.
+    assert resolved["kroger_catalog"] == "mock"
 
 
 def test_empty_vendor_env_uses_global_mode(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -128,7 +133,8 @@ def test_kroger_ordering_always_mock(monkeypatch: pytest.MonkeyPatch) -> None:
     resolved = _resolve(_FakeConn([("kroger_ordering", "real")]))
 
     assert resolved["kroger_ordering"] == "mock"
-    assert resolved["kroger_catalog"] == "real"
+    assert resolved["kroger_catalog"] == "mock"
+    assert resolved["doordash"] == "mock"
     assert set(resolved) == VENDORS
 
 
@@ -140,13 +146,84 @@ def test_adapter_for_real_without_adapter_not_configured() -> None:
     assert modes.adapter_for("square_restaurant", mock) is MockRestaurantAdapter
     assert modes.adapter_for("doordash", mock) is MockCourierAdapter
 
-    # No real adapter exists yet (build step 7): `real` raises and never falls back to mock.
-    for vendor in VENDORS - {"kroger_ordering"}:
+    # A key with no real class: `real` raises and never falls back to mock.
+    for vendor in ALWAYS_MOCK:
         with pytest.raises(AdapterFailure) as e:
             modes.adapter_for(vendor, {**mock, vendor: "real"})
         assert (e.value.reason, e.value.retryable) == ("adapter_not_configured", False)
-    # An unknown vendor, or one with no mode for the run, fails closed too.
+    # A key missing from a non-empty run's modes is the mock (adapters §3).
+    assert modes.adapter_for("square_retail", {"doordash": "mock"}) is MockStoreAdapter
+    # An unknown vendor, or a run with no modes at all, fails closed.
     for vendor, run_modes in (("acme", {"acme": "mock"}), ("square_retail", {})):
         with pytest.raises(AdapterFailure) as e:
             modes.adapter_for(vendor, run_modes)
         assert e.value.reason == "adapter_not_configured"
+
+
+def test_always_mock_is_keys_without_a_real_class() -> None:
+    assert {"kroger_catalog", "kroger_ordering", "doordash"} == ALWAYS_MOCK
+
+
+def test_always_mock_ignores_mode_real(monkeypatch: pytest.MonkeyPatch) -> None:
+    real = {f"MODE_{v.upper()}": "real" for v in VENDORS}
+    _use_env(monkeypatch, MODE="real", **real)
+
+    resolved = _resolve(_FakeConn())
+
+    for vendor in ("doordash", "kroger_catalog", "kroger_ordering"):
+        assert resolved[vendor] == "mock"
+    assert resolved["square_retail"] == "real"
+    assert resolved["square_restaurant"] == "real"
+
+
+def test_always_mock_ignores_panel_real(monkeypatch: pytest.MonkeyPatch) -> None:
+    _use_env(monkeypatch, MODE="mock")
+
+    resolved = _resolve(_FakeConn([("doordash", "real")]))
+
+    assert resolved["doordash"] == "mock"
+
+
+def test_missing_key_in_run_modes_is_mock() -> None:
+    # A run pinned before a deploy that added a key keeps working, with that key simulated.
+    run_modes = {"square_retail": "mock"}
+    assert modes.adapter_for("doordash", run_modes) is MockCourierAdapter
+    assert modes.adapter_for("square_restaurant", run_modes) is MockRestaurantAdapter
+    assert modes.adapter_for("kroger_catalog", run_modes) is MockStoreAdapter
+
+
+def test_empty_run_modes_raises() -> None:
+    for vendor in VENDORS:
+        with pytest.raises(AdapterFailure) as e:
+            modes.adapter_for(vendor, {})
+        assert (e.value.reason, e.value.retryable) == ("adapter_not_configured", False)
+
+
+def test_square_real_is_not_configured_until_its_class_exists() -> None:
+    # The Square classes land in adapters build step 6; until then `real` fails closed.
+    mock = {vendor: "mock" for vendor in VENDORS}
+    for vendor in ("square_retail", "square_restaurant"):
+        with pytest.raises(AdapterFailure) as e:
+            modes.adapter_for(vendor, {**mock, vendor: "real"})
+        assert (e.value.reason, e.value.retryable) == ("adapter_not_configured", False)
+
+
+def test_eval_env_pins_mock() -> None:
+    resolved: dict[str, modes.Mode] = dict.fromkeys(VENDORS, "real")
+
+    assert modes.pin_for_env(resolved, "eval") == dict.fromkeys(VENDORS, "mock")
+    assert modes.pin_for_env(resolved, "live") == resolved
+
+
+_INFRA = Path(__file__).resolve().parents[2] / "infra"
+
+
+def test_every_vendor_has_setting_compose_and_env_example() -> None:
+    fields = {f.name for f in dataclasses.fields(Settings)}
+    compose = (_INFRA / "docker-compose.yml").read_text()
+    env_example = (_INFRA / ".env.example").read_text()
+    for vendor in VENDORS:
+        name = f"MODE_{vendor.upper()}"
+        assert f"mode_{vendor}" in fields, vendor
+        assert re.search(rf"^\s*{name}:", compose, re.MULTILINE), name
+        assert re.search(rf"^{name}=", env_example, re.MULTILINE), name

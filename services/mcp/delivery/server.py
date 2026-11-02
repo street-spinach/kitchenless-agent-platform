@@ -13,9 +13,9 @@
 *   `get_delivery_status(order_id)`: the courier's state of the order's delivery, for the
     order's courier only.
 
-Each tool picks its adapter from the card's vendor: a `mock` card always uses
-`MockCourierAdapter`; a `doordash` card goes through `modes.adapter_for("doordash",
-ctx.modes)`, which never falls back to the mock.
+Each tool picks its adapter from the card's vendor key, `vendors.card_vendor_key("delivery",
+card, tool)`: a `mock` card always uses `MockCourierAdapter`; a `doordash` card goes through
+`modes.adapter_for("doordash", ctx.modes)`, which never falls back to the mock.
 """
 
 import json
@@ -30,11 +30,11 @@ from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 from psycopg.types.range import Range
 
-from services.common import db, directory, ids, modes, orders
+from services.common import db, directory, ids, modes, orders, vendors
 from services.common.directory import AgentCard
 from services.common.protocol.schemas import Window
 from services.mcp.delivery.adapters.mock_courier import MockCourierAdapter
-from services.mcp.meta import AdapterFailure, CallContext, tool_error, tool_errors
+from services.mcp.meta import CallContext, tool_error, tool_errors
 from services.mcp.traced import Tool, traced
 from services.safety import addresses, limits
 from services.safety.guard import GuardRefused, run_guarded
@@ -52,8 +52,6 @@ __all__ = [
 AREA = "delivery"
 AUTHZ_DENIED = "authz_denied"
 INVALID_STATE = "invalid_state"
-# The card vendor that resolves through `modes` (vendor key `doordash`).
-_VENDOR_KEYS = {"doordash": "doordash"}
 # `courier_booked` is accepted so a replayed call returns its stored result.
 _BOOK_FROM = ("placed", "courier_booked")
 
@@ -78,14 +76,9 @@ class CourierAdapter(Protocol):
     async def get_delivery_status(self, external_delivery_id: str) -> dict[str, Any]: ...
 
 
-def _adapter(card: AgentCard, ctx: CallContext) -> CourierAdapter:
-    if card.vendor == "mock":
-        cls: type[Any] = MockCourierAdapter
-    else:
-        vendor = _VENDOR_KEYS.get(card.vendor or "")
-        if vendor is None:
-            raise AdapterFailure(modes.NOT_CONFIGURED, retryable=False)
-        cls = modes.adapter_for(vendor, ctx.modes)
+def _adapter(card: AgentCard, tool: str, ctx: CallContext) -> CourierAdapter:
+    key = vendors.card_vendor_key(AREA, card, tool)
+    cls: type[Any] = MockCourierAdapter if key is None else modes.adapter_for(key, ctx.modes)
     return cls(card, ctx.env)
 
 
@@ -132,7 +125,7 @@ async def quote_delivery(
     """The courier's fee and the free slots inside `window` for `zone_id`."""
     card = await _courier_card(ctx)
     _require_courier(card)
-    return await _adapter(card, ctx).quote_delivery(zone_id, _window(window))
+    return await _adapter(card, "quote_delivery", ctx).quote_delivery(zone_id, _window(window))
 
 
 async def book_delivery(
@@ -169,7 +162,7 @@ async def book_delivery(
         address.append(await addresses.resolve(conn, ctx, address_ref, order_id))
 
     async def call() -> dict[str, Any]:
-        booked = await _adapter(card, ctx).book_delivery(
+        booked = await _adapter(card, "book_delivery", ctx).book_delivery(
             idempotency_key=ids.vendor_key(key),
             order_id=str(order_id),
             zone_id=order["zone_id"],
@@ -222,7 +215,9 @@ async def get_delivery_status(ctx: CallContext, *, order_id: str) -> dict[str, A
         raise GuardRefused(AUTHZ_DENIED)
     if row["external_delivery_id"] is None:
         raise GuardRefused(INVALID_STATE)
-    status = await _adapter(card, ctx).get_delivery_status(row["external_delivery_id"])
+    status = await _adapter(card, "get_delivery_status", ctx).get_delivery_status(
+        row["external_delivery_id"]
+    )
     return {"order_id": order_id, **status}
 
 

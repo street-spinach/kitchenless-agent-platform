@@ -2,7 +2,8 @@
 
 `services/mcp/app.py` mounts `server`. Its tools are the seller tools in
 `services/mcp/seller.py`: `search_items`, `quote`, and the *guarded* `place_order` and
-`amend_order`. Mock cards use `MockRestaurantAdapter`; Square cards resolve `square_restaurant`.
+`amend_order`. Mock cards use `MockRestaurantAdapter`; Square cards resolve `square_restaurant`
+for every tool (`vendors.card_vendor_key`).
 """
 
 from mcp.server.mcpserver import MCPServer
@@ -19,9 +20,6 @@ server = MCPServer(name=AREA)
 tools = seller.SellerTools(
     area=AREA,
     mock_adapter=MockRestaurantAdapter,
-    vendor_keys={
-        "square": dict.fromkeys(("search_items", "quote", "place_order"), "square_restaurant"),
-    },
 )
 _tools = tools.build()
 search_items = _tools["search_items"]

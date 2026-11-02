@@ -351,6 +351,61 @@ def test_inject_event_validates_shortfall_params(world: dict[str, Any]) -> None:
     assert row == ("eval", "shortfall", GROCERY, {"order_id": order_id, "skus": skus}, True)
 
 
+def _square_order(pg: str, order_id: uuid.UUID, square_retail: str) -> None:
+    """Make the order a `grocery:square-us` order whose run pinned `square_retail`."""
+    with psycopg.connect(pg) as conn:
+        conn.execute(
+            "UPDATE orders SET seller_agent_id = 'grocery:square-us' WHERE order_id = %s",
+            (order_id,),
+        )
+        conn.execute(
+            "UPDATE runs SET modes = %s WHERE run_id = (SELECT run_id FROM orders"
+            " WHERE order_id = %s)",
+            (Jsonb({"square_retail": square_retail, "doordash": "mock"}), order_id),
+        )
+
+
+@pytest.mark.db
+def test_shortfall_refused_on_real_mode_order(world: dict[str, Any]) -> None:
+    # Adapters §8: a shortfall amends the order, and a real order cannot be amended.
+    pg = world["pg"]
+    order_id = world["live"]["order_id"]
+    _square_order(pg, order_id, "real")
+    with psycopg.connect(pg) as conn:
+        conn.execute("DELETE FROM mock_events")
+
+    with pytest.raises(control.ControlRefused, match="shortfall events need a mock-mode order"):
+        _inject(
+            pg,
+            env="live",
+            kind="shortfall",
+            target_agent_id="grocery:square-us",
+            params={"order_id": str(order_id), "skus": ["MOCK-MILK-WHOLE"]},
+        )
+
+    with psycopg.connect(pg) as conn:
+        assert _count(conn, "SELECT count(*) FROM mock_events") == 0
+
+
+@pytest.mark.db
+def test_shortfall_allowed_on_mock_mode_order(world: dict[str, Any]) -> None:
+    pg = world["pg"]
+    order_id = world["live"]["order_id"]
+    _square_order(pg, order_id, "mock")
+
+    event_id = _inject(
+        pg,
+        env="live",
+        kind="shortfall",
+        target_agent_id="grocery:square-us",
+        params={"order_id": str(order_id), "skus": ["MOCK-MILK-WHOLE"]},
+    )
+
+    with psycopg.connect(pg) as conn:
+        row = conn.execute("SELECT kind FROM mock_events WHERE id = %s", (event_id,)).fetchone()
+    assert row == ("shortfall",)
+
+
 def test_mock_stock_rows_cover_seeded_items() -> None:
     data = seed_mod.load_data()
     expected = {

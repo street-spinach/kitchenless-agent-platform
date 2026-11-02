@@ -5,7 +5,8 @@
     (§7 reset scope, amended 2026-11-02). It refuses any other `env`.
 *   `inject_event(...)`: writes a `mock_events` row and returns its id. A `shortfall`
     event needs `params = {order_id, skus}`, with 1 to `SHORTFALL_MAX_LINES` SKUs, each a
-    line of the order (agent-protocol §10).
+    line of the order (agent-protocol §10). It is refused when the order's run pinned the
+    seller's vendor key to `real` (adapters §8).
 *   `set_mode(...)`: writes the control-panel override in `adapter_modes`.
 *   `expire_approval(...)`: makes the approval's pending `approval_expiry` timer due now,
     so the sweeper expires it.
@@ -21,6 +22,7 @@ from uuid import UUID
 from psycopg import AsyncConnection
 from psycopg.types.json import Jsonb
 
+from services.common import directory, vendors
 from services.common.config import get_settings
 from services.common.modes import ALWAYS_MOCK, VENDORS
 from services.seed import mock_stock_rows
@@ -135,7 +137,41 @@ async def _validate_shortfall(conn: AsyncConnection, params: Mapping[str, Any]) 
     missing = [s for s in skus if s not in lines]
     if missing:
         raise ControlRefused(f"shortfall SKUs are not lines of order {order_id}: {missing}")
+    await _require_mock_seller(conn, order_id)
     return {"order_id": str(order_id), "skus": skus}
+
+
+SHORTFALL_NEEDS_MOCK = "shortfall events need a mock-mode order"
+
+
+async def _require_mock_seller(conn: AsyncConnection, order_id: UUID) -> None:
+    """Refuse unless the order's run pinned the seller's vendor key to `mock` (adapters §8).
+
+    A seller with no vendor key (a `mock` card, or a vendor with no entry, which can reach
+    no real adapter) passes; an order with no run or seller, or an unknown seller card, is
+    refused.
+    """
+    cur = await conn.execute(
+        "SELECT o.seller_agent_id, r.modes FROM orders o JOIN runs r ON r.run_id = o.run_id"
+        " WHERE o.order_id = %s",
+        (order_id,),
+    )
+    row = await cur.fetchone()
+    if row is None or row[0] is None:
+        raise ControlRefused(f"order {order_id} has no seller")
+    seller_agent_id, run_modes = row
+    from services.mcp.meta import AdapterFailure
+
+    try:
+        card = await directory.card(conn, seller_agent_id)
+    except directory.UnknownAgent:
+        raise ControlRefused(SHORTFALL_NEEDS_MOCK) from None
+    try:
+        key = vendors.card_vendor_key(card.agent_class, card, "amend_order")
+    except AdapterFailure:
+        return
+    if key is not None and (run_modes or {}).get(key) == "real":
+        raise ControlRefused(SHORTFALL_NEEDS_MOCK)
 
 
 async def inject_event(
@@ -148,7 +184,8 @@ async def inject_event(
 ) -> int:
     """Write an active `mock_events` row and return its id (agent-protocol P33).
 
-    Raises `ControlRefused` for an unknown `env` or `kind`, or invalid `shortfall` params.
+    Raises `ControlRefused` for an unknown `env` or `kind`, invalid `shortfall` params, or a
+    `shortfall` on an order whose run pinned the seller's vendor key to `real`.
     """
     if env not in ENVS:
         raise ControlRefused(f"env must be one of {sorted(ENVS)}, got {env!r}")

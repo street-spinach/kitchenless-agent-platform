@@ -123,6 +123,32 @@ def _ended_error_run(pg: str) -> uuid.UUID:
     return run_id
 
 
+def test_eval_household_run_pins_mock_under_mode_real(
+    world: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Adapters §3: the Square sandbox is not split by env, so eval runs never pin `real`.
+    env = {"SERVICE_NAME": "migrate", "DATABASE_URL": "x", "LOG_LEVEL": "info", "MODE": "real"}
+    settings = Settings.from_env(env)
+    monkeypatch.setattr(runs, "get_settings", lambda: settings)
+    monkeypatch.setattr(modes, "get_settings", lambda: settings)
+    with psycopg.connect(world) as conn:
+        conn.execute("UPDATE households SET env = 'eval' WHERE household_id = %s", (HOUSEHOLD_ID,))
+
+    run_id = _start(world)
+
+    all_mock = dict.fromkeys(modes.VENDORS, "mock")
+    assert _run_row(world, run_id)["modes"] == all_mock
+    [start_row] = _traces(world, run_id, "run_start")
+    assert start_row["payload"]["modes"] == all_mock
+
+    # The same settings for a live household pin the Square keys to `real`.
+    with psycopg.connect(world) as conn:
+        conn.execute("UPDATE households SET env = 'live' WHERE household_id = %s", (HOUSEHOLD_ID,))
+    live = _run_row(world, _start(world, trigger=_trigger(inbound_id="wamid.2")))["modes"]
+    assert live["square_retail"] == "real"
+    assert live["doordash"] == "mock"
+
+
 def test_finish_writes_single_outcome(world: str) -> None:
     run_id = _start(world)
     [start_row] = _traces(world, run_id, "run_start")
