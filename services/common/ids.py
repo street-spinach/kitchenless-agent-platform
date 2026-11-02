@@ -68,6 +68,11 @@ def quote_id(request_message_id: UUID) -> UUID:
     return uuid5(request_message_id, "quote")
 
 
+def approval_id(order_id: UUID) -> UUID:
+    """An order has at most one approval (its `request_approval` key has no scope)."""
+    return uuid5(order_id, "approval")
+
+
 def conversation_id(opening_message_id: UUID) -> UUID:
     """Conversation opened by `opening_message_id` (a negotiation or store-to-courier)."""
     return uuid5(opening_message_id, "conversation")

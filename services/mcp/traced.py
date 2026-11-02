@@ -9,7 +9,8 @@ and writes the `tool_result` row. Each call therefore has exactly one trace writ
 
 The wrapped function takes the `CallContext` first and its tool arguments as keywords,
 which the `tool_call` row records as `args`. The tool name in the trace is the function's
-name.
+name. A `GuardRefused` raised by the tool body writes a refused `tool_result` row and is
+re-raised.
 """
 
 import functools
@@ -68,7 +69,12 @@ def traced[R](server: str) -> Callable[[Tool[R]], Tool[R]]:
                 "tool_call",
                 {"server": server, "tool": tool, "args": kwargs, "idempotency_key": None},
             )
-            result = await fn(ctx, **kwargs)
+            try:
+                result = await fn(ctx, **kwargs)
+            except GuardRefused as e:
+                # A refusal from the tool body is traced like a guard refusal (§5).
+                await trace("tool_result", result_row(None, e.reason))
+                raise
             await trace("tool_result", result_row(result, None))
             return result
 
