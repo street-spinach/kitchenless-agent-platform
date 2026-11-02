@@ -105,8 +105,16 @@ class RecordingStubs:
 
 
 class World:
-    def __init__(self, *, remaining_minor: int = 15000, sellers: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        remaining_minor: int = 15000,
+        sellers: list[str] | None = None,
+        overrides: dict[str, Any] | None = None,
+    ) -> None:
         self.run_id = uuid.uuid4()
+        self.overrides = dict(overrides or {})
+        self.slept: list[float] = []
         self.traces = mf.FakeTraces()
         self.household = FakeHousehold(remaining_minor)
         self.stubs = RecordingStubs()
@@ -127,11 +135,15 @@ class World:
                 sub, act, list(scopes)
             ),
             clock=lambda: NOW,
+            sleep=self.sleep,
         )
+
+    async def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
 
     async def load_run(self, run_id: uuid.UUID) -> hg.RunInfo:
         assert run_id == self.run_id
-        return hg.RunInfo(user_id=STARTER)
+        return hg.RunInfo(user_id=STARTER, overrides=self.overrides)
 
     async def load_members(self, household_id: str) -> dict[str, str]:
         assert household_id == "us-1"
@@ -230,6 +242,32 @@ class World:
         self.start()
         self.constraints("consumer:us-1-a")
         return self.constraints("consumer:us-1-b", ["tree_nuts"])
+
+    def reject(self, seller: str, quote_id: str, reason: str) -> StepResult:
+        body = {"order_id": self.order_id, "quote_id": quote_id, "reason": reason}
+        return self.step(self.inbound("reject", body, from_agent=seller))
+
+    def protocol_error(self, refused: Any, code: str = "wrong_party") -> StepResult:
+        body = {"ref_message_id": str(refused.message_id), "code": code, "detail": "refused"}
+        return self.step(self.inbound("protocol_error", body, from_agent=refused.to_agent))
+
+    def approve(self) -> StepResult:
+        approval_id = str(ids.approval_id(uuid.UUID(self.order_id)))
+        body = {"approval_id": approval_id, "order_id": self.order_id, "status": "approved"}
+        return self.step(self.inbound("approval_decision", body, from_agent="system:api"))
+
+    def saved(self) -> dict[str, Any]:
+        config = {"configurable": {"thread_id": ids.thread_id(HOUSEHOLD, self.run_id)}}
+        return asyncio.run(self.agent.graph.aget_state(config)).values
+
+    def accepted(self) -> Any:
+        """Two offers, the round closes, the cheaper one (square-us, 2100) is accepted."""
+        self.to_quoting()
+        self.offer("grocery:mock-us", 2400)
+        self.offer("grocery:square-us", 2100)
+        [accept] = self.round_closed().messages
+        assert accept.type == "accept"
+        return accept
 
 
 @pytest.fixture(autouse=True)
@@ -492,10 +530,210 @@ def test_unknown_state_version_ends_the_run() -> None:
 
 
 def test_unhandled_message_type_fails_the_step() -> None:
+    # `reject` is handled since #60; `cancel` never reaches a household.
     w = World()
     body = {"order_id": str(uuid.uuid4()), "quote_id": str(uuid.uuid4()), "reason": "price"}
     with pytest.raises(hg.UnsupportedMessage):
-        w.step(w.inbound("reject", body, from_agent="grocery:mock-us"))
+        w.step(w.inbound("cancel", body, from_agent="grocery:mock-us"))
+
+
+# Negotiation rules: protocol errors, the reject rule, re-quote (agent-protocol §6, §7) ----
+
+
+def _quote(seller: str, w: World, tag: str = "") -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, seller + w.order_id + tag))
+
+
+def test_protocol_error_reaction_by_refused_type() -> None:
+    # A refused quote_request drops that seller, as if its offer never came.
+    w = World()
+    requests = w.to_quoting().messages
+    refused = next(m for m in requests if m.to_agent == "grocery:square-us")
+    dropped = w.protocol_error(refused)
+    assert (list(dropped.messages), dropped.finish) == ([], None)
+    assert w.saved()["excluded_sellers"] == ["grocery:square-us"]
+    assert w.offer("grocery:square-us", 100).messages == []  # ignored, not recorded
+    w.offer("grocery:mock-us", 2400)
+    [accept] = w.round_closed().messages
+    assert accept.to_agent == "grocery:mock-us"
+
+    # A refused accept ends the run with error, protocol_error.
+    ended = w.protocol_error(accept)
+    assert ended.messages == [] and ended.finish == RunFinish("error", "protocol_error")
+    assert w.saved()["phase"] == hg.DONE
+
+    # A refused counter_offer drops that seller; the household decides again without it.
+    w = World(remaining_minor=1000)  # both offers over budget: the stub counters the cheapest
+    w.to_quoting()
+    w.offer("grocery:mock-us", 1900)
+    w.offer("grocery:square-us", 1800)
+    [counter] = w.round_closed().messages
+    assert (counter.type, counter.to_agent) == ("counter_offer", "grocery:square-us")
+    after = w.protocol_error(counter)
+    assert w.saved()["excluded_sellers"] == ["grocery:square-us"]
+    assert "grocery:square-us" not in w.saved()["quotes"]
+    assert [m.type for m in after.messages] == []  # over budget: approval for mock-us
+    [approval] = w.household.of("request_approval")
+    assert approval["args"]["amount"]["amount_minor"] == 1900
+
+    # Anything else (a refused constraints_request): a decision trace and nothing more.
+    w = World()
+    [ask, _] = w.start().messages
+    calls = len(w.household.calls)
+    other = w.step(
+        w.inbound(
+            "protocol_error",
+            {"ref_message_id": str(ask.message_id), "code": "wrong_party", "detail": "x"},
+            from_agent=ask.to_agent,
+        )
+    )
+    # The household is still collecting constraints, so the error is ignored with a trace.
+    assert (list(other.messages), list(other.timers), other.finish) == ([], [], None)
+    assert len(w.household.calls) == calls
+    w.constraints("consumer:us-1-a")
+    w.constraints("consumer:us-1-b")
+    late = w.step(
+        w.inbound(
+            "protocol_error",
+            {"ref_message_id": str(ask.message_id), "code": "wrong_party", "detail": "x"},
+            from_agent=ask.to_agent,
+        )
+    )
+    assert (list(late.messages), late.finish) == ([], None)
+    decision = w.traces.of("decision")[-1]
+    assert (decision["node"], decision["choice"]) == (
+        "protocol_error",
+        "ignored_constraints_request",
+    )
+    assert w.saved()["excluded_sellers"] == []
+
+
+def test_requote_moves_order_back_to_quoting() -> None:
+    w = World()
+    accept = w.accepted()
+    result = w.reject(accept.to_agent, accept.body["quote_id"], "expired")
+    moves = [c["args"] for c in w.household.of("set_order_state")]
+    assert moves[-1] == {"order_id": w.order_id, "expected": "authorized", "new": "quoting"}
+    assert not any(m["expected"] == "draft" for m in moves[1:])  # draft → quoting only once
+    assert [(m.type, m.to_agent) for m in result.messages] == [
+        ("quote_request", s) for s in SELLERS
+    ]
+    [timer] = result.timers
+    assert timer.kind == "quote_round"
+    saved = w.saved()
+    assert (saved["phase"], saved["requotes"], saved["quotes"]) == (hg.QUOTING, 1, {})
+    # The new round negotiates and authorizes the new quote under its own quote_id.
+    new_q = _quote("grocery:mock-us", w, "requote")
+    w.offer("grocery:mock-us", 2300, quote_id=new_q)
+    [again] = w.round_closed().messages
+    assert (again.type, again.body["quote_id"]) == ("accept", new_q)
+    assert [c["args"]["quote_id"] for c in w.household.of("authorize_spend")][-1] == new_q
+
+
+def test_requote_once_then_error() -> None:
+    w = World()
+    accept = w.accepted()
+    w.reject(accept.to_agent, accept.body["quote_id"], "expired")
+    new_q = _quote("grocery:mock-us", w, "requote")
+    w.offer("grocery:mock-us", 2300, quote_id=new_q)
+    [again] = w.round_closed().messages
+    result = w.reject("grocery:mock-us", new_q, "expired")
+    assert result.messages == []
+    assert result.finish == RunFinish("error", "offer_expired")
+    assert len(w.household.of("set_order_state")) == 4  # no second authorized → quoting
+
+
+def test_requote_within_approved_total_skips_approval() -> None:
+    w = World(remaining_minor=2000)
+    w.to_quoting()
+    w.offer("grocery:square-us", 2500)
+    w.round_closed()  # counter at 2250
+    w.offer("grocery:square-us", 2250, round=1)  # approval asked for 2250
+    [accept] = w.approve().messages
+    assert accept.body["total_minor"] == 2250
+    w.reject("grocery:square-us", accept.body["quote_id"], "expired")
+
+    # Re-quoted at or below the approved 2250: no new approval.
+    q2 = _quote("grocery:square-us", w, "requote")
+    w.offer("grocery:square-us", 2250, round=1, quote_id=q2)
+    [again] = w.round_closed().messages
+    assert (again.type, again.body["quote_id"], again.body["total_minor"]) == ("accept", q2, 2250)
+    assert len(w.household.of("request_approval")) == 1
+
+
+def test_requote_above_approved_total_asks_again() -> None:
+    w = World(remaining_minor=2000)
+    w.to_quoting()
+    w.offer("grocery:square-us", 2500)
+    w.round_closed()
+    w.offer("grocery:square-us", 2250, round=1)
+    [accept] = w.approve().messages
+    w.reject("grocery:square-us", accept.body["quote_id"], "expired")
+    q2 = _quote("grocery:square-us", w, "requote")
+    w.offer("grocery:square-us", 2400, round=1, quote_id=q2)
+    result = w.round_closed()
+    assert result.messages == []
+    assert [c["args"]["amount"]["amount_minor"] for c in w.household.of("request_approval")] == [
+        2250,
+        2400,
+    ]
+
+
+def test_no_courier_takes_next_offer() -> None:
+    w = World()
+    accept = w.accepted()
+    result = w.reject("grocery:square-us", accept.body["quote_id"], "no_courier")
+    [next_accept] = result.messages
+    assert (next_accept.type, next_accept.to_agent) == ("accept", "grocery:mock-us")
+    assert next_accept.body["quote_id"] == _quote("grocery:mock-us", w)
+    assert w.saved()["excluded_sellers"] == ["grocery:square-us"]
+
+    # No live offer left: the run ends with error, no_courier.
+    last = w.reject("grocery:mock-us", next_accept.body["quote_id"], "no_courier")
+    assert last.messages == []
+    assert last.finish == RunFinish("error", "no_courier")
+
+
+def test_other_reject_excludes_seller() -> None:
+    w = World()
+    accept = w.accepted()
+    result = w.reject("grocery:square-us", accept.body["quote_id"], "price")
+    [next_accept] = result.messages
+    assert (next_accept.type, next_accept.to_agent) == ("accept", "grocery:mock-us")
+    saved = w.saved()
+    assert saved["excluded_sellers"] == ["grocery:square-us"]
+    assert "grocery:square-us" not in saved["quotes"]
+
+    # With no valid offer left, the architecture's "No offers" path ends the run.
+    last = w.reject("grocery:mock-us", next_accept.body["quote_id"], "items_changed")
+    assert last.finish == RunFinish("error", "no_offers")
+    assert [m.type for m in last.messages] == ["whatsapp_out"]
+
+
+def test_already_placed_reject_is_ignored() -> None:
+    w = World()
+    accept = w.accepted()
+    result = w.reject("grocery:square-us", accept.body["quote_id"], "already_placed")
+    assert (list(result.messages), result.finish) == ([], None)
+    decision = w.traces.of("decision")[-1]
+    assert (decision["node"], decision["choice"]) == ("seller_rejected", "ignored_already_placed")
+    assert w.saved()["excluded_sellers"] == []
+
+
+def test_stub_accept_delay_rounds_waits_before_first_accepts() -> None:
+    w = World(overrides={"STUB_ACCEPT_DELAY_ROUNDS": 1, "OFFER_TTL_SECONDS": 2})
+    accept = w.accepted()
+    assert w.slept == [3]  # OFFER_TTL_SECONDS + 1 before the first accept
+    w.reject(accept.to_agent, accept.body["quote_id"], "expired")
+    w.offer("grocery:mock-us", 2300, quote_id=_quote("grocery:mock-us", w, "requote"))
+    w.round_closed()
+    assert w.slept == [3]  # not before the second
+
+
+def test_no_accept_delay_without_the_override() -> None:
+    w = World()
+    w.accepted()
+    assert w.slept == []
 
 
 def test_host_registers_the_household_handler() -> None:

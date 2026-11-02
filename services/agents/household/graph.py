@@ -17,7 +17,17 @@ routed by its type and the order's phase:
     `choose_offer` (the cheapest valid offer) → `request_approval` when the total is over
     the remaining weekly budget, else `authorize` (`authorize_spend`, then `accept`).
 *   `approval_decision` `approved` → `authorize`; `rejected` or `expired` → the run ends
-    `cancelled`.
+    `cancelled`. A re-quoted offer at or below the approved total uses that approval; a
+    higher total asks again.
+*   `reject` from a seller → `seller_rejected`, the household rule of agent-protocol §7:
+    `expired` (answering our `accept`) → `requote` once (`authorized → quoting`, a new
+    round of `quote_request`), a second time `error, offer_expired`; `no_courier` → the
+    next valid offer, else `error, no_courier`; `already_placed` → ignored; any other
+    reason → the seller is excluded from the run and the next valid offer is taken.
+*   `protocol_error` → `protocol_error`, the agent-protocol §6 reaction by the refused
+    message's type (read from `sent`): a `quote_request` or `counter_offer` drops that
+    seller; an `accept` or `cancel` ends the run `error, protocol_error`; anything else is
+    a `decision` trace.
 *   `order_confirm`, `delivery_booked`, `order_status` → `track_order`; on `delivered`,
     `record_delivery` (weekly orders only) → `finish` (`completed` and a summary
     `whatsapp_out`).
@@ -35,10 +45,11 @@ checkpointed ones (P-CUJ 8).
 model prompt can contain it (architecture item 29).
 """
 
+import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, TypedDict
 from uuid import UUID
@@ -48,6 +59,7 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import ValidationError
 
 from services.agents.common.model import InvalidOutput, ModelClient, TraceSink
+from services.agents.household import stubs
 from services.common import ids, mcp_client
 from services.common.consumer import (
     Inbound,
@@ -65,6 +77,7 @@ from services.identity.tokens import MockIssuer
 __all__ = [
     "HANDLED_TYPES",
     "MAX_COUNTER_ROUNDS",
+    "OFFER_TTL_SECONDS",
     "QUOTE_ROUND_SECONDS",
     "STATE_VERSION",
     "HouseholdGraph",
@@ -82,6 +95,8 @@ log = logging.getLogger(__name__)
 STATE_VERSION = 1
 QUOTE_ROUND_SECONDS = 30
 MAX_COUNTER_ROUNDS = 2
+OFFER_TTL_SECONDS = 600  # agent-protocol §13; the run override `OFFER_TTL_SECONDS` wins
+MAX_REQUOTES = 1
 # The delivery window asked for in `quote_request`, relative to the request.
 WINDOW_START = timedelta(hours=2)
 WINDOW_END = timedelta(hours=4)
@@ -110,8 +125,13 @@ HANDLED_TYPES = frozenset(
         "order_confirm",
         "delivery_booked",
         "order_status",
+        "reject",
+        "protocol_error",
     }
 )
+# agent-protocol §6 step 4: what the household does when one of its messages is refused.
+DROP_SELLER_ON_REFUSAL = frozenset({"quote_request", "counter_offer"})
+END_RUN_ON_REFUSAL = frozenset({"accept", "cancel"})
 SUMMARY_TEMPLATE = "order_summary"
 NO_OFFERS_TEMPLATE = "no_offers"
 
@@ -166,6 +186,13 @@ class HouseholdState(TypedDict, total=False):
     counters: int
     awaiting_counter: str | None  # the seller whose reply to our counter we wait for
     remaining_minor: int | None
+    excluded_sellers: list[str]  # sellers dropped from the run (agent-protocol §6, §7)
+    requotes: int  # 0 or 1 (agent-protocol §7 re-quote)
+    approval_minor: int | None  # the total the pending approval asks for
+    approved_minor: int | None  # the total an `approved` approval covers
+    accepts: int  # `accept` messages decided so far
+    accept_delay_rounds: int  # the run override `STUB_ACCEPT_DELAY_ROUNDS`
+    offer_ttl_seconds: int
     # The inbound message of the current invocation.
     message_id: str
     message_type: str
@@ -182,9 +209,11 @@ class HouseholdState(TypedDict, total=False):
 
 @dataclass(frozen=True)
 class RunInfo:
-    """What the graph reads from the `runs` row: the member who started the run."""
+    """What the graph reads from the `runs` row: the member who started the run, and the
+    run's overrides (`runs.trigger.overrides`)."""
 
     user_id: str | None
+    overrides: Mapping[str, Any] = field(default_factory=dict)
 
 
 Members = Mapping[str, str]
@@ -194,6 +223,7 @@ FindSellers = Callable[[str, str, str, str], Awaitable[Sequence[str]]]
 CallTool = Callable[..., Awaitable[dict[str, Any]]]
 IssueToken = Callable[[str, str, Sequence[str]], str]
 Clock = Callable[[], datetime]
+Sleep = Callable[[float], Awaitable[None]]
 
 
 def _mock_token(sub: str, act: str, scopes: Sequence[str]) -> str:
@@ -256,15 +286,45 @@ def _expired(offer: Mapping[str, Any], now: datetime) -> bool:
 
 
 def valid_offers(state: HouseholdState, now: datetime) -> list[dict[str, Any]]:
-    """Offers that can be taken: live, in the household's currency, with an offered line."""
+    """Offers that can be taken: live, in the household's currency, with an offered line,
+    from a seller not excluded from the run."""
     valid = []
+    excluded = set(state.get("excluded_sellers") or [])
     for seller, offer in sorted((state.get("quotes") or {}).items()):
+        if seller in excluded:
+            continue
         if offer.get("currency") != state.get("currency") or _expired(offer, now):
             continue
         if not any(line.get("offered_sku") for line in offer.get("lines", [])):
             continue
         valid.append({**offer, "seller": seller})
     return valid
+
+
+def _int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _exclude(state: HouseholdState, seller: str) -> dict[str, Any]:
+    """The state update that drops `seller` from the run, as if its offer never came."""
+    excluded = sorted({*(state.get("excluded_sellers") or []), seller})
+    quotes = {s: q for s, q in (state.get("quotes") or {}).items() if s != seller}
+    update: dict[str, Any] = {"excluded_sellers": excluded, "quotes": quotes}
+    if state.get("awaiting_counter") == seller:
+        update["awaiting_counter"] = None
+    return update
+
+
+def _sent_message(state: HouseholdState, message_id: str) -> dict[str, Any] | None:
+    """One of the household's own filed outgoing messages, by id."""
+    for entry in (state.get("sent") or {}).values():
+        for m in entry.get("messages") or []:
+            if m["message_id"] == message_id:
+                return m
+    return None
 
 
 def _cheapest(offers: Sequence[Mapping[str, Any]]) -> Mapping[str, Any] | None:
@@ -296,6 +356,7 @@ def build_graph(
     load_members: LoadMembers,
     find_sellers: FindSellers,
     clock: Clock = _now,
+    sleep: Sleep = asyncio.sleep,
 ) -> StateGraph:
     """The household graph's nodes and edges, before `compile(checkpointer=...)`."""
 
@@ -332,6 +393,14 @@ def build_graph(
         return _json(result.text)
 
     # Nodes ------------------------------------------------------------------------------
+
+    async def accept_delay(state: HouseholdState) -> None:
+        """`STUB_ACCEPT_DELAY_ROUNDS` (agent-protocol P21): stub mode only."""
+        if model.mode != "stub":
+            return
+        seconds = stubs.accept_delay_seconds(state)
+        if seconds > 0:
+            await sleep(seconds)
 
     async def ignore(state: HouseholdState) -> dict[str, Any]:
         reason = {"offer": "late_offer"}.get(state["message_type"], "ignored")
@@ -379,13 +448,17 @@ def build_graph(
         return {"items": [i.model_dump(mode="json") for i in items]}
 
     async def request_quotes(state: HouseholdState) -> dict[str, Any]:
-        await tool(
-            state,
-            "set_order_state",
-            {"order_id": state["order_id"], "expected": "draft", "new": "quoting"},
-        )
+        if not state.get("requotes"):
+            # On a re-quote, `requote` has already moved the order `authorized → quoting`.
+            await tool(
+                state,
+                "set_order_state",
+                {"order_id": state["order_id"], "expected": "draft", "new": "quoting"},
+            )
         cls = SELLER_CLASS[state["kind"] or "grocery"]
-        sellers = await find_sellers(cls, state["region"], state["zone_id"], state["currency"])
+        found = await find_sellers(cls, state["region"], state["zone_id"], state["currency"])
+        excluded = set(state.get("excluded_sellers") or [])
+        sellers = [s for s in found if s not in excluded]
         allergens: set[str] = set()
         diets: set[str] = set()
         for codes in (state.get("constraints") or {}).values():
@@ -516,6 +589,10 @@ def build_graph(
             return {"decision": "no_offers"}
         remaining = state.get("remaining_minor")
         over = remaining is None or pick["total_minor"] > remaining
+        approved = state.get("approved_minor")
+        if over and approved is not None and pick["total_minor"] <= approved:
+            # A re-quoted offer at or below the approved total uses that approval (§7).
+            over = False
         return {
             "chosen_quote_id": pick["quote_id"],
             "decision": "request_approval" if over else "authorize",
@@ -527,7 +604,11 @@ def build_graph(
         result = await tool(
             state, "request_approval", {"order_id": state["order_id"], "amount": amount}
         )
-        return {"approval_id": str(result["approval_id"]), "phase": AWAITING_APPROVAL}
+        return {
+            "approval_id": str(result["approval_id"]),
+            "approval_minor": offer["total_minor"],
+            "phase": AWAITING_APPROVAL,
+        }
 
     async def approval_decided(state: HouseholdState) -> dict[str, Any]:
         body = state["body"]
@@ -535,7 +616,7 @@ def build_graph(
             await trace_decision(state, "approval_decided", "unknown_approval")
             return {"decision": "ignore"}
         if body["status"] == "approved":
-            return {"decision": "authorize"}
+            return {"decision": "authorize", "approved_minor": state.get("approval_minor")}
         return {
             "decision": "cancelled",
             "phase": DONE,
@@ -543,6 +624,7 @@ def build_graph(
         }
 
     async def authorize(state: HouseholdState) -> dict[str, Any]:
+        await accept_delay(state)
         offer = _chosen(state)
         items = [
             {
@@ -581,7 +663,84 @@ def build_graph(
         }
         out = list(state.get("outgoing") or [])
         _add(state, out, seller, "accept", body, conversation_id=conversation)
-        return {"phase": PLACING, "outgoing": out}
+        accepts = int(state.get("accepts") or 0) + 1
+        return {"phase": PLACING, "outgoing": out, "accepts": accepts}
+
+    async def seller_rejected(state: HouseholdState) -> dict[str, Any]:
+        """A seller's `reject`: the household rule of agent-protocol §7."""
+        body = state["body"]
+        reason = body.get("reason") or "other"
+        quote_id = str(body["quote_id"])
+        try:
+            seller = _seller_of(state, quote_id)
+        except LookupError:
+            await trace_decision(state, "seller_rejected", "unknown_quote")
+            return {"decision": "ignore"}
+        phase = state.get("phase")
+        after_accept = phase == PLACING and quote_id == state.get("chosen_quote_id")
+        countered = phase == NEGOTIATING and state.get("awaiting_counter") == seller
+        if reason == "already_placed" or not (after_accept or countered or phase == QUOTING):
+            await trace_decision(state, "seller_rejected", f"ignored_{reason}")
+            return {"decision": "ignore"}
+        if reason == "expired" and after_accept:
+            if int(state.get("requotes") or 0) >= MAX_REQUOTES:
+                await trace_decision(state, "seller_rejected", "offer_expired")
+                return {
+                    "decision": "finish",
+                    "phase": DONE,
+                    "finish": {"status": "error", "reason": "offer_expired"},
+                }
+            await trace_decision(state, "seller_rejected", "requote")
+            return {"decision": "requote"}
+        # `no_courier` and any other reason: drop the seller, take the next valid offer.
+        update = _exclude(state, seller)
+        await trace_decision(state, "seller_rejected", f"excluded_{reason}")
+        if phase == QUOTING:
+            return {**update, "decision": "ignore"}
+        if valid_offers({**state, **update}, clock()):  # type: ignore[typeddict-item]
+            return {**update, "decision": "next_offer"}
+        if reason == "no_courier":
+            return {
+                **update,
+                "decision": "finish",
+                "phase": DONE,
+                "finish": {"status": "error", "reason": "no_courier"},
+            }
+        return {**update, "decision": "no_offers"}
+
+    async def requote(state: HouseholdState) -> dict[str, Any]:
+        """The one re-quote after an expired offer: `authorized → quoting` (A7)."""
+        await tool(
+            state,
+            "set_order_state",
+            {"order_id": state["order_id"], "expected": "authorized", "new": "quoting"},
+        )
+        return {
+            "requotes": int(state.get("requotes") or 0) + 1,
+            "chosen_quote_id": None,
+            "awaiting_counter": None,
+        }
+
+    async def protocol_error(state: HouseholdState) -> dict[str, Any]:
+        """The agent-protocol §6 reaction, by the type of the refused message."""
+        refused = _sent_message(state, str(state["body"]["ref_message_id"]))
+        refused_type = refused["type"] if refused else "unknown"
+        if refused is not None and refused_type in DROP_SELLER_ON_REFUSAL:
+            seller = refused["to_agent"]
+            update = _exclude(state, seller)
+            await trace_decision(state, "protocol_error", f"dropped_{refused_type}")
+            if state.get("phase") == NEGOTIATING and state.get("awaiting_counter") == seller:
+                return {**update, "decision": "negotiate"}
+            return {**update, "decision": "ignore"}
+        if refused is not None and refused_type in END_RUN_ON_REFUSAL:
+            await trace_decision(state, "protocol_error", f"end_{refused_type}")
+            return {
+                "decision": "finish",
+                "phase": DONE,
+                "finish": {"status": "error", "reason": "protocol_error"},
+            }
+        await trace_decision(state, "protocol_error", f"ignored_{refused_type}")
+        return {"decision": "ignore"}
 
     async def track_order(state: HouseholdState) -> dict[str, Any]:
         delivered = state["message_type"] == "order_status" and (
@@ -631,6 +790,8 @@ def build_graph(
             known = state["from_agent"] in (state.get("members") or {})
             return "record_constraints" if phase == CONSTRAINTS and known else "ignore"
         if t == "offer":
+            if state["from_agent"] in (state.get("excluded_sellers") or []):
+                return "ignore"
             if phase == QUOTING:
                 return "record_offer"
             if phase == NEGOTIATING and state.get("awaiting_counter") == state["from_agent"]:
@@ -643,6 +804,10 @@ def build_graph(
             return "approval_decided" if phase == AWAITING_APPROVAL else "ignore"
         if t in ("order_confirm", "delivery_booked", "order_status"):
             return "track_order" if phase == PLACING else "ignore"
+        if t in ("reject", "protocol_error"):
+            if phase in (NEW, CONSTRAINTS, DONE):
+                return "ignore"
+            return "seller_rejected" if t == "reject" else "protocol_error"
         raise UnsupportedMessage(f"the household graph does not handle {t!r}")
 
     def after_constraints(state: HouseholdState) -> str:
@@ -665,6 +830,16 @@ def build_graph(
     def after_approval(state: HouseholdState) -> str:
         return "authorize" if state.get("decision") == "authorize" else "send"
 
+    def after_rejected(state: HouseholdState) -> str:
+        return {
+            "requote": "requote",
+            "next_offer": "choose_offer",
+            "no_offers": "no_offers",
+        }.get(state.get("decision") or "", "send")
+
+    def after_protocol_error(state: HouseholdState) -> str:
+        return "negotiate" if state.get("decision") == "negotiate" else "send"
+
     def after_track(state: HouseholdState) -> str:
         if state.get("decision") != "delivered":
             return "send"
@@ -686,6 +861,9 @@ def build_graph(
         "approval_decided": approval_decided,
         "authorize": authorize,
         "track_order": track_order,
+        "seller_rejected": seller_rejected,
+        "requote": requote,
+        "protocol_error": protocol_error,
         "record_delivery": record_delivery,
         "finish": finish,
         "send": send,
@@ -700,6 +878,8 @@ def build_graph(
         "negotiate",
         "approval_decided",
         "track_order",
+        "seller_rejected",
+        "protocol_error",
     ]
     g.add_conditional_edges(START, route_message, {n: n for n in entries})
     g.add_edge("ignore", "send")
@@ -718,6 +898,11 @@ def build_graph(
     g.add_conditional_edges("approval_decided", after_approval, ["authorize", "send"])
     g.add_edge("authorize", "send")
     g.add_conditional_edges("track_order", after_track, ["record_delivery", "finish", "send"])
+    g.add_conditional_edges(
+        "seller_rejected", after_rejected, ["requote", "choose_offer", "no_offers", "send"]
+    )
+    g.add_edge("requote", "request_quotes")
+    g.add_conditional_edges("protocol_error", after_protocol_error, ["negotiate", "send"])
     g.add_edge("record_delivery", "finish")
     g.add_edge("finish", "send")
     g.add_edge("send", END)
@@ -754,10 +939,13 @@ class HouseholdGraph:
         call_tool: CallTool = mcp_client.call_tool,
         issue_token: IssueToken = _mock_token,
         clock: Clock = _now,
+        sleep: Sleep = asyncio.sleep,
+        offer_ttl_seconds: int = OFFER_TTL_SECONDS,
     ) -> None:
         self._load_run = load_run
+        self._offer_ttl_seconds = offer_ttl_seconds
         self.builder = build_graph(
-            model, traces, call_tool, issue_token, load_members, find_sellers, clock
+            model, traces, call_tool, issue_token, load_members, find_sellers, clock, sleep
         )
         self.graph = self.builder.compile(checkpointer=checkpointer)
 
@@ -809,6 +997,15 @@ class HouseholdGraph:
                 chosen_quote_id=None,
                 approval_id=None,
                 counters=0,
+                excluded_sellers=[],
+                requotes=0,
+                approval_minor=None,
+                approved_minor=None,
+                accepts=0,
+                accept_delay_rounds=_int(run.overrides.get("STUB_ACCEPT_DELAY_ROUNDS"), 0),
+                offer_ttl_seconds=_int(
+                    run.overrides.get("OFFER_TTL_SECONDS"), self._offer_ttl_seconds
+                ),
                 sent={},
             )
         state = await self.graph.ainvoke(inbound, config)
@@ -845,7 +1042,7 @@ class HouseholdGraph:
 
 # The host's handler. Built on first use, after the host has opened the pool.
 
-_RUN_SQL = "SELECT trigger->>'user_id' FROM runs WHERE run_id = %s"
+_RUN_SQL = "SELECT trigger->>'user_id', trigger->'overrides' FROM runs WHERE run_id = %s"
 _MEMBERS_SQL = """
 SELECT c.agent_id, m.user_id::text
 FROM household_members m
@@ -861,6 +1058,7 @@ def _build_default() -> HouseholdGraph:
 
     from services.agents.common.model import PgRunState
     from services.common import db, directory
+    from services.common.config import get_settings
     from services.common.trace import TraceStore
 
     pool = db.get_pool()
@@ -872,7 +1070,8 @@ def _build_default() -> HouseholdGraph:
             row = await cur.fetchone()
         if row is None:
             raise LookupError(f"run {run_id} does not exist")
-        return RunInfo(user_id=row[0])
+        overrides = row[1] if isinstance(row[1], dict) else {}
+        return RunInfo(user_id=row[0], overrides=overrides)
 
     async def load_members(household_id: str) -> Members:
         async with pool.connection() as conn:
@@ -891,6 +1090,7 @@ def _build_default() -> HouseholdGraph:
         load_run=load_run,
         load_members=load_members,
         find_sellers=find_sellers,
+        offer_ttl_seconds=get_settings().offer_ttl_seconds,
     )
 
 
