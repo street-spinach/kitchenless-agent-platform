@@ -219,6 +219,8 @@ Each goal has a test, an eval or a measurement in the Verification Plan.
     document fixes the guard and the provisional tool list in §13.
 *   **The pantry event model, confidence decay, photos and receipts.** These belong to the
     pantry design. This document only requires that a delivery updates the pantry once.
+
+*Amended 2026-11-02 (pantry, #251):* pantry.md owns the pantry event model, the trust window and confidence. Photos, receipts, WhatsApp media (R9) and the pantry check stay out of scope, for a later design (pantry.md PT-A1, PT-OD6, PT-OD8).
 *   **Behavior of the Expo business app and the `/me` consent and history pages.** These
     belong to the experience and identity-authz designs. This document only reserves their
     routes in `api`.
@@ -634,6 +636,8 @@ outbox and marks the timer `done`.
 
 ### 5. MCP servers and adapters
 
+*Amended 2026-11-02 (pantry, #251):* `record_delivery` also writes `pantry_item` (from `catalog_items.pantry_item`), `kind = 'add'` and `run_id`. `get_pantry` keeps `items` unchanged and adds `enabled` (true only for `env = 'eval'` households), `as_of` and `estimates` (pantry.md §3, §4, PT-A2).
+
 `services/mcp/app.py` is one Starlette app. It mounts five MCP servers over streamable HTTP.
 
 | Path | Backend area | Used by | Adapters |
@@ -926,6 +930,8 @@ check.
 
 ### 8. Weekly grocery order: end-to-end flow
 
+*Amended 2026-11-02 (pantry, #251):* on eval households, `build_list` skips trusted pantry items in code only, after the item-name check and before the dislike rule. When the skip empties the list, the order goes `draft → cancelled`, no `quote_request` is sent, and the run ends `completed` with reason `nothing_needed`: a `completed` run (G1, step 7) then places no order. Live households skip nothing (pantry.md §5, PT-A3).
+
 ```text
 WhatsApp ─► api: verify signature, dedupe on WhatsApp message id, phone → user,
              runs.start() (modes pinned, run_start trace), send user_message ─► consumer
@@ -1003,6 +1009,8 @@ the user and the control panel. There are no holds: an open quote simply expires
 *   There is no `record_delivery`.
 
 ### 9. Failure handling
+
+*Amended 2026-11-02 (pantry, #251):* a failed vocabulary load or `get_pantry` call means nothing is skipped (reason `pantry_unavailable`) (pantry.md §9, PT-A4).
 
 "Attempts" counts every try, including the first.
 
@@ -1170,6 +1178,8 @@ runs end with `reason=model_unavailable`, the nightly workflow titles the issue 
 evals: model unavailable" instead of "Eval regression".
 
 ### 13. Provisional contracts owned by later designs
+
+*Amended 2026-11-02 (pantry, #251):* the `pantry_events` row is settled by pantry.md §3: `item` keeps the SKU, and `pantry_item`, `kind` and `run_id` are added; `pantry_updated_once` keeps its meaning (PT-A5).
 
 *Amended 2026-11-02 (adapters, #146):* the MCP tool names and arguments are fixed as listed in item 43, with the
 additions in adapters.md §10.
@@ -1577,6 +1587,8 @@ provisional shapes in §13 are enough to start every step in mock mode.
     context variable carries `run_id` and `agent_id` into every log line.
 
 #### Migrations (`migrations/`, all critical, all additive)
+
+*Amended 2026-11-02 (pantry, #251):* `0014_pantry.sql` adds `pantry_events.pantry_item`, `.kind`, `.run_id`, the index `pantry_events_item_latest`, and `catalog_items.pantry_item` (pantry.md §3, PT-A5).
 
 *Amended 2026-11-02 (evals, #142):* `0013_eval_history.sql` adds `eval_runs` and `eval_results` (evals.md §6, E-A14).
 
@@ -2078,6 +2090,8 @@ and values; none of these may be renamed or dropped.
 
 ##### 29. `services/agents/household/graph.py` and `services/agents/household/stubs.py` (Create)
 
+*Amended 2026-11-02 (pantry, #251):* `build_list` gains the code-only pantry skip, the `nothing_needed` node and the state fields `pantry_skipped` and `pantry_as_of` (pantry.md §5, P5).
+
 *   **Type / Scope**: LangGraph graph and stub decisions.
 *   **Proposed Changes**:
     *   **Required state fields:** `state_version`, `run_id`, `household_id`, `order_id`,
@@ -2353,6 +2367,8 @@ and values; none of these may be renamed or dropped.
 
 ##### 43. `services/mcp/{grocery,restaurant,delivery,household,knowledge}/server.py` (Create)
 
+*Amended 2026-11-02 (pantry, #251):* the household server's `record_delivery` and `get_pantry` change as in pantry.md P4 (PT-A2).
+
 *   **Type / Scope**: Five MCP server modules.
 *   **Proposed Changes**: Each module defines its tools. Names and arguments are provisional
     (§13); the adapters design owns the final schemas. Tools marked *guarded* use
@@ -2589,6 +2605,8 @@ and values; none of these may be renamed or dropped.
 #### Seed (`services/seed/`)
 
 ##### 55. `services/seed/__main__.py` and `services/seed/data/*.yaml` (Create)
+
+*Amended 2026-11-02 (pantry, #251):* adds `services/seed/data/pantry_items.yaml` (the pantry vocabulary), `pantry_item` values in `catalog_mock.yaml`, and a seed check that every `pantry_item` is a vocabulary name (pantry.md §2, P3, PT-A6).
 
 *Amended 2026-11-02 (evals, #142):* eval member `us-1-b-eval` gains `allergies: [peanuts]`; live households are unchanged. `services.seed.seeded_limits()` returns the seeded budgets and bands (evals.md E-A9).
 
