@@ -9,15 +9,22 @@ Precedence, highest first:
 4. `MODE`, which defaults to `mock`.
 
 `kroger_ordering` is always mock.
+
+`adapter_for(vendor, run_modes)` returns the adapter class for the vendor's mode in the run.
+Until a vendor's real adapter exists (build step 7), `real` raises
+`AdapterFailure("adapter_not_configured", retryable=False)`. It never falls back to the mock
+(item 5, amended 2026-11-02, #47; Alternative R).
 """
 
-from typing import Literal, cast
+import importlib
+from collections.abc import Mapping
+from typing import Any, Literal, cast
 
 from psycopg import AsyncConnection
 
 from services.common.config import Settings, get_settings
 
-__all__ = ["ALWAYS_MOCK", "VENDORS", "Mode", "resolve_modes"]
+__all__ = ["ALWAYS_MOCK", "NOT_CONFIGURED", "VENDORS", "Mode", "adapter_for", "resolve_modes"]
 
 Mode = Literal["real", "mock"]
 
@@ -27,6 +34,20 @@ VENDORS = frozenset(
 ALWAYS_MOCK = frozenset({"kroger_ordering"})
 
 _MODES = frozenset({"real", "mock"})
+
+NOT_CONFIGURED = "adapter_not_configured"
+
+_MOCK_STORE = "services.mcp.grocery.adapters.mock_store:MockStoreAdapter"
+_MOCK_RESTAURANT = "services.mcp.restaurant.adapters.mock_restaurant:MockRestaurantAdapter"
+# Adapter classes by vendor and mode, as `module:Class`, imported on use so this module
+# does not depend on the MCP servers. The real adapters are added in build step 7, and
+# the mock courier by its own issue; until then those entries are missing.
+_ADAPTERS: dict[tuple[str, Mode], str] = {
+    ("kroger_catalog", "mock"): _MOCK_STORE,
+    ("kroger_ordering", "mock"): _MOCK_STORE,
+    ("square_retail", "mock"): _MOCK_STORE,
+    ("square_restaurant", "mock"): _MOCK_RESTAURANT,
+}
 
 
 def _check(name: str, value: str) -> Mode:
@@ -58,3 +79,20 @@ async def resolve_modes(conn: AsyncConnection) -> dict[str, Mode]:
         else:
             modes[vendor] = default
     return modes
+
+
+def adapter_for(vendor: str, run_modes: Mapping[str, str]) -> type[Any]:
+    """The adapter class for `vendor` in the run's mode (`runs.modes`).
+
+    Raises `AdapterFailure("adapter_not_configured", retryable=False)` when the vendor is
+    unknown, has no mode in `run_modes`, or has no adapter class for that mode. A `real`
+    vendor with no real adapter is never given the mock.
+    """
+    from services.mcp.meta import AdapterFailure
+
+    mode = run_modes.get(vendor)
+    path = _ADAPTERS.get((vendor, cast(Mode, mode))) if vendor in VENDORS else None
+    if path is None:
+        raise AdapterFailure(NOT_CONFIGURED, retryable=False)
+    module, _, name = path.partition(":")
+    return cast(type[Any], getattr(importlib.import_module(module), name))

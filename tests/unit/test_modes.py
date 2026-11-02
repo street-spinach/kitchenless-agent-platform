@@ -9,6 +9,9 @@ import pytest
 from services.common import modes
 from services.common.config import Settings
 from services.common.modes import VENDORS
+from services.mcp.grocery.adapters.mock_store import MockStoreAdapter
+from services.mcp.meta import AdapterFailure
+from services.mcp.restaurant.adapters.mock_restaurant import MockRestaurantAdapter
 
 
 def _use_env(monkeypatch: pytest.MonkeyPatch, **env: str) -> None:
@@ -91,3 +94,22 @@ def test_kroger_ordering_always_mock(monkeypatch: pytest.MonkeyPatch) -> None:
     assert resolved["kroger_ordering"] == "mock"
     assert resolved["kroger_catalog"] == "real"
     assert set(resolved) == VENDORS
+
+
+def test_adapter_for_real_without_adapter_not_configured() -> None:
+    mock = {vendor: "mock" for vendor in VENDORS}
+    assert modes.adapter_for("square_retail", mock) is MockStoreAdapter
+    assert modes.adapter_for("kroger_catalog", mock) is MockStoreAdapter
+    assert modes.adapter_for("kroger_ordering", mock) is MockStoreAdapter
+    assert modes.adapter_for("square_restaurant", mock) is MockRestaurantAdapter
+
+    # No real adapter exists yet (build step 7): `real` raises and never falls back to mock.
+    for vendor in VENDORS - {"kroger_ordering"}:
+        with pytest.raises(AdapterFailure) as e:
+            modes.adapter_for(vendor, {**mock, vendor: "real"})
+        assert (e.value.reason, e.value.retryable) == ("adapter_not_configured", False)
+    # An unknown vendor, or one with no mode for the run, fails closed too.
+    for vendor, run_modes in (("acme", {"acme": "mock"}), ("square_retail", {})):
+        with pytest.raises(AdapterFailure) as e:
+            modes.adapter_for(vendor, run_modes)
+        assert e.value.reason == "adapter_not_configured"
