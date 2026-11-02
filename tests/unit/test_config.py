@@ -1,5 +1,6 @@
 """One test per required-value rule of `services.common.config` (architecture item 2)."""
 
+import base64
 import dataclasses
 
 import pytest
@@ -7,33 +8,61 @@ import pytest
 from services.common import config
 from services.common.config import ConfigError, Settings
 
+_FIELDS = {f.name.upper(): f for f in dataclasses.fields(Settings)}
 _REQUIRED = {
-    f.name.upper(): f.metadata["services"]
-    for f in dataclasses.fields(Settings)
+    name: f.metadata["services"]
+    for name, f in _FIELDS.items()
     if f.metadata["default"] is config._NO_DEFAULT
+}
+# The TOKEN_SOURCE values under which each required value is required (None: any).
+_SOURCES = {name: _FIELDS[name].metadata["sources"] for name in _REQUIRED}
+
+_PEM = base64.b64encode(b"-----BEGIN PRIVATE KEY-----\nplaceholder\n").decode()
+_PLACEHOLDER = {
+    "RUN_TOKEN_CEILING": "100000",
+    "GRANT_KEY_VERSION": "1",
+    "AGENT_SIGNING_CERT": base64.b64encode(b"der").decode(),
 }
 
 
-def full_env(service: str) -> dict[str, str]:
-    """Every value `service` requires, set to a placeholder."""
-    env = {name: "x" for name, services in _REQUIRED.items() if service in services}
+def _required(name: str, service: str, source: str) -> bool:
+    sources = _SOURCES[name]
+    return service in _REQUIRED[name] and (sources is None or source in sources)
+
+
+def full_env(service: str, source: str = "mock") -> dict[str, str]:
+    """Every value `service` requires under TOKEN_SOURCE `source`, set to a placeholder."""
+    env = {}
+    for name in _REQUIRED:
+        if _required(name, service, source):
+            pem = _FIELDS[name].metadata["encoding"] == "pem"
+            env[name] = _PEM if pem else _PLACEHOLDER.get(name, "x")
+    if "TOKEN_SOURCE" in env:
+        env["TOKEN_SOURCE"] = source
     env["SERVICE_NAME"] = service
-    if "RUN_TOKEN_CEILING" in env:
-        env["RUN_TOKEN_CEILING"] = "100000"
     return env
 
 
-@pytest.mark.parametrize("service", sorted(config.SERVICES))
-def test_complete_env_builds(service: str) -> None:
-    assert Settings.from_env(full_env(service)).service_name == service
+@pytest.mark.parametrize(
+    ("service", "source"),
+    [(s, t) for s in sorted(config.SERVICES) for t in sorted(config.TOKEN_SOURCES)],
+)
+def test_complete_env_builds(service: str, source: str) -> None:
+    assert Settings.from_env(full_env(service, source)).service_name == service
 
 
 @pytest.mark.parametrize(
-    ("service", "name"),
-    [(s, n) for n, services in sorted(_REQUIRED.items()) for s in sorted(services)],
+    ("service", "name", "source"),
+    [
+        (s, n, t)
+        for n, services in sorted(_REQUIRED.items())
+        for s in sorted(services)
+        for t in sorted(config.TOKEN_SOURCES)
+        if _required(n, s, t)
+    ],
 )
-def test_missing_required_value_raises(service: str, name: str) -> None:
-    env = full_env(service)
+def test_missing_required_value_raises(service: str, name: str, source: str) -> None:
+    env = full_env(service, source)
     env.pop(name)
     with pytest.raises(ConfigError, match=name):
         Settings.from_env(env)
@@ -127,3 +156,91 @@ def test_settings_built_once(monkeypatch: pytest.MonkeyPatch) -> None:
             first.mode = "real"  # type: ignore[misc]
     finally:
         config.get_settings.cache_clear()
+
+
+def test_mcp_starts_live_without_grant_key() -> None:
+    # GRANT_ENCRYPTION_KEY is R live on agents and api only (identity-authz §13).
+    for source in sorted(config.LIVE):
+        env = full_env("mcp", source)
+        assert "GRANT_ENCRYPTION_KEY" not in env and "KEYCLOAK_URL" in env
+        s = Settings.from_env(env)
+        assert s.token_source == source and s.grant_encryption_key is None
+
+
+def test_api_refuses_live_without_grant_key() -> None:
+    for source in sorted(config.LIVE):
+        env = full_env("api", source)
+        env.pop("GRANT_ENCRYPTION_KEY")
+        with pytest.raises(ConfigError, match="GRANT_ENCRYPTION_KEY"):
+            Settings.from_env(env)
+        # Compose passes unset values as empty strings: empty is missing too.
+        with pytest.raises(ConfigError, match="GRANT_ENCRYPTION_KEY"):
+            Settings.from_env({**env, "GRANT_ENCRYPTION_KEY": ""})
+    # Under mock, api starts without it.
+    assert Settings.from_env(full_env("api")).grant_encryption_key is None
+
+
+def test_mock_key_required() -> None:
+    # Required on agents, api, mcp and testrunner in every mode (I5, I-D26); not on migrate.
+    for service in sorted(config.APP):
+        for source in sorted(config.TOKEN_SOURCES):
+            env = full_env(service, source)
+            for value in (None, ""):
+                if value is None:
+                    env.pop("MOCK_SIGNING_KEY", None)
+                else:
+                    env["MOCK_SIGNING_KEY"] = value
+                with pytest.raises(ConfigError, match="MOCK_SIGNING_KEY"):
+                    Settings.from_env(env)
+    assert "MOCK_SIGNING_KEY" not in full_env("migrate")
+    assert Settings.from_env(full_env("migrate")).mock_signing_key is None
+
+
+def test_env_example_mock_key_is_a_pem_rsa_key() -> None:
+    from pathlib import Path
+
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    example = Path(__file__).resolve().parents[2] / "infra" / ".env.example"
+    lines = example.read_text().splitlines()
+    i = next(n for n, line in enumerate(lines) if line.startswith("MOCK_SIGNING_KEY="))
+    assert lines[i - 1] == "# TEST ONLY - never trusted for live households"
+    env = {**full_env("mcp"), "MOCK_SIGNING_KEY": lines[i].split("=", 1)[1]}
+    pem = Settings.from_env(env).mock_signing_key
+    assert pem is not None
+    key = serialization.load_pem_private_key(pem.encode(), password=None)
+    assert isinstance(key, rsa.RSAPrivateKey)
+
+
+def test_pem_values_decoded_from_base64() -> None:
+    env = full_env("api", "token_service")
+    s = Settings.from_env(env)
+    assert s.token_service_key == "-----BEGIN PRIVATE KEY-----\nplaceholder\n"
+    for bad in ("not base64!", base64.b64encode(b"not a pem").decode()):
+        with pytest.raises(ConfigError, match="TOKEN_SERVICE_KEY") as err:
+            Settings.from_env({**env, "TOKEN_SERVICE_KEY": bad})
+        assert bad not in str(err.value)
+
+
+def test_token_source_must_be_known() -> None:
+    with pytest.raises(ConfigError, match="TOKEN_SOURCE"):
+        Settings.from_env({**full_env("mcp"), "TOKEN_SOURCE": "none"})
+    with pytest.raises(ConfigError, match="TOKEN_SOURCE"):
+        Settings.from_env({**full_env("mcp"), "TOKEN_SOURCE": ""})
+
+
+def test_keycloak_url_required_only_live() -> None:
+    for service in ("agents", "api", "mcp"):
+        assert "KEYCLOAK_URL" not in full_env(service, "mock")
+        assert "KEYCLOAK_URL" in full_env(service, "keycloak")
+    assert "KEYCLOAK_URL" not in full_env("testrunner", "keycloak")
+
+
+def test_issuer_url_derived_from_domain() -> None:
+    env = {**full_env("mcp"), "DOMAIN": "example.org"}
+    assert Settings.from_env(env).issuer_url == "https://example.org/auth/realms/kitchenless"
+    env = {**full_env("api", "token_service"), "DOMAIN": "example.org", "ISSUER_URL": ""}
+    assert Settings.from_env(env).issuer_url == "https://example.org/tokens"
+    env = {**full_env("mcp"), "ISSUER_URL": "https://issuer.test/x"}
+    assert Settings.from_env(env).issuer_url == "https://issuer.test/x"
