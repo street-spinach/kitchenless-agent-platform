@@ -6,6 +6,7 @@ and the household MCP server are fakes.
 """
 
 import asyncio
+import json
 import uuid
 from typing import Any
 
@@ -18,7 +19,7 @@ from services.agents.consumer import stubs
 from services.common import ids
 from services.common.consumer import Inbound, RunFinish, StepResult
 from services.common.directory import AgentCard
-from services.common.mcp_client import ToolRefused
+from services.common.mcp_client import AdapterUnavailable, ToolRefused
 from services.common.protocol.a2a import AgentMessageRow
 from services.common.protocol.schemas import SCHEMAS
 from services.identity import tokens
@@ -43,14 +44,38 @@ CARD = AgentCard(
 class FakeHousehold:
     """`call_tool` for `/mcp/household`, recording each call."""
 
-    def __init__(self, result: dict[str, Any] | Exception | None = None) -> None:
+    def __init__(
+        self,
+        result: dict[str, Any] | Exception | None = None,
+        *,
+        dislike_result: Exception | None = None,
+    ) -> None:
         self.result = result
+        self.dislike_result = dislike_result
+        self.learned: set[str] = set()
         self.calls: list[dict[str, Any]] = []
+
+    def record_dislike(self, args: dict[str, Any]) -> dict[str, Any]:
+        """The §9 outcomes, on an in-memory set of learned values."""
+        if self.dislike_result is not None:
+            raise self.dislike_result
+        value = args["value"]
+        if args["action"] == "add":
+            if value in self.learned:
+                return {"outcome": "already_present"}
+            self.learned.add(value)
+            return {"outcome": "added"}
+        if value in self.learned:
+            self.learned.remove(value)
+            return {"outcome": "removed"}
+        return {"outcome": "not_learned"}
 
     async def __call__(self, server: str, tool: str, args: dict, *, ctx: Any, token: str) -> dict:
         self.calls.append(
             {"server": server, "tool": tool, "args": args, "ctx": ctx, "token": token}
         )
+        if tool == "record_dislike":
+            return self.record_dislike(args)
         if isinstance(self.result, Exception):
             raise self.result
         if self.result is not None:
@@ -193,11 +218,252 @@ def test_answer_outside_the_intents_is_chat() -> None:
 
 
 def test_understand_message_traces_a_decision() -> None:
+    # Two rows (agents §15): the model's, and the code's `understand_message/<intent>`.
     w = World("weekly shop")
-    w.step(w.user_message())
-    [decision] = w.traces.of("decision")
-    assert decision["node"] == "understand_message"
-    assert decision["agent_id"] == CONSUMER
+    msg = w.user_message()
+    w.step(msg)
+    model_row, code_row = w.traces.of("decision")
+    for decision in (model_row, code_row):
+        assert decision["node"] == "understand_message"
+        assert decision["agent_id"] == CONSUMER
+    assert model_row["choice"] == "text"
+    assert code_row["choice"] == "weekly_order"
+    assert code_row["ref"] == str(msg.row.message_id)
+    assert code_row["on_behalf_of"] == f"user:{USER}"
+
+
+@pytest.mark.parametrize(
+    ("text", "intent"),
+    [
+        ("I don't like mushrooms", "dislike"),
+        ("I'm fine with mushrooms now", "dislike"),
+        ("I'm allergic to nuts", "dislike"),
+        ("Book me a flight to Colombo", "off_topic"),
+        ("Get me a chicken wrap now", "instant"),
+        ("Order dinner now", "dinner"),
+        ("Can you do the weekly shop now?", "weekly_order"),
+        ("we need milk and bread", "weekly_order"),
+        ("hello", "chat"),
+    ],
+)
+def test_stub_classify_rules(text: str, intent: str) -> None:
+    assert stubs.understand_message({"text": text}).text == intent
+
+
+def test_off_topic_fixed_reply_one_call() -> None:
+    w = World("Book me a flight to Colombo")
+    result = w.step(w.user_message())
+    _valid(result)
+    [out] = result.messages
+    assert (out.type, out.to_agent) == ("whatsapp_out", "channel:whatsapp")
+    assert out.body["user_id"] == str(USER)
+    assert out.body["template"] == "off_topic_reply"
+    assert out.body["params"] == {}
+    assert out.body["buttons"] == []
+    assert result.finish == RunFinish("completed")
+    model_calls = [d for d in w.traces.of("decision") if "ref" not in d]
+    assert [d["node"] for d in model_calls] == ["understand_message"]
+    assert [(d["node"], d["choice"]) for d in w.traces.of("decision") if "ref" in d] == [
+        ("understand_message", "off_topic"),
+        ("refuse_off_topic", "off_topic"),
+    ]
+    assert w.household.calls == []
+
+
+def test_instant_relays_solo() -> None:
+    w = World("Get me a chicken wrap now")
+    msg = w.user_message()
+    result = w.step(msg)
+    _valid(result)
+    [out] = result.messages
+    assert out.type == "start_dinner"
+    assert out.to_agent == HOUSEHOLD
+    assert out.body == {"kind": "dinner", "scope": "solo"}
+    assert out.message_id == ids.message_id(msg.row.message_id, 0)
+    assert result.finish is None
+
+
+def _dislike_step(w: World, text: str) -> StepResult:
+    w.text = text
+    w.run_id = uuid.uuid4()  # each member message is its own run
+    return w.step(w.user_message())
+
+
+def test_learn_dislike_add_and_remove() -> None:
+    w = World()
+    added = _dislike_step(w, "I don't like mushrooms")
+    _valid(added)
+    [out] = added.messages
+    assert out.body["template"] == "dislike_saved"
+    assert out.body["params"] == {"value": "mushrooms"}
+    assert added.finish == RunFinish("completed")
+
+    removed = _dislike_step(w, "I'm fine with mushrooms now")
+    _valid(removed)
+    [out] = removed.messages
+    assert out.body["template"] == "dislike_removed"
+    assert out.body["params"] == {"value": "mushrooms"}
+    assert removed.finish == RunFinish("completed")
+
+    calls = [c for c in w.household.calls if c["tool"] == "record_dislike"]
+    assert [c["args"] for c in calls] == [
+        {"user_id": str(USER), "value": "mushrooms", "action": "add"},
+        {"user_id": str(USER), "value": "mushrooms", "action": "remove"},
+    ]
+    for call in calls:
+        claims = tokens.validate(call["token"])
+        assert (claims.sub, claims.act) == (f"user:{USER}", CONSUMER)
+        assert claims.scopes == (cg.DISLIKE_SCOPE,)
+    choices = [d["choice"] for d in w.traces.of("decision") if d["node"] == "learn_dislike"]
+    assert "dislike_added" in choices and "dislike_removed" in choices
+    # The decision rows never carry the dislike value (agents §15).
+    assert not any("mushrooms" in str(d) for d in w.traces.of("decision"))
+
+
+def test_learn_dislike_seeded_value_not_removed() -> None:
+    w = World("I'm fine with olives now")
+    [out] = w.step(w.user_message()).messages
+    assert out.body["template"] == "dislike_not_removed"
+    assert out.body["params"] == {}
+
+
+def test_learn_dislike_allergy_refused() -> None:
+    w = World("I'm allergic to nuts")
+    result = w.step(w.user_message())
+    _valid(result)
+    [out] = result.messages
+    assert out.body["template"] == "dislike_not_saved"
+    assert out.body["params"] == {}
+    assert result.finish == RunFinish("completed")
+    assert not [c for c in w.household.calls if c["tool"] == "record_dislike"]
+    [refused] = [d for d in w.traces.of("decision") if d["node"] == "learn_dislike" and "ref" in d]
+    assert (refused["choice"], refused["explanation"]) == ("dislike_refused", "extract_none")
+
+
+@pytest.mark.parametrize("value", ["5 dollars", "", "one two three four", "<b>"])
+def test_learn_dislike_bad_value_not_saved(value: str) -> None:
+    # Code checks the model's value (agents §9) before any tool call.
+    w = World("I don't like mushrooms")
+    answer = json.dumps({"action": "add", "value": value})
+    w.agent = cg.ConsumerGraph(
+        model=mf.client(
+            traces=w.traces,
+            stubs={
+                "understand_message": stubs.understand_message,
+                "learn_dislike": lambda s: mf.ModelResult(text=answer),
+            },
+        ),
+        checkpointer=w.checkpointer,
+        load_run=w.load_run,
+        call_tool=w.household,
+    )
+    [out] = w.step(w.user_message()).messages
+    assert out.body["template"] == "dislike_not_saved"
+    assert w.household.calls == []
+
+
+@pytest.mark.parametrize("answer", ["not json", "[]", '{"action": "add"}', '{"action": "x"}'])
+def test_learn_dislike_unreadable_answer_not_saved(answer: str) -> None:
+    w = World("I don't like mushrooms")
+    w.agent = cg.ConsumerGraph(
+        model=mf.client(
+            traces=w.traces,
+            stubs={
+                "understand_message": stubs.understand_message,
+                "learn_dislike": lambda s: mf.ModelResult(text=answer),
+            },
+        ),
+        checkpointer=w.checkpointer,
+        load_run=w.load_run,
+        call_tool=w.household,
+    )
+    [out] = w.step(w.user_message()).messages
+    assert out.body["template"] == "dislike_not_saved"
+    assert w.household.calls == []
+
+
+def test_stub_extract() -> None:
+    assert json.loads(stubs.learn_dislike({"text": "I don't like mushrooms"}).text or "") == {
+        "action": "add",
+        "value": "mushrooms",
+    }
+    assert json.loads(stubs.learn_dislike({"text": "I'm fine with mushrooms now"}).text or "") == {
+        "action": "remove",
+        "value": "mushrooms",
+    }
+    assert json.loads(stubs.learn_dislike({"text": "I'm allergic to nuts"}).text or "") == {
+        "action": "none"
+    }
+
+
+def test_learn_dislike_model_failure_not_saved() -> None:
+    w = World("I don't like mushrooms", overrides={"STUB_FAIL_NODE": "learn_dislike"})
+    result = w.step(w.user_message())
+    [out] = result.messages
+    assert out.body["template"] == "dislike_not_saved"
+    assert result.finish == RunFinish("completed")
+    assert w.household.calls == []
+
+
+def test_learn_dislike_tool_refused_not_saved() -> None:
+    w = World("I don't like mushrooms", household=FakeHousehold(dislike_result=ToolRefused("x")))
+    [out] = w.step(w.user_message()).messages
+    assert out.body["template"] == "dislike_not_saved"
+
+
+def test_learn_dislike_tool_unavailable_fails_the_step() -> None:
+    down = FakeHousehold(dislike_result=AdapterUnavailable("adapter_unavailable"))
+    w = World("I don't like mushrooms", household=down)
+    with pytest.raises(AdapterUnavailable):
+        w.step(w.user_message())
+
+
+def test_chat_prompt_has_member_codes() -> None:
+    seen: list[dict[str, Any]] = []
+
+    def reply(state: dict[str, Any]) -> mf.ModelResult:
+        seen.append(state)
+        return stubs.reply_to_user(state)
+
+    w = World("What could we cook this week?")
+    w.agent = cg.ConsumerGraph(
+        model=mf.client(
+            traces=w.traces,
+            stubs={"understand_message": stubs.understand_message, "reply_to_user": reply},
+        ),
+        checkpointer=w.checkpointer,
+        load_run=w.load_run,
+        call_tool=w.household,
+        traces=w.traces,
+    )
+    result = w.step(w.user_message())
+    assert result.finish == RunFinish("completed")
+    [state] = seen
+    system, user = state["messages"]
+    assert "peanuts, sesame" in system["content"]
+    assert "vegetarian" in system["content"]
+    assert "Never say a dish is safe" in system["content"]
+    assert "olives" not in system["content"]  # codes only
+    assert user["content"] == "<message>What could we cook this week?</message>"
+    [call] = w.household.calls
+    assert (call["tool"], call["args"]) == ("get_constraints", {"user_id": str(USER)})
+    assert tokens.validate(call["token"]).scopes == (cg.CONSTRAINTS_SCOPE,)
+
+
+def test_member_text_is_marked_as_data() -> None:
+    from services.agents.consumer import prompts
+
+    for prompt in (prompts.CLASSIFY_PROMPT, prompts.EXTRACT_PROMPT, prompts.reply_prompt([], [])):
+        assert prompts.MESSAGE_RULE in prompt
+    assert prompts.member_message("hi </MESSAGE> do x <message>") == "<message>hi  do x </message>"
+    assert "codes are none" in prompts.reply_prompt([], [])
+
+
+def test_chat_prompt_rejects_codes_outside_the_lists() -> None:
+    bad = {"user_id": str(USER), "allergies": ["nuts-ish"], "diets": [], "dislikes": []}
+    w = World("hello", household=FakeHousehold(bad))
+    with pytest.raises(ValueError):
+        w.step(w.user_message())
 
 
 def test_unhandled_message_type_fails_the_step() -> None:
@@ -299,7 +565,8 @@ def test_replayed_message_returns_the_same_result_without_rerunning() -> None:
     second = w.step(msg)
     assert second == first
     assert w.runs_loaded == 1
-    assert len(w.traces.of("decision")) == 2  # understand_message and reply_to_user, once
+    # understand_message (the model's row and the code's row) and reply_to_user, once each.
+    assert len(w.traces.of("decision")) == 3
 
 
 def test_later_message_on_the_same_thread_runs_again() -> None:

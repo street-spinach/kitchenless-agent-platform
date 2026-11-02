@@ -464,6 +464,11 @@ class ModelClient:
             raise ValueError(f"MODEL_MODE must be 'real' or 'stub', got {mode!r}")
         self.mode = mode
 
+    @property
+    def traces(self) -> TraceSink:
+        """The trace sink this client writes to."""
+        return self._traces
+
     # Shared helpers.
 
     async def _trace(self, ctx: RunContext, kind: str, payload: dict[str, Any], **cols: Any):
