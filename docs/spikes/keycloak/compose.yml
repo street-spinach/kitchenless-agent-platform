@@ -1,0 +1,46 @@
+# Spike only (identity-authz I14): a scratch Keycloak 26.8.1 with the magic-link
+# extension and the delegation preview. All values below are throwaway, local-only.
+name: kc-spike
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: spike-only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak"]
+      interval: 2s
+      retries: 30
+  keycloak:
+    build: .
+    command: start --optimized --import-realm
+    depends_on:
+      db: {condition: service_healthy}
+    environment:
+      KC_DB_URL: jdbc:postgresql://db:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: spike-only
+      KC_DB_POOL_MAX_SIZE: "10"
+      KC_HOSTNAME: http://localhost:8180/auth
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+      KC_HTTP_ENABLED: "true"
+      KC_BOOTSTRAP_ADMIN_USERNAME: spike-admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: spike-only
+      JAVA_OPTS_KC_HEAP: -Xms256m -Xmx384m
+      SPIKE_PHONE_1: "+15135550101"
+      SPIKE_PROBE_SECRET: probe-secret-value
+      SPIKE_PROBE_CERT: PROBECERTVALUE
+      SPIKE_DOMAIN: demo.example.test
+    volumes: ["./realm-probe.json:/opt/keycloak/data/import/realm-probe.json:ro"]
+    ports: ["8180:8080"]
+    mem_limit: 640m
+  # Admin CLI in its own container, so its JVM never counts against Keycloak's limit.
+  kcadm:
+    image: kc-spike-keycloak
+    profiles: [tools]
+    entrypoint: ["/opt/keycloak/bin/kcadm.sh"]
+    volumes: ["kcadm-config:/cfg"]
+    user: root
+volumes:
+  kcadm-config:
