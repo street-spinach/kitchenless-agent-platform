@@ -4,7 +4,10 @@
 `services.mocks.control` (architecture item 47) and read traces and messages for the
 "watch the agents talk" view:
 
-*   `POST /panel/reset {env}`: `env: eval` only; refuses anything else with 400.
+*   `POST /panel/reset {env, setup, household}`: `env: eval` only. `setup` holds keys of
+    `control.SETUP_KEYS` applied to `household` (an eval household, default `us-1-eval`)
+    and undone by the next reset (evals.md §4, E-A7). An unknown key, a bad type or a
+    non-eval household is refused with 400.
 *   `POST /panel/events {env, kind, target_agent_id, params}` writes `mock_events`. The
     `shortfall` kind (agent-protocol §10 and P31, #70) is refused with 409 unless the
     order is `courier_booked` and has no shortfall (no `shortfalls` row and no earlier
@@ -100,9 +103,15 @@ async def reset(request: Request) -> JSONResponse:
     env = body.get("env")
     if not isinstance(env, str):
         return _error(400, "env is a required string")
+    setup = body.get("setup")
+    if setup is not None and not isinstance(setup, dict):
+        return _error(400, "setup must be an object")
+    household = body.get("household", control.DEFAULT_EVAL_HOUSEHOLD)
+    if not isinstance(household, str):
+        return _error(400, "household must be a string")
     async with request.app.state.connect() as conn:
         try:
-            deleted = await control.reset(conn, env)
+            deleted = await control.reset(conn, env, setup, household)
         except control.ControlRefused as exc:
             return _error(400, str(exc))
     return JSONResponse({"env": "eval", "deleted": deleted})

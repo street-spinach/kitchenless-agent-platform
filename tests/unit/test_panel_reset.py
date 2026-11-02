@@ -14,7 +14,7 @@ from psycopg.types.json import Jsonb
 from services.common import ids
 from services.common.config import Settings
 from services.mocks import control
-from services.seed import MOCK_STOCK_QTY, mock_stock_rows
+from services.seed import MOCK_STOCK_QTY, mock_stock_rows, seeded_limits
 from services.seed import __main__ as seed_mod
 
 LIVE = "us-1"
@@ -464,3 +464,109 @@ def test_reset_eval_deletes_learned_dislikes_and_household_rules(world: dict[str
         assert [r[0] for r in rules] == [LIVE]
         after = _count(conn, "SELECT count(*) FROM member_constraints WHERE source <> 'learned'")
         assert after == seeded
+
+
+# --- setup keys (evals.md §4, E-A8; issue #224) ---------------------------------------------
+
+_LIVE_LIMITS_SQL = (
+    "SELECT b.household_id, b.amount_minor, r.per_order_minor FROM budgets b"
+    " JOIN households h USING (household_id)"
+    " LEFT JOIN approval_rules r USING (household_id)"
+    " WHERE h.env = 'live' ORDER BY 1"
+)
+
+
+def _budget(conn: psycopg.Connection, household_id: str) -> int:
+    return _count(
+        conn,
+        "SELECT amount_minor FROM budgets WHERE household_id = %s AND period = 'weekly'",
+        household_id,
+    )
+
+
+def _per_order(conn: psycopg.Connection, household_id: str) -> int | None:
+    row = conn.execute(
+        "SELECT per_order_minor FROM approval_rules WHERE household_id = %s", (household_id,)
+    ).fetchone()
+    assert row is not None
+    return row[0]
+
+
+def _reset_setup(pg: str, setup: Any, household_id: str = EVAL) -> dict[str, int]:
+    return _run(pg, lambda conn: control.reset(conn, "eval", setup, household_id))
+
+
+@pytest.mark.db
+def test_budget_setup_applied_then_restored(world: dict[str, Any]) -> None:
+    pg = world["pg"]
+    limits = seeded_limits()
+    seeded = limits[EVAL]["weekly_budget_minor"]
+    assert seeded is not None
+
+    _reset_setup(pg, {"budget_minor": 2500})
+    with psycopg.connect(pg) as conn:
+        assert _budget(conn, EVAL) == 2500
+        assert _budget(conn, "us-2-eval") == limits["us-2-eval"]["weekly_budget_minor"]
+
+    _reset(pg, "eval")
+    with psycopg.connect(pg) as conn:
+        assert _budget(conn, EVAL) == seeded
+
+
+@pytest.mark.db
+def test_per_order_setup_restored(world: dict[str, Any]) -> None:
+    pg = world["pg"]
+    limits = seeded_limits()
+
+    _reset_setup(pg, {"per_order_minor": 4000}, "us-2-eval")
+    with psycopg.connect(pg) as conn:
+        assert _per_order(conn, "us-2-eval") == 4000
+        assert _per_order(conn, EVAL) == limits[EVAL]["per_order_minor"]
+
+    _reset(pg, "eval")
+    with psycopg.connect(pg) as conn:
+        assert _per_order(conn, "us-2-eval") == limits["us-2-eval"]["per_order_minor"]
+
+
+@pytest.mark.db
+def test_setup_never_touches_live_households(world: dict[str, Any]) -> None:
+    pg = world["pg"]
+    with psycopg.connect(pg) as conn:
+        # Live limits that differ from the seed: no reset may apply or restore them.
+        conn.execute("UPDATE budgets SET amount_minor = 999 WHERE household_id = %s", (LIVE,))
+        conn.execute(
+            "UPDATE approval_rules SET per_order_minor = 777 WHERE household_id = %s", (LIVE,)
+        )
+        before = conn.execute(_LIVE_LIMITS_SQL).fetchall()
+
+    setup = {"budget_minor": 1, "per_order_minor": 1}
+    _reset_setup(pg, setup)
+    for household in (LIVE, "us-2", "a2a-demo", "nope"):
+        with pytest.raises(control.ControlRefused):
+            _reset_setup(pg, setup, household)
+    _reset(pg, "eval")
+
+    with psycopg.connect(pg) as conn:
+        after = conn.execute(_LIVE_LIMITS_SQL).fetchall()
+    assert after == before
+    assert (LIVE, 999, 777) in after
+
+
+@pytest.mark.db
+def test_bad_setup_refused_and_writes_nothing(world: dict[str, Any]) -> None:
+    pg = world["pg"]
+    eval_run = world["eval"]["run_id"]
+    bad: list[Any] = [
+        {"bogus": 1},
+        {"budget_minor": "2500"},
+        {"budget_minor": True},
+        {"budget_minor": 25.0},
+        {"per_order_minor": None},
+        {"per_order_minor": -1},
+        ["budget_minor"],
+    ]
+    for setup in bad:
+        with pytest.raises(control.ControlRefused):
+            _reset_setup(pg, setup)
+    with psycopg.connect(pg) as conn:
+        assert _count(conn, "SELECT count(*) FROM runs WHERE run_id = %s", eval_run) == 1

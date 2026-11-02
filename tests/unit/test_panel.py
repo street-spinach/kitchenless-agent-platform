@@ -471,6 +471,27 @@ def test_reset_eval(world: str, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @db
+@pytest.mark.parametrize(
+    ("setup", "named"),
+    [({"bogus": 1}, "bogus"), ({"budget_minor": "100"}, "budget_minor"), ([1], "setup")],
+)
+def test_reset_unknown_setup_key_is_400(world: str, setup: Any, named: str) -> None:
+    resp = w.client(world).post("/panel/reset", json={"env": "eval", "setup": setup})
+    assert resp.status_code == 400
+    assert named in resp.json()["error"]
+
+
+@db
+@pytest.mark.parametrize("household", [w.LIVE_HOUSEHOLD_ID, "us-1", "unknown", 7])
+def test_reset_live_household_is_400(world: str, household: Any) -> None:
+    resp = w.client(world).post(
+        "/panel/reset", json={"env": "eval", "setup": {"budget_minor": 1}, "household": household}
+    )
+    assert resp.status_code == 400
+    assert "household" in resp.json()["error"]
+
+
+@db
 def test_events_writes_mock_event(world: str) -> None:
     resp = w.client(world).post(
         "/panel/events",
