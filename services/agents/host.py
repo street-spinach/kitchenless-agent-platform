@@ -12,13 +12,13 @@ Run with `python -m services.agents.host`. At startup it loads the enabled cards
 *   `/health` reports Postgres reachability, the loaded card count and the message backlog
     per host (`pending`, `processing`, `oldest_pending_seconds`), excluding `external`.
 
-Mounting the A2A routes (agent-protocol P18, P19) belongs to issue #77.
+*   The A2A routes (agent-protocol P18, P19) are mounted on the same app and port.
 """
 
 import asyncio
 import contextlib
 import logging
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from typing import Any
 
 import psycopg
@@ -26,9 +26,10 @@ import uvicorn
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
-from starlette.routing import Route
+from starlette.routing import BaseRoute, Route
 
 from services.agents import sweeper
+from services.agents.a2a.server import A2AServer
 from services.agents.consumer import graph as consumer_graph
 from services.agents.delivery import handler as delivery_handler
 from services.agents.grocery import handler as grocery_handler
@@ -165,6 +166,7 @@ def create_app(
     *,
     get_backlog: Callable[[], Awaitable[Backlog | None]] = read_backlog,
     card_count: Callable[[], int] = lambda: 0,
+    a2a_routes: Sequence[BaseRoute] = (),
 ) -> Starlette:
     async def health(request: Request) -> JSONResponse:
         return JSONResponse(
@@ -177,7 +179,7 @@ def create_app(
             }
         )
 
-    return Starlette(routes=[Route("/health", health)])
+    return Starlette(routes=[Route("/health", health), *a2a_routes])
 
 
 async def serve(handlers: Mapping[str, ClassHandler] = HANDLERS) -> None:
@@ -191,7 +193,10 @@ async def serve(handlers: Mapping[str, ClassHandler] = HANDLERS) -> None:
         dispatch = Dispatcher(cards, handlers)
         server = uvicorn.Server(
             uvicorn.Config(
-                create_app(card_count=lambda: len(cards)),
+                create_app(
+                    card_count=lambda: len(cards),
+                    a2a_routes=A2AServer.from_settings(pool.connection).routes(),
+                ),
                 host="0.0.0.0",
                 port=PORT,
                 log_config=None,

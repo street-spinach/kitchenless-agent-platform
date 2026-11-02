@@ -145,6 +145,14 @@ def test_a2a_message_id_namespaced_by_sender() -> None:
     assert ids.a2a_run_id(a) != ids.a2a_order_id(a)
 
 
+def test_a2a_cancel_id_one_per_quote() -> None:
+    q = uuid4()
+    assert ids.a2a_cancel_id(q) == ids.a2a_cancel_id(q) == uuid5(q, "a2a_cancel")
+    assert ids.a2a_cancel_id(q) != ids.a2a_cancel_id(uuid4())
+    with pytest.raises(ValueError):
+        ids.a2a_cancel_id(None)  # type: ignore[arg-type]
+
+
 def test_other_protocol_ids() -> None:
     m = uuid4()
     assert ids.conversation_id(m) == uuid5(m, "conversation")

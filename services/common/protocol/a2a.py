@@ -27,6 +27,7 @@ __all__ = [
     "QuoteRow",
     "error_data",
     "from_a2a_message",
+    "request_hash",
     "task_state",
     "to_a2a_card",
     "to_a2a_message",
@@ -256,9 +257,6 @@ def from_a2a_message(
         if ctx.quote_id is not None:
             body["quote_id"] = str(ctx.quote_id)
 
-    request_hash = hashlib.sha256(
-        json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
     return OutboxArgs(
         message_id=ids.a2a_message_id(sender, a2a_id),
         run_id=ctx.run_id,
@@ -268,8 +266,16 @@ def from_a2a_message(
         to_agent=to_agent,
         type=type_,
         body=body,
-        trace_extra={"request_hash": request_hash},
+        trace_extra={"request_hash": request_hash(data)},
     )
+
+
+def request_hash(data: Any) -> str:
+    """SHA-256 of a client's data part, stored in the `message` trace for the duplicate
+    check of `SendMessage` (§11 step 1)."""
+    return hashlib.sha256(
+        json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 def to_a2a_card(card: AgentCardRow, base_url: str) -> dict[str, Any]:
