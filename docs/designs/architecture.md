@@ -1485,6 +1485,10 @@ provisional shapes in §13 are enough to start every step in mock mode.
     *   `resolve_modes(conn) -> dict[str, Literal["real", "mock"]]` applies the precedence
         in §5. `kroger_ordering` is always `mock`.
     *   `adapter_for(vendor, run_modes)` returns the real or mock adapter class.
+*   **Amended 2026-11-02 (mock events, #47).** Until a vendor's real adapter exists (build
+    step 7), `adapter_for` raises `AdapterFailure("adapter_not_configured",
+    retryable=False)` when that vendor resolves to `real`. It never falls back to the mock
+    (Alternative R).
 
 ##### 6. `services/common/money.py` (Create)
 
@@ -2307,6 +2311,27 @@ and values; none of these may be renamed or dropped.
 *   **Proposed Changes**: Stock, pricing and order placement over `mock_*` rows for the
     call's `env`. They apply active `mock_events` for that `env` (out of stock, kitchen
     overloaded, adapter down). Orders are idempotent on `idempotency_key`.
+*   **Amended 2026-11-02 (mock events, #47).** These rules define the events and stock:
+    *   **Available quantity** of a SKU is `mock_stock.qty`, or 0 while an active
+        `out_of_stock` event for that SKU (`params: {sku}`) targets the card. `quote`
+        marks a line unavailable when the available quantity is below the requested
+        `qty`.
+    *   **`place_order`** decrements `mock_stock.qty` for each line, conditionally
+        (`qty >= requested`), in the same transaction as the `mock_orders` insert. If any
+        line can't be filled, it raises `AdapterFailure("out_of_stock",
+        retryable=False)` and changes nothing. A replay with the same `idempotency_key`
+        returns the stored order and decrements nothing. `eval` stock is restored by
+        `/panel/reset` (§7). `live` stock is restored by `make seed`, which every deploy
+        runs.
+    *   **`kitchen_overloaded`** (restaurant cards, no params): `quote` and `place_order`
+        raise `AdapterFailure("kitchen_overloaded", retryable=False)`. `search_items`
+        still works. The handler treats it as a 4xx (§9: unavailable for this run).
+    *   **`adapter_down`** (any store or restaurant card, no params): every tool of that
+        card's adapter raises `AdapterFailure("adapter_5xx", retryable=True)`. The
+        client retries once with the same key (§9), and then the seller is unavailable
+        for this run.
+    *   An event applies only to the card in `target_agent_id` and to rows with the
+        call's `env`.
 
 ##### 46. `services/mocks/courier.py` (Create)
 
@@ -2739,6 +2764,7 @@ and values; none of these may be renamed or dropped.
     *   `test_panel_override_beats_env` (*db*)
     *   `test_vendor_env_beats_global_mode`
     *   `test_kroger_ordering_always_mock`
+    *   `test_adapter_for_real_without_adapter_not_configured` (amended 2026-11-02, #47)
 *   `test_money.py`: `test_mixed_currency_raises`, `test_minor_unit_arithmetic`.
 *   `test_trace_store.py` (*db*):
     *   `test_write_takes_run_id_per_call`
@@ -2867,6 +2893,8 @@ against every adapter of that interface:
     *   `test_search_shape`
     *   `test_place_order_idempotent`
     *   `test_out_of_stock_event_respected` (mock only)
+    *   `test_place_order_decrements_stock_once` (mock only; amended 2026-11-02, #47)
+    *   `test_adapter_down_event_is_retryable_5xx` (mock only; amended 2026-11-02, #47)
 *   `restaurant` (Square restaurant, mock restaurant):
     *   `test_place_order_idempotent`
     *   `test_capacity_event_respected` (mock only)
