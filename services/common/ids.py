@@ -1,10 +1,11 @@
 """Every shared id and idempotency key (architecture item 4, agent-protocol P6).
 
 All ids are deterministic: they are derived from values passed in and never from random or
-time-based parts, so a replayed step produces the same ids.
+time-based parts, so a replayed step produces the same ids. The one exception is
+`new_run_id`, which is only called once per trigger (see its docstring).
 """
 
-from uuid import UUID, uuid5
+from uuid import UUID, uuid4, uuid5
 
 # Fixed namespaces. Changing either value changes every derived id; never edit them.
 KEY_NAMESPACE = UUID("7ee0682a-39c6-4ff0-90ae-b071ffe25312")
@@ -85,6 +86,21 @@ def shortfall_conversation_id(shortfall_id: UUID) -> UUID:
 def protocol_error_id(refused_message_id: UUID) -> UUID:
     """Id of the `protocol_error` sent back for a refused message."""
     return uuid5(refused_message_id, "protocol_error")
+
+
+def retry_prompt_id(run_id: UUID) -> UUID:
+    """`message_id` of a run's retry prompt (architecture item 4, amended for #36)."""
+    return uuid5(run_id, "retry_prompt")
+
+
+def new_run_id() -> UUID:
+    """A fresh `run_id` for `runs.start()` when the caller has none to derive it from.
+
+    The one random id in this module. A run is started once, inside the transaction that
+    inserts its trigger (an `inbound_messages` row or a `POST /runs` call), so a replay never
+    reaches it. A2A demo runs derive theirs with `a2a_run_id`.
+    """
+    return uuid4()
 
 
 def a2a_message_id(sender: str, a2a_message_id: str) -> UUID:
