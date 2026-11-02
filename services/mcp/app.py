@@ -4,11 +4,13 @@ One Starlette app mounts the five MCP servers at `/mcp/<area>` over streamable H
 `/health`. A middleware stores each request's `Authorization` bearer token for
 `meta.current_token()`.
 
-Run with `python -m services.mcp.app`. It serves on port 8002.
+Run with `python -m services.mcp.app`. It opens the database pool, starts the mock courier
+progression loop and serves on port 8002.
 """
 
+import asyncio
 import contextlib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 
 import uvicorn
 from mcp.server.mcpserver import MCPServer
@@ -19,6 +21,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import BaseRoute, Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from services.common import db
 from services.common import logging as app_logging
 from services.mcp import meta
 from services.mcp.delivery.server import server as delivery
@@ -26,6 +29,7 @@ from services.mcp.grocery.server import server as grocery
 from services.mcp.household.server import server as household
 from services.mcp.knowledge.server import server as knowledge
 from services.mcp.restaurant.server import server as restaurant
+from services.mocks import courier
 
 SERVICE = "mcp"
 PORT = 8002
@@ -94,9 +98,30 @@ def create_app() -> Starlette:
 app = create_app()
 
 
+async def serve(progress: Callable[[], Awaitable[None]] = courier.progress_forever) -> None:
+    """Open the pool, run the mock courier progression loop and serve HTTP until stopped.
+
+    The guarded tools and the mock backends read Postgres through `db.get_pool()`, which is
+    created closed. Mock courier progression is a loop inside `mcp` (architecture §5).
+    """
+    pool = db.get_pool()
+    await pool.open()
+    try:
+        loop = asyncio.create_task(progress())
+        try:
+            server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=PORT, log_config=None))
+            await server.serve()
+        finally:
+            loop.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await loop
+    finally:
+        await pool.close()
+
+
 def main() -> None:
     app_logging.configure(SERVICE)
-    uvicorn.run(app, host="0.0.0.0", port=PORT, log_config=None)
+    asyncio.run(serve())
 
 
 if __name__ == "__main__":

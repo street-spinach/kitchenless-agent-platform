@@ -83,3 +83,50 @@ def test_each_request_carries_its_own_bearer_token(served: str) -> None:
         return seen
 
     assert asyncio.run(go()) == [f"{area}-{n}" for area in AREAS for n in (1, 2)]
+
+
+def test_serve_opens_the_pool_and_runs_courier_progression(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression (#59): `mcp` never opened its pool or started the mock courier loop, so on
+    # the stack every database tool failed and no mock delivery reached `delivered`.
+    events: list[str] = []
+
+    class FakePool:
+        async def open(self) -> None:
+            events.append("pool_open")
+
+        async def close(self) -> None:
+            events.append("pool_close")
+
+    started = asyncio.Event()
+
+    async def progress() -> None:
+        events.append("progress_start")
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            events.append("progress_cancelled")
+            raise
+
+    class FakeServer:
+        def __init__(self, config: uvicorn.Config) -> None:
+            assert config.app is mcp_app.app
+
+        async def serve(self) -> None:
+            await asyncio.wait_for(started.wait(), timeout=5)
+            events.append("served")
+
+    monkeypatch.setattr(mcp_app.db, "get_pool", lambda: FakePool())
+    monkeypatch.setattr(mcp_app.uvicorn, "Server", FakeServer)
+
+    asyncio.run(mcp_app.serve(progress))
+
+    assert events == [
+        "pool_open",
+        "progress_start",
+        "served",
+        "progress_cancelled",
+        "pool_close",
+    ]
