@@ -225,6 +225,12 @@ def a2a_order_id(message_id: UUID) -> UUID:
     return uuid5(message_id, "order")
 
 
+def a2a_cancel_id(quote_id: UUID) -> UUID:
+    """`message_id` of the `cancel` that A2A `CancelTask` sends for `quote_id` (§11). A quote
+    is cancelled at most once, so a repeated `CancelTask` reuses the id and sends nothing."""
+    return uuid5(UUID(_require("quote_id", quote_id)), "a2a_cancel")
+
+
 # Seeded rows (architecture item 55). Seeding twice must give the same rows, so the UUID
 # keys of seeded users and addresses are derived from their seed names.
 NS_SEED = UUID("3a1f7c52-9a0e-4d1b-8f6e-2c4b5d7e9a10")

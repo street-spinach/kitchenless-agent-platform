@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from starlette.testclient import TestClient
 
 from services.agents import host
+from services.agents.a2a.server import A2AServer
 from services.common import directory, runs
 from services.common.consumer import Inbound, StepResult
 from services.common.directory import AgentCard
@@ -121,6 +122,7 @@ def test_serve_passes_runs_finish_to_consumer(monkeypatch: pytest.MonkeyPatch) -
     class FakeServer:
         def __init__(self, config: Any) -> None:
             self.should_exit = False
+            seen["paths"] = {route.path for route in config.app.routes}
 
         async def serve(self) -> None:
             await asyncio.sleep(0)  # let the loops start
@@ -133,6 +135,8 @@ def test_serve_passes_runs_finish_to_consumer(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(host, "consume_forever", consume)
     monkeypatch.setattr(host.sweeper, "sweep_forever", sweep)
     monkeypatch.setattr(host.uvicorn, "Server", FakeServer)
+    a2a = A2AServer(FakePool().connection, token="t")
+    monkeypatch.setattr(host.A2AServer, "from_settings", lambda connect: a2a)
 
     asyncio.run(host.serve({}))
     assert seen["host_process"] == "agents"
@@ -141,6 +145,12 @@ def test_serve_passes_runs_finish_to_consumer(monkeypatch: pytest.MonkeyPatch) -
     assert isinstance(seen["handle"], host.Dispatcher)
     assert set(seen["handle"].cards) == {GROCERY}
     assert seen["closed"] is True
+    # Agent-protocol P18: the A2A routes are mounted on the same app as /health.
+    assert seen["paths"] >= {
+        "/health",
+        "/a2a/{agent_id}",
+        "/a2a/{agent_id}/.well-known/agent-card.json",
+    }
 
 
 def test_health_reports_card_count_and_backlog_unreadable() -> None:
