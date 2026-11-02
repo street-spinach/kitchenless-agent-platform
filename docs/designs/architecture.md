@@ -922,6 +922,8 @@ check.
 
 *Amended 2026-11-02 (agents, #186):* `/panel/reset` also deletes `eval` households' learned dislikes (`member_constraints` rows with `source = 'learned'`) and their `household_rules` rows (agents.md AG-A12). Migration `0012_agents.sql` adds the `household_rules` table and a CHECK that learned rows are dislikes only.
 
+*Amended 2026-11-02 (evals, #142):* the reset also applies a case's `setup` keys from the `SETUP_KEYS` registry in `services/mocks/control.py`, inside the same transaction, and the next reset undoes them; `eval_runs` and `eval_results` are never deleted (evals.md §4, E-A8).
+
 ### 8. Weekly grocery order: end-to-end flow
 
 ```text
@@ -1150,6 +1152,8 @@ G6 measures the **peak** during a full weekly-order run: `docker stats` sampled 
 *   Create `/opt/app/DEPLOY_FREEZE`.
 
 ### 12. What runs where
+
+*Amended 2026-11-02 (evals, #142):* the rows of this table are replaced by evals.md §13 (E-A1). The paragraph below on `reason_counts` and "more than half `model_unavailable`" is replaced by evals.md §5 (outcome) and §8 (triage).
 
 | When | What | Model | Business systems |
 |---|---|---|---|
@@ -1574,6 +1578,8 @@ provisional shapes in §13 are enough to start every step in mock mode.
 
 #### Migrations (`migrations/`, all critical, all additive)
 
+*Amended 2026-11-02 (evals, #142):* `0013_eval_history.sql` adds `eval_runs` and `eval_results` (evals.md §6, E-A14).
+
 Every table below has `created_at timestamptz NOT NULL DEFAULT now()`. Where a schema below
 lists other time columns, it also names `created_at` explicitly, except tables whose own time
 column already records creation (`received_at`, `requested_at`, `started_at`, `ts`). Text enumerations use `CHECK` constraints. Later designs may add columns
@@ -1903,6 +1909,8 @@ and values; none of these may be renamed or dropped.
 
 ##### 22. `services/agents/common/model.py` (Create)
 
+*Amended 2026-11-02 (evals, #142):* in stub mode `_choose` passes `counter_reject=bool(overrides.get("STUB_COUNTER_REJECT"))` to seller stubs that take the keyword (evals.md E-A13).
+
 *   **Type / Scope**: Python module.
 *   **Proposed Changes**: `ModelClient.complete(ctx: RunContext, messages, tools, node, *,
     profile="people") -> ModelResult`, with the modes and profiles in §6.
@@ -2037,6 +2045,8 @@ and values; none of these may be renamed or dropped.
 
 ##### 27. `services/agents/host.py` (Create)
 
+*Amended 2026-11-02 (evals, #142):* `/health` adds `model_mode`, `model_name` and `model_business_name`; `create_app` takes an optional settings argument (evals.md E-A10).
+
 *   **Type / Scope**: Python service entry point (`python -m services.agents.host`).
 *   **Proposed Changes**:
     *   Loads enabled cards with `host_process='agents'` and builds a handler per class.
@@ -2106,6 +2116,8 @@ and values; none of these may be renamed or dropped.
 *Amended 2026-11-02 (agents, #186):* `negotiate` and `choose_offer` decide in code: offers are ranked by items covered, then total; the household counters at most once (`HOUSEHOLD_MAX_COUNTERS = 1`, `MAX_COUNTER_ROUNDS` stays 2), at the remaining budget, only when the runner-up covers as many items. A `needs_approval` refusal at `authorize` routes to `request_approval`. Adds the solo dinner scope, dislike handling and take-turns in `finish` (agents.md §6–§10, AG-A2, AG-A3).
 
 ##### 30. `services/agents/grocery/handler.py`, `services/agents/restaurant/handler.py`, `services/agents/delivery/handler.py` (Create)
+
+*Amended 2026-11-02 (evals, #142):* with `STUB_COUNTER_REJECT: true` on the run, the seller stub's `respond_to_counter` returns `reject` (evals.md E-A13).
 
 *   **Type / Scope**: Stateless handlers with bounded model choices. No LangGraph and no
     memory between messages. Each class adds `services/agents/<class>/stubs.py` (rule
@@ -2217,6 +2229,8 @@ and values; none of these may be renamed or dropped.
 
 ##### 36. `services/api/routes/runs.py` (Create)
 
+*Amended 2026-11-02 (evals, #142):* a `member_message` scenario sends `text` from a named eval member with run kind `chat`; `ALLOWED_OVERRIDES` gains `STUB_COUNTER_REJECT` (evals.md E-A6).
+
 *   **Type / Scope**: Route module, internal (eval runner and control panel).
 *   **Proposed Changes**:
     *   `POST /runs {scenario, household_id, input, overrides?}` returns `{run_id}`.
@@ -2255,6 +2269,8 @@ and values; none of these may be renamed or dropped.
 *   **Amended 2026-11-01 (identity-authz I-A14).** `/me/*` and `/app/*` are no longer reserved; identity-authz's `routes/me.py` and `routes/app.py` serve them.
 
 ##### 39. `services/api/routes/panel.py` and `services/api/whatsapp/{sender,signature}.py` (Create)
+
+*Amended 2026-11-02 (evals, #142):* adds `GET /panel/evals`; `POST /panel/reset` accepts `setup` and `household` (evals.md E-A7, §4, §14).
 
 *   **Type / Scope**: Route module and Python modules.
 *   **Proposed Changes**:
@@ -2461,6 +2477,8 @@ and values; none of these may be renamed or dropped.
 
 ##### 47. `services/mocks/control.py` (Create)
 
+*Amended 2026-11-02 (evals, #142):* the setup-key registry `SETUP_KEYS` lives here; each key is applied inside the reset transaction and undone by the next reset. `eval_runs` and `eval_results` are never in the reset list (evals.md E-A8, §4).
+
 *   **Type / Scope**: Python module.
 *   **Proposed Changes**: Functions called by `services/api/routes/panel.py`:
     `reset(conn, env)`, `inject_event(...)`, `set_mode(vendor, mode)`,
@@ -2572,6 +2590,8 @@ and values; none of these may be renamed or dropped.
 
 ##### 55. `services/seed/__main__.py` and `services/seed/data/*.yaml` (Create)
 
+*Amended 2026-11-02 (evals, #142):* eval member `us-1-b-eval` gains `allergies: [peanuts]`; live households are unchanged. `services.seed.seeded_limits()` returns the seeded budgets and bands (evals.md E-A9).
+
 *   **Type / Scope**: Seed script, `python -m services.seed [--env live|eval|all]`. Running
     it twice gives the same result.
 *   **Proposed Changes**:
@@ -2613,6 +2633,8 @@ and values; none of these may be renamed or dropped.
 #### Infrastructure (critical)
 
 ##### 56. `infra/docker-compose.yml` (Modify, critical)
+
+*Amended 2026-11-02 (evals, #142):* `testrunner` gains `GIT_SHA`, `EVAL_DEADLINE_SECONDS` and `RUN_TOKEN_CEILING` (evals.md E-A11).
 
 *   **Type / Scope**: Compose file.
 *   **Proposed Changes**:
@@ -2694,6 +2716,8 @@ and values; none of these may be renamed or dropped.
 
 ##### 63. `.github/workflows/ci.yml` (Modify, critical)
 
+*Amended 2026-11-02 (evals, #142):* the eval job uses this item's eight-path filter, sets `MODEL_MODE=stub`, passes no `MUSE_API_KEY` or other model key, seeds the eval households before `make eval-fast`, and uploads the results as an artifact and job summary (evals.md E-A2).
+
 *   **Type / Scope**: GitHub workflow.
 *   **Proposed Changes**:
     *   The `test` job adds a `postgres:16` service (with pgvector) and sets `DATABASE_URL`,
@@ -2706,6 +2730,8 @@ and values; none of these may be renamed or dropped.
 
 ##### 64. `.github/workflows/nightly-evals.yml` (Modify, critical)
 
+*Amended 2026-11-02 (evals, #142):* replaced by evals.md §8 and §10: one eval run a night through `make eval-nightly`, the outcome read from the `EVAL_STATUS` line, real mode entered and restored through `infra/eval-mode.sh`, one open issue per class. `MODEL_MODE` is no longer set for `testrunner` (E-A3).
+
 *   **Type / Scope**: GitHub workflow.
 *   **Proposed Changes**:
     *   On the VM: exit 0 if `/opt/app/DEPLOY_FREEZE` exists. Otherwise run `make
@@ -2716,6 +2742,8 @@ and values; none of these may be renamed or dropped.
 #### Evals and tests
 
 ##### 65. `evals/run.py` (Modify, critical)
+
+*Amended 2026-11-02 (evals, #142):* cases use the format of evals.md §4; a `checks:` entry such as `run_status(error, no_offers)` is written `expect: [{check: run_status, args: {status: error, reason: no_offers}}]` (E-A4). The runner contract is evals.md §5.
 
 *   **Type / Scope**: Eval runner.
 *   **Proposed Changes**:
@@ -2733,6 +2761,8 @@ and values; none of these may be renamed or dropped.
         of agent-protocol P38.
 
 ##### 66. `evals/checks.py` (Modify, critical)
+
+*Amended 2026-11-02 (evals, #142):* every check declares `invariant` (evals.md §5; undeclared counts as invariant). `model_judge` is not built (evals.md E-A5, E-OD9).
 
 *   **Type / Scope**: Eval checks.
 *   **Proposed Changes**: Add checks only; existing checks are unchanged. Each reads the
@@ -2835,6 +2865,8 @@ and values; none of these may be renamed or dropped.
 
 ##### 73. `Makefile` (Modify, critical)
 
+*Amended 2026-11-02 (evals, #142):* a new target `eval-nightly` runs `infra/eval-nightly.sh`; `eval-full` is unchanged (evals.md E-A15).
+
 *   **Type / Scope**: Build commands.
 *   **Proposed Changes**:
     *   `seed`: `$(COMPOSE) run --rm testrunner python -m services.seed $(SEED_ARGS)`.
@@ -2846,6 +2878,8 @@ and values; none of these may be renamed or dropped.
     *   No target sets `MODEL_MODE`; Compose and `deploy.sh` do.
 
 ### Environment matrix
+
+*Amended 2026-11-02 (evals, #142):* `testrunner` gains `GIT_SHA`, `EVAL_DEADLINE_SECONDS` and `RUN_TOKEN_CEILING`; `REAL_EVALS_ENABLED` is read on the VM host only, by `infra/eval-nightly.sh` (evals.md E-A11).
 
 "All app" means `api`, `agents`, `mcp` and `testrunner`.
 
@@ -3038,6 +3072,8 @@ against every adapter of that interface:
 **Scenario**: `test_weekly_order_completes_in_mock_mode`.
 
 ### Eval cases
+
+*Amended 2026-11-02 (evals, #142):* case files use evals.md §4's format (E-A4). The `explanation-store-choice` case below is replaced by evals.md §12 case 10, same id, checked by `explanation_within_limits`; #64 does not create it (E-A5).
 
 Each case is a YAML file. The shape:
 
