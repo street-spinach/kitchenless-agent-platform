@@ -54,6 +54,9 @@ _OPEN_STATUSES = ("running", "awaiting_approval")
 # `delivery_agent_id` means the order reached `placed` even if it later `failed`.
 _PLACED_OR_LATER = ("placed", "courier_booked", "in_delivery", "delivered")
 A2A_DEMO = "a2a_demo"
+# Runs a person never retries (experience EX-A16): code-only replies, JOIN, `ob:` taps,
+# `/me` POSTs and reminders. They are skipped, so they never hide a failed run (EX-A15).
+_NOT_RETRY_SOURCES = ("code", "join", "tap", "me", "reminder")
 RETRY_WINDOW = "24 hours"
 
 # `TraceStore.write(..., conn=...)` never touches the pool.
@@ -83,6 +86,8 @@ SELECT r.run_id, r.status,
                AND (o.state IN {_PLACED_OR_LATER!r} OR o.delivery_agent_id IS NOT NULL))
 FROM runs r
 WHERE r.trigger->>'user_id' = %s AND r.started_at > now() - interval '{RETRY_WINDOW}'
+  AND r.household_id IS NOT NULL
+  AND coalesce(r.trigger->>'source', '') NOT IN {_NOT_RETRY_SOURCES!r}
 ORDER BY r.started_at DESC
 LIMIT 1
 """
@@ -224,7 +229,8 @@ async def is_ended(conn: AsyncConnection, run_id: uuid.UUID) -> bool:
 
 async def retry_target(conn: AsyncConnection, user_id: uuid.UUID) -> uuid.UUID | None:
     """The user's latest run in the last 24 h if it ended `error` or `timeout` and its order
-    never reached `placed`; otherwise `None` (architecture §9 "Retry")."""
+    never reached `placed`; otherwise `None` (architecture §9 "Retry"). Runs with no
+    household or a `trigger.source` in `_NOT_RETRY_SOURCES` are skipped (experience EX-A16)."""
     cur = await conn.execute(_RETRY_TARGET_SQL, (str(user_id),))
     row = await cur.fetchone()
     if row is None:

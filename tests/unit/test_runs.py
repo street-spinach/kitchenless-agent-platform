@@ -321,6 +321,47 @@ def test_retry_target_none_after_24_hours(world: str) -> None:
     assert _run(world, lambda conn: runs.retry_target(conn, USER)) is None
 
 
+def _source_run(pg: str, source: str, status: str, *, household_id: str | None) -> uuid.UUID:
+    trigger = {"source": source, "user_id": str(USER)}
+    run_id = _start(pg, kind="chat", household_id=household_id, trigger=trigger)
+    assert _finish(pg, run_id, runs.RUNS_AGENT, status, "model_unavailable")
+    return run_id
+
+
+def test_code_only_run_not_retry_target(world: str) -> None:
+    # Experience EX-A16: a failed code-only run (no household) is never the target.
+    _source_run(world, "code", "error", household_id=None)
+    assert _run(world, lambda conn: runs.retry_target(conn, USER)) is None
+
+    # A finished code-only run does not hide the failed run before it (EX-A15).
+    failed = _ended_error_run(world)
+    _source_run(world, "code", "completed", household_id=None)
+    assert _run(world, lambda conn: runs.retry_target(conn, USER)) == failed
+
+
+def test_reminder_never_retry_target(world: str) -> None:
+    for status in ("error", "timeout"):
+        _source_run(world, "reminder", status, household_id=None)
+        assert _run(world, lambda conn: runs.retry_target(conn, USER)) is None
+
+
+def test_tap_run_not_retry_target(world: str) -> None:
+    # An `ob:` tap run has a household but is still never the target.
+    _source_run(world, "tap", "error", household_id=HOUSEHOLD_ID)
+    assert _run(world, lambda conn: runs.retry_target(conn, USER)) is None
+
+
+def test_failed_chat_run_still_retry_target(world: str) -> None:
+    failed = _ended_error_run(world)
+    for source in ("code", "join", "tap", "me", "reminder"):
+        household_id = None if source in ("code", "reminder") else HOUSEHOLD_ID
+        _source_run(world, source, "error", household_id=household_id)
+        _source_run(world, source, "completed", household_id=household_id)
+    # A run with no household and no excluded source is skipped too.
+    _source_run(world, "whatsapp", "error", household_id=None)
+    assert _run(world, lambda conn: runs.retry_target(conn, USER)) == failed
+
+
 def test_retry_starts_new_run_with_retry_of(world: str) -> None:
     old = _ended_error_run(world)
     target = _run(world, lambda conn: runs.retry_target(conn, USER))
