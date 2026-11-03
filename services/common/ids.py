@@ -477,6 +477,18 @@ def new_join_code() -> str:
     return "".join(secrets.choice(_JOIN_ALPHABET) for _ in range(8))
 
 
+def parse_join_text(text: str) -> str | None:
+    """The code in a `JOIN <code>` message (§7: case-insensitive, trimmed), upper-cased, or
+    `None` if the text is not one."""
+    if not isinstance(text, str):
+        return None
+    parts = text.split()
+    if len(parts) != 2 or parts[0].lower() != "join":
+        return None
+    code = parts[1].upper()
+    return code if len(code) == 8 and all(c in _JOIN_ALPHABET for c in code) else None
+
+
 def _int_id(name: str, value: object) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
         raise ValueError(f"{name} must be an int, got {value!r}")
