@@ -2,7 +2,8 @@
 
 All ids are deterministic: they are derived from values passed in and never from random or
 time-based parts, so a replayed step produces the same ids. The exceptions are the only
-random ids: `new_run_id`, `new_eval_run_id` and `new_join_code` (see their docstrings).
+random ids: `new_run_id`, `new_eval_run_id`, `new_join_code`, `new_grant_id` and
+`new_token_id` (see their docstrings).
 """
 
 import base64
@@ -41,6 +42,15 @@ def keycloak_client_id(agent_id: str) -> str:
     if ":" in name:
         raise ValueError(f"agent name must not contain ':', got {agent_id!r}")
     return f"{agent_class}.{name}"
+
+
+def agent_id_from_client_id(client_id: str) -> str:
+    """The inverse of `keycloak_client_id`: replaces only the first `.`, so
+    `consumer.us-1.2` maps back to `consumer:us-1.2` (identity-authz I1)."""
+    agent_class, sep, name = _require("client_id", client_id).partition(".")
+    if not sep or not agent_class or not name or ":" in client_id:
+        raise ValueError(f"client_id must be '<class>.<name>', got {client_id!r}")
+    return f"{agent_class}:{name}"
 
 
 def thread_id(agent_id: str, run_id: UUID) -> str:
@@ -289,6 +299,30 @@ def seed_user_id(member_id: str) -> UUID:
 def seed_address_ref(household_id: str) -> UUID:
     """`address_ref` of a seeded household's one address."""
     return uuid5(NS_SEED, f"address|{_require('household_id', household_id)}")
+
+
+def seed_grant_id(agent_id: str, user_id: UUID) -> UUID:
+    """`grant_id` of a seeded mock grant (identity-authz I27), so the seed renews the same
+    row on every run."""
+    return uuid5(NS_SEED, f"grant|{_require('agent_id', agent_id)}|{_require('user_id', user_id)}")
+
+
+def new_grant_id() -> UUID:
+    """A fresh `grant_id` for `grants.create` (identity-authz I4).
+
+    One of the random ids in this module. A grant is created once, from one consent; a
+    later consent is a new grant that replaces it, never a replay of the same one.
+    """
+    return uuid4()
+
+
+def new_token_id() -> str:
+    """A fresh `jti` for a signed token or client assertion (identity-authz I3, I4).
+
+    One of the random ids in this module: a `jti` must never repeat, and a token is
+    minted, not replayed.
+    """
+    return str(uuid4())
 
 
 # Experience EX-I5 (docs/designs/experience.md §5, §9, §10, §11).

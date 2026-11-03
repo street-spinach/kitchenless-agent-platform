@@ -14,17 +14,11 @@ from services.agents.common.model import ModelResult, check_rationale
 from services.agents.household import graph as hg
 from services.agents.household import stubs
 from services.common.consumer import RunFinish
-from services.identity import tokens
 from tests.unit import model_fakes as mf
-from tests.unit.test_household_graph import LABELS, NOW, SECRET, World
+from tests.unit.test_household_graph import LABELS, NOW, World
 
 BEST = "grocery:square-us"
 RUNNER_UP = "grocery:mock-us"
-
-
-@pytest.fixture(autouse=True)
-def _secret(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(tokens, "_secret", lambda: SECRET)
 
 
 class SlowModel:
@@ -84,7 +78,6 @@ class ExplainWorld(World):
             load_members=self.load_members,
             find_sellers=self.find_sellers,
             call_tool=self.household,
-            issue_token=_issue,
             clock=lambda: NOW,
             sleep=self.sleep,
             load_whatsapp_members=self.load_whatsapp_members,
@@ -99,10 +92,6 @@ class ExplainWorld(World):
         self.order_update("order_confirm", "placed", BEST)
         self.order_update("order_status", "in_delivery", "system:api")
         return self.order_update("order_status", "delivered", "system:api")
-
-
-def _issue(sub: str, act: str, scopes: Any) -> str:
-    return tokens.MockIssuer(secret=SECRET).issue(sub, act, list(scopes))
 
 
 def _explanations(w: World) -> list[dict[str, Any]]:

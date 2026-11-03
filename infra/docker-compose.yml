@@ -22,7 +22,6 @@ x-env-app: &env-app # all app
   APPROVAL_TTL_SECONDS: ${APPROVAL_TTL_SECONDS:-14400}
   RUN_TIMEOUT_SECONDS: ${RUN_TIMEOUT_SECONDS:-300}
   QUOTE_ROUND_SECONDS: ${QUOTE_ROUND_SECONDS:-30}
-  MOCK_TOKEN_SECRET: ${MOCK_TOKEN_SECRET}
 
 x-env-modes: &env-modes # api, testrunner
   MODE: ${MODE:-mock}

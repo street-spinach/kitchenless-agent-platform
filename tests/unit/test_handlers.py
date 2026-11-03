@@ -101,7 +101,6 @@ class World:
             traces=self.traces,
             store=self.store,
             call_tool=self.seller,
-            issue_token=lambda sub, act, scopes: f"token:{sub}:{act}",
             clock=lambda: NOW,
             offer_ttl_seconds=600,
         )
@@ -344,9 +343,9 @@ def test_restaurant_guidance_reaches_choose_with_dish() -> None:
     w = World()
     recorder = mf.RecordingChooser(w.handler.model)
 
-    async def call_tool(server: str, tool: str, args: dict, *, ctx: Any, token: str) -> dict:
+    async def call_tool(server: str, tool: str, args: dict, *, ctx: Any) -> dict:
         assert server == "restaurant"
-        return await w.seller("grocery", tool, args, ctx=ctx, token=token)
+        return await w.seller("grocery", tool, args, ctx=ctx)
 
     w.handler = SellerHandler(
         "restaurant",
@@ -354,7 +353,6 @@ def test_restaurant_guidance_reaches_choose_with_dish() -> None:
         traces=w.traces,
         store=w.store,
         call_tool=call_tool,
-        issue_token=lambda sub, act, scopes: f"token:{sub}:{act}",
         clock=lambda: NOW,
         offer_ttl_seconds=600,
     )

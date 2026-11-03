@@ -6,9 +6,11 @@ rules are shared by both `env` values and always written; `--env` picks which ho
 which `mock_stock` env are written. Exits non-zero on any failure, so the deploy rolls back
 (§9).
 
-OpenFGA tuples are not written here: the model and its tuples belong to identity-authz §7
-(architecture item 54, amended by I-A3), and the seed's FGA step (`fga.reconcile`) lands with
-identity-authz I27.
+Identity (identity-authz I27, build step 5): members get `users.keycloak_sub` from their
+`keycloak_user_id`; every seeded agent and `system:api` get an `agent_clients` row; eval
+households always, and simulated households under `TOKEN_SOURCE=mock`, get mock grants
+renewed to 30 days on every run. `main` then calls `seed_fga`: `fga.sync_agent` for every
+seeded agent, then `fga.reconcile()`.
 """
 
 import argparse
@@ -25,6 +27,8 @@ from psycopg.types.json import Jsonb
 
 from services.common import ids, pantry, vendors
 from services.common.directory import AgentCard
+from services.identity import grants
+from services.safety.scope import unscoped
 from services.seed import DATA_DIR, mock_stock_rows
 
 ENVS = ("live", "eval", "all")
@@ -39,6 +43,26 @@ _KEY_CHECK_TOOL = {
     "restaurant": "search_items",
     "delivery": "quote_delivery",
 }
+
+
+# Identity (identity-authz §3, §6, I27).
+MOCK_TOKEN_SOURCE = "mock"
+API_AGENT = "system:api"
+API_CLIENT = "svc.api"
+PEOPLE_CLASSES = {"consumer": "people", "household": "people"}
+# Mock grants hold no offline token: placeholder bytes, key version 0 (no key holds it).
+MOCK_GRANT_CIPHERTEXT = b"mock-grant"
+MOCK_GRANT_KEY_VERSION = 0
+
+_MOCK_GRANT_SQL = f"""
+INSERT INTO agent_grants (grant_id, agent_id, agent_kind, user_id, consented_by, household_id,
+                          scopes, refresh_ciphertext, key_version, expires_at)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, {MOCK_GRANT_KEY_VERSION},
+        now() + make_interval(days => %s))
+ON CONFLICT (grant_id) DO UPDATE SET
+  scopes = EXCLUDED.scopes, status = 'active', expires_at = EXCLUDED.expires_at,
+  revoked_at = NULL, revoked_by = NULL, revoke_reason = NULL
+"""
 
 
 class SeedError(RuntimeError):
@@ -182,7 +206,7 @@ def _upsert(conn: psycopg.Connection, table: str, key: Sequence[str], row: dict[
         if updates
         else "DO NOTHING"
     )
-    conn.execute(
+    unscoped(conn, "seed").execute(
         f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({', '.join(['%s'] * len(cols))})"
         f" ON CONFLICT ({', '.join(key)}) {action}",
         [Jsonb(v) if isinstance(v, dict) else v for v in row.values()],
@@ -285,7 +309,10 @@ def _seeded_prices(data: dict[str, Any], agent_id: str) -> dict[str, int]:
 
 
 def _seed_household(
-    conn: psycopg.Connection, hh: dict[str, Any], us1_phones: list[str] | None
+    conn: psycopg.Connection,
+    hh: dict[str, Any],
+    us1_phones: list[str] | None,
+    token_source: str = MOCK_TOKEN_SOURCE,
 ) -> None:
     hid = hh["household_id"]
     _upsert(
@@ -339,7 +366,12 @@ def _seed_household(
             conn,
             "users",
             ["user_id"],
-            {"user_id": user_id, "display_name": m["member_id"]},
+            {
+                "user_id": user_id,
+                "display_name": m["member_id"],
+                # The token `sub` of this person (identity-authz §3, I27).
+                "keycloak_sub": str(m["keycloak_user_id"]),
+            },
         )
         _upsert(
             conn,
@@ -348,7 +380,7 @@ def _seed_household(
             {"household_id": hid, "user_id": user_id, "role": m["role"]},
         )
         for code in m.get("allergies", []):
-            conn.execute(
+            unscoped(conn, "seed").execute(
                 "INSERT INTO member_constraints (user_id, kind, value, source)"
                 " SELECT %s, 'allergy', %s, 'seed' WHERE NOT EXISTS ("
                 "  SELECT 1 FROM member_constraints"
@@ -375,12 +407,98 @@ def _seed_household(
                 {"phone_e164": phone, "user_id": user_id, "channel_mode": mode},
             )
             # Seeded phones start inside the WhatsApp window (experience EX-A4, EX-I11).
-            conn.execute(
+            unscoped(conn, "seed").execute(
                 "UPDATE channel_identities SET last_inbound_at = now() WHERE phone_e164 = %s",
                 (phone,),
             )
         _people_card(conn, f"consumer:{m['member_id']}", "consumer", f"user:{user_id}", hh)
     _people_card(conn, f"household:{hid}", "household", f"household:{hid}", hh)
+    if _gets_mock_grants(hh, token_source):
+        _seed_mock_grants(conn, hh)
+
+
+def _gets_mock_grants(hh: dict[str, Any], token_source: str) -> bool:
+    """Eval households always; simulated households (no real phones) only under
+    `TOKEN_SOURCE=mock` (identity-authz I27, I-D24). The real household (`phones_from_env`)
+    consents through links."""
+    if hh["env"] == "eval":
+        return True
+    return token_source == MOCK_TOKEN_SOURCE and not hh.get("phones_from_env")
+
+
+def _seed_mock_grants(conn: psycopg.Connection, hh: dict[str, Any]) -> None:
+    """Upsert one active mock grant per people agent of `hh`, expiring 30 days from now.
+
+    The household agent's grant holder is the approver; a consumer agent's is its member,
+    consented by the approver for a child. A grant whose agent (and person) already has
+    another active grant, for example a real consent, is left alone.
+    """
+    hid = hh["household_id"]
+    approver = next(m for m in hh["members"] if m.get("approver"))
+    admin_id = ids.seed_user_id(approver["member_id"])
+    rows = [(f"household:{hid}", "household", admin_id, admin_id)]
+    for m in hh["members"]:
+        user_id = ids.seed_user_id(m["member_id"])
+        consented_by = admin_id if m["role"] == "child" else user_id
+        rows.append((f"consumer:{m['member_id']}", "consumer", user_id, consented_by))
+    q = unscoped(conn, "seed")
+    for agent_id, kind, user_id, consented_by in rows:
+        grant_id = ids.seed_grant_id(agent_id, user_id)
+        other = q.execute(
+            "SELECT 1 FROM agent_grants WHERE agent_id = %s AND status = 'active'"
+            " AND grant_id <> %s AND (agent_kind = 'household' OR user_id = %s)",
+            (agent_id, grant_id, user_id),
+        ).fetchone()
+        if other is not None:
+            continue
+        q.execute(
+            _MOCK_GRANT_SQL,
+            (
+                grant_id,
+                agent_id,
+                kind,
+                user_id,
+                consented_by,
+                hid,
+                list(grants.CLASS_SCOPES[kind]),
+                MOCK_GRANT_CIPHERTEXT,
+                grants.GRANT_DAYS,
+            ),
+        )
+
+
+def _seed_agent_clients(conn: psycopg.Connection) -> None:
+    """One `agent_clients` row per seeded agent card and for `system:api` (identity-authz
+    §3, I27): people agents are `people`, business agents `service`."""
+    cards = conn.execute(
+        "SELECT agent_id, class FROM agent_cards"
+        " WHERE class IN ('consumer', 'household', 'grocery', 'restaurant', 'delivery')"
+    ).fetchall()
+    rows = [
+        (agent_id, ids.keycloak_client_id(agent_id), PEOPLE_CLASSES.get(cls, "service"))
+        for agent_id, cls in cards
+    ]
+    rows.append((API_AGENT, API_CLIENT, "service"))
+    for agent_id, client_id, kind in rows:
+        _upsert(
+            conn,
+            "agent_clients",
+            ["agent_id"],
+            {"agent_id": agent_id, "client_id": client_id, "kind": kind},
+        )
+
+
+def seed_fga(conn: psycopg.Connection) -> None:
+    """Write the structural OpenFGA tuples of every seeded agent, then reconcile the store
+    with Postgres (identity-authz §7, I27)."""
+    from services.identity import fga
+
+    agents = conn.execute(
+        "SELECT agent_id FROM agent_cards WHERE enabled ORDER BY agent_id"
+    ).fetchall()
+    for (agent_id,) in agents:
+        fga.sync_agent(conn, agent_id)
+    fga.reconcile(conn)
 
 
 def _people_card(
@@ -422,8 +540,13 @@ def seed(
     *,
     us1_phones: list[str] | None = None,
     data: dict[str, Any] | None = None,
+    token_source: str = MOCK_TOKEN_SOURCE,
 ) -> None:
-    """Write the seed rows for `env` in one transaction on `conn`."""
+    """Write the seed rows for `env` in one transaction on `conn`.
+
+    `token_source` is `TOKEN_SOURCE`: simulated households get mock grants only under
+    `mock` (identity-authz I27). OpenFGA tuples are written afterwards by `seed_fga`.
+    """
     if env not in ENVS:
         raise SeedError(f"--env must be one of {ENVS}, got {env!r}")
     data = load_data() if data is None else data
@@ -432,7 +555,8 @@ def seed(
         _seed_business(conn, data)
         for hh in data["households"]:
             if hh["env"] in envs:
-                _seed_household(conn, hh, us1_phones)
+                _seed_household(conn, hh, us1_phones, token_source)
+        _seed_agent_clients(conn)
         _seed_mock_stock(conn, data, envs)
 
 
@@ -488,7 +612,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not (settings.neo4j_uri and settings.neo4j_user and settings.neo4j_password):
             raise SeedError("NEO4J_URI, NEO4J_USER and NEO4J_PASSWORD are required")
         with psycopg.connect(settings.database_url) as conn:
-            seed(conn, args.env, us1_phones=us1_phones, data=data)
+            seed(
+                conn,
+                args.env,
+                us1_phones=us1_phones,
+                data=data,
+                token_source=settings.token_source or MOCK_TOKEN_SOURCE,
+            )
+            seed_fga(conn)
         load_graph(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password, data["off"])
     except Exception as exc:  # noqa: BLE001 - any failure must exit non-zero (§9)
         print(f"seed failed: {type(exc).__name__}: {exc}", file=sys.stderr)

@@ -56,9 +56,10 @@ class FakeSeller:
     def of(self, tool: str) -> list[dict[str, Any]]:
         return [c for c in self.calls if c["tool"] == tool]
 
-    async def __call__(self, server: str, tool: str, args: dict, *, ctx: Any, token: str) -> dict:
+    async def __call__(self, server: str, tool: str, args: dict, *, ctx: Any) -> dict:
+        # No `token` argument: `call_tool_as` obtains it (identity-authz I6).
         assert server == "grocery"
-        self.calls.append({"tool": tool, "args": args, "ctx": ctx, "token": token})
+        self.calls.append({"tool": tool, "args": args, "ctx": ctx})
         if tool == "search_items":
             words = args["query"].lower().split()
             banned = set(args["filters"].get("allergen_codes") or [])

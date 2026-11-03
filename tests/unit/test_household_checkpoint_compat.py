@@ -10,16 +10,13 @@ import asyncio
 import uuid
 from typing import Any
 
-import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
 from services.agents.household import graph as hg
 from services.common import ids
 from services.common.consumer import RunFinish
-from services.identity import tokens
 from tests.unit.test_household_graph import (
     HOUSEHOLD,
-    SECRET,
     FakeHousehold,
     World,
     _awaiting_approval,
@@ -69,11 +66,6 @@ TODAY_KEYS = (
     "finish",
     "sent",
 )
-
-
-@pytest.fixture(autouse=True)
-def _secret(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(tokens, "_secret", lambda: SECRET)
 
 
 def test_paused_approval_resumes_on_a_fresh_graph() -> None:

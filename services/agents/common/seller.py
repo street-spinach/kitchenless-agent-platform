@@ -79,7 +79,6 @@ from services.common.consumer import (
 from services.common.directory import AgentCard
 from services.common.mcp_client import ToolRefused
 from services.common.run_context import RunContext
-from services.identity.tokens import MockIssuer
 
 __all__ = [
     "A2A_DEMO_BUYER",
@@ -214,7 +213,6 @@ class SellerStore(Protocol):
 
 
 CallTool = Callable[..., Awaitable[dict[str, Any]]]
-IssueToken = Callable[[str, str, Sequence[str]], str]
 Clock = Callable[[], datetime]
 
 
@@ -234,11 +232,6 @@ class TraceSink(Protocol):
     async def write(
         self, run_id: Any, agent_id: str, kind: str, payload: dict[str, Any], **cols: Any
     ) -> int: ...
-
-
-def _mock_token(sub: str, act: str, scopes: Sequence[str]) -> str:
-    # Every run uses the mock issuer until identity-authz replaces the token source (Q4).
-    return MockIssuer().issue(sub, act, list(scopes))
 
 
 def _now() -> datetime:
@@ -402,8 +395,7 @@ class SellerHandler:
         model: Chooser,
         traces: TraceSink,
         store: SellerStore,
-        call_tool: CallTool = mcp_client.call_tool,
-        issue_token: IssueToken = _mock_token,
+        call_tool: CallTool = mcp_client.call_tool_as,
         clock: Clock = _now,
         offer_ttl_seconds: int | None = None,
         shortfall_reply_seconds: int | None = None,
@@ -413,7 +405,6 @@ class SellerHandler:
         self.traces = traces
         self.store = store
         self.call_tool = call_tool
-        self.issue_token = issue_token
         self.clock = clock
         self.offer_ttl = timedelta(
             seconds=offer_ttl_seconds
@@ -444,11 +435,9 @@ class SellerHandler:
     async def _tool(
         self, step: _Step, name: str, args: dict[str, Any], conversation_id: UUID | None = None
     ) -> dict[str, Any]:
-        # A seller acts for its own org with a service token (identity-authz §8 step 1b).
-        token = self.issue_token(step.card.owner_ref, step.card.agent_id, ())
-        return await self.call_tool(
-            self.area, name, args, ctx=self._ctx(step, conversation_id), token=token
-        )
+        # A seller acts for its own org with a service token (identity-authz §8 step 1b);
+        # `call_tool_as` obtains it.
+        return await self.call_tool(self.area, name, args, ctx=self._ctx(step, conversation_id))
 
     async def _decision(self, step: _Step, node: str, choice: str) -> None:
         await self.traces.write(

@@ -32,11 +32,13 @@ from services.common.config import Settings, get_settings
 __all__ = [
     "ALWAYS_MOCK",
     "NOT_CONFIGURED",
+    "MOCK_TOKEN_SOURCE",
     "VENDORS",
     "Mode",
     "adapter_for",
     "pin_for_env",
     "resolve_modes",
+    "token_source",
 ]
 
 Mode = Literal["real", "mock"]
@@ -104,6 +106,18 @@ async def resolve_modes(conn: AsyncConnection) -> dict[str, Mode]:
         else:
             modes[vendor] = default
     return modes
+
+
+MOCK_TOKEN_SOURCE = "mock"
+
+
+def token_source(env: str) -> str:
+    """The token source of a run (identity-authz §12, I-D24): `mock` for an `eval`
+    household's run, otherwise `TOKEN_SOURCE` (default `mock`). `runs.start` records it in
+    `runs.modes["token_source"]`."""
+    if env == "eval":
+        return MOCK_TOKEN_SOURCE
+    return get_settings().token_source or MOCK_TOKEN_SOURCE
 
 
 def pin_for_env(modes: dict[str, Mode], env: str) -> dict[str, Mode]:

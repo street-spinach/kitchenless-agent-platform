@@ -30,6 +30,7 @@ from psycopg.types.json import Jsonb
 from services.common import directory, dislikes, ids, pantry, vendors
 from services.common.config import get_settings
 from services.common.modes import ALWAYS_MOCK, VENDORS
+from services.safety.scope import unscoped
 from services.seed import household_envs, mock_stock_rows, seeded_limits
 
 __all__ = [
@@ -132,7 +133,7 @@ _EVAL_ONLY = "household_id IN (SELECT household_id FROM households WHERE env = '
 
 
 async def _apply_budget(conn: AsyncConnection, household_id: str, value: int) -> None:
-    cur = await conn.execute(
+    cur = await unscoped(conn, "control.reset").execute(
         "UPDATE budgets SET amount_minor = %s"
         f" WHERE household_id = %s AND period = 'weekly' AND {_EVAL_ONLY}",
         (value, household_id),
@@ -147,7 +148,7 @@ async def _undo_budget(
     value = seeded["weekly_budget_minor"]
     if value is None:  # the seed writes no budget row, and apply never creates one
         return
-    await conn.execute(
+    await unscoped(conn, "control.reset").execute(
         "UPDATE budgets SET amount_minor = %s"
         f" WHERE household_id = %s AND period = 'weekly' AND {_EVAL_ONLY}",
         (value, household_id),
@@ -155,7 +156,7 @@ async def _undo_budget(
 
 
 async def _apply_per_order(conn: AsyncConnection, household_id: str, value: int) -> None:
-    cur = await conn.execute(
+    cur = await unscoped(conn, "control.reset").execute(
         f"UPDATE approval_rules SET per_order_minor = %s WHERE household_id = %s AND {_EVAL_ONLY}",
         (value, household_id),
     )
@@ -166,7 +167,7 @@ async def _apply_per_order(conn: AsyncConnection, household_id: str, value: int)
 async def _undo_per_order(
     conn: AsyncConnection, household_id: str, seeded: Mapping[str, int | None]
 ) -> None:
-    await conn.execute(
+    await unscoped(conn, "control.reset").execute(
         f"UPDATE approval_rules SET per_order_minor = %s WHERE household_id = %s AND {_EVAL_ONLY}",
         (seeded["per_order_minor"], household_id),
     )
@@ -190,7 +191,7 @@ async def _apply_dislikes(
 ) -> None:
     for member_id, values in value.items():
         user_id = ids.seed_user_id(member_id)
-        cur = await conn.execute(
+        cur = await unscoped(conn, "control.reset").execute(
             f"SELECT 1 FROM household_members WHERE user_id = %s AND household_id = %s"
             f" AND {_EVAL_ONLY}",
             (user_id, household_id),
@@ -198,7 +199,7 @@ async def _apply_dislikes(
         if await cur.fetchone() is None:
             raise ControlRefused(f"dislikes: {member_id} is not a member of {household_id}")
         for v in values:
-            await conn.execute(
+            await unscoped(conn, "control.reset").execute(
                 "INSERT INTO member_constraints (user_id, kind, value, source)"
                 " VALUES (%s, 'dislike', %s, 'learned')"
                 " ON CONFLICT (user_id, value) WHERE source = 'learned' DO NOTHING",
@@ -210,7 +211,7 @@ async def _undo_dislikes(
     conn: AsyncConnection, household_id: str, seeded: Mapping[str, int | None]
 ) -> None:
     # The reset's deletes already removed these (AG-A12); this keeps the key self-contained.
-    await conn.execute(
+    await unscoped(conn, "control.reset").execute(
         "DELETE FROM member_constraints WHERE source = 'learned' AND user_id IN"
         f" (SELECT user_id FROM household_members WHERE household_id = %s AND {_EVAL_ONLY})",
         (household_id,),
@@ -218,7 +219,7 @@ async def _undo_dislikes(
 
 
 async def _apply_take_turns(conn: AsyncConnection, household_id: str, value: bool) -> None:
-    cur = await conn.execute(
+    cur = await unscoped(conn, "control.reset").execute(
         "INSERT INTO household_rules (household_id, take_turns)"
         f" SELECT household_id, %s FROM households WHERE household_id = %s AND {_EVAL_ONLY}"
         " ON CONFLICT (household_id) DO UPDATE"
@@ -233,7 +234,7 @@ async def _undo_take_turns(
     conn: AsyncConnection, household_id: str, seeded: Mapping[str, int | None]
 ) -> None:
     # The reset's deletes already removed these (AG-A12); this keeps the key self-contained.
-    await conn.execute(
+    await unscoped(conn, "control.reset").execute(
         f"DELETE FROM household_rules WHERE household_id = %s AND {_EVAL_ONLY}",
         (household_id,),
     )
@@ -284,7 +285,7 @@ async def _apply_pantry(
     checked = _check_pantry("pantry", value)
     for item, entries in checked.items():
         for entry in entries:
-            cur = await conn.execute(
+            cur = await unscoped(conn, "control.reset").execute(
                 "INSERT INTO pantry_events"
                 " (household_id, item, pantry_item, kind, delta, unit, source, ts)"
                 " SELECT household_id, %s, %s, %s, 0, 'each', 'eval_setup',"
@@ -361,12 +362,12 @@ async def reset(
     eval_households = sorted(h for h, e in household_envs().items() if e == "eval")
     deleted: dict[str, int] = {}
     async with conn.transaction():
-        cur = await conn.execute(_EVAL_RUNS_SQL)
+        cur = await unscoped(conn, "control.reset").execute(_EVAL_RUNS_SQL)
         params = {"runs": [row[0] for row in await cur.fetchall()]}
         for table, sql in _RESET_SQL:
-            cur = await conn.execute(sql, params)
+            cur = await unscoped(conn, "control.reset").execute(sql, params)
             deleted[table] = cur.rowcount
-        async with conn.cursor() as cur:
+        async with unscoped(conn, "control.reset").cursor() as cur:
             await cur.executemany(
                 "INSERT INTO mock_stock (env, agent_id, sku, qty) VALUES (%s, %s, %s, %s)",
                 stock,
@@ -376,7 +377,7 @@ async def reset(
                 await key.undo(conn, hid, limits[hid])
         # Eval phones start inside the WhatsApp window again (experience §14, EX-I11),
         # before `setup` is applied.
-        await conn.execute(_RESTORE_WINDOW_SQL)
+        await unscoped(conn, "control.reset").execute(_RESTORE_WINDOW_SQL)
         for name, value in applied.items():
             await SETUP_KEYS[name].apply(conn, household_id, value)
     return deleted
@@ -401,7 +402,9 @@ async def _validate_shortfall(conn: AsyncConnection, params: Mapping[str, Any]) 
         or len(set(skus)) != len(skus)
     ):
         raise ControlRefused(f"shortfall params.skus must be 1 to {max_lines} distinct SKUs")
-    cur = await conn.execute("SELECT sku FROM order_items WHERE order_id = %s", (order_id,))
+    cur = await unscoped(conn, "control.reset").execute(
+        "SELECT sku FROM order_items WHERE order_id = %s", (order_id,)
+    )
     lines = {row[0] for row in await cur.fetchall()}
     missing = [s for s in skus if s not in lines]
     if missing:
@@ -420,7 +423,7 @@ async def _require_mock_seller(conn: AsyncConnection, order_id: UUID) -> None:
     no real adapter) passes; an order with no run or seller, or an unknown seller card, is
     refused.
     """
-    cur = await conn.execute(
+    cur = await unscoped(conn, "control.reset").execute(
         "SELECT o.seller_agent_id, r.modes FROM orders o JOIN runs r ON r.run_id = o.run_id"
         " WHERE o.order_id = %s",
         (order_id,),
@@ -465,7 +468,7 @@ async def inject_event(
     body: dict[str, Any] = dict(params or {})
     if kind == "shortfall":
         body = await _validate_shortfall(conn, body)
-    cur = await conn.execute(
+    cur = await unscoped(conn, "control.reset").execute(
         "INSERT INTO mock_events (env, kind, target_agent_id, params)"
         " VALUES (%s, %s, %s, %s) RETURNING id",
         (env, kind, target_agent_id, Jsonb(body)),
@@ -490,7 +493,7 @@ async def set_mode(conn: AsyncConnection, vendor: str, mode: str, *, set_by: str
         raise ControlRefused(f"mode must be 'real' or 'mock', got {mode!r}")
     if vendor in ALWAYS_MOCK and mode != "mock":
         raise ControlRefused(f"{vendor} is always mock")
-    await conn.execute(
+    await unscoped(conn, "control.reset").execute(
         "INSERT INTO adapter_modes (vendor, mode, set_by) VALUES (%s, %s, %s)"
         " ON CONFLICT (vendor) DO UPDATE SET mode = EXCLUDED.mode,"
         " set_by = EXCLUDED.set_by, set_at = now()",
@@ -503,7 +506,7 @@ async def expire_approval(conn: AsyncConnection, approval_id: UUID) -> None:
 
     Raises `LookupError` if the approval has no pending expiry timer.
     """
-    cur = await conn.execute(
+    cur = await unscoped(conn, "control.reset").execute(
         "UPDATE timers SET due_at = now()"
         " WHERE kind = 'approval_expiry' AND status = 'pending' AND ref->>'approval_id' = %s",
         (str(approval_id),),

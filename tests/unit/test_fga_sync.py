@@ -14,10 +14,11 @@ import pytest
 from psycopg_pool import AsyncConnectionPool
 
 from authz import apply as authz_apply
-from services.identity import fga, tokens
+from services.identity import fga
 from services.identity.errors import AuthzUnavailable
 from services.safety import guard
 from services.safety.guard import GuardRefused, run_guarded
+from tests.unit import identity_world as w
 
 U_ADMIN = uuid.UUID("00000000-0000-4000-8000-0000000000a1")
 U_MEMBER = uuid.UUID("00000000-0000-4000-8000-0000000000a2")
@@ -199,17 +200,20 @@ def test_connection_error_raises_authz_unavailable() -> None:
         )
 
 
-SECRET = "unit-test-mock-token-secret-32-bytes-long"
 SELLER = "grocery:mock-us"
 
 
-@dataclass(frozen=True)
+@dataclass
 class _Ctx:
     run_id: uuid.UUID
     agent_id: str
     token: str | None
     on_behalf_of: str | None = "org:mock"
     conversation_id: uuid.UUID | None = None
+    env: str = "live"
+    # Set by the guard (identity-authz I6).
+    claims: Any = None
+    authz_form: str | None = None
 
 
 @pytest.mark.db
@@ -223,8 +227,8 @@ def test_authz_timeout_not_denial(pg: str, monkeypatch: pytest.MonkeyPatch) -> N
             " VALUES (%s, 'chat', 'running', '{}', '{}')",
             (run_id,),
         )
-    monkeypatch.setattr(tokens, "_secret", lambda: SECRET)
-    token = tokens.MockIssuer(secret=SECRET).issue("user:us-1-a", SELLER, ["orders"])
+        w.add_agent(conn, SELLER, "org:mock")
+    token = w.service_token(SELLER)
 
     def check(user: str, relation: str, object: str) -> tuple[bool, str]:
         raise AuthzUnavailable("timeout")

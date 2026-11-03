@@ -98,10 +98,6 @@ class Settings:
     model_business_name: str = _var({"agents", "testrunner"}, "Muse Glimmer")
     model_business_timeout_seconds: int = _var({"agents", "testrunner"}, 5)
 
-    # Retired by identity-authz §13 in the PR that removes its last reader
-    # (services/identity/tokens.py, build step 5).
-    mock_token_secret: str | None = _var(APP)
-
     # Identity (identity-authz §13 and I5).
     token_source: str | None = _id(APP)
     # Empty: derived from DOMAIN (see `from_env`).

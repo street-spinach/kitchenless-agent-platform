@@ -13,9 +13,8 @@ import pytest
 
 from services.agents.common.model import ModelClient
 from services.common.consumer import RunFinish
-from services.identity import tokens
 from tests.unit import test_consumer_graph as cgt
-from tests.unit.test_household_graph import MEMBERS, SECRET, STARTER_AGENT, World
+from tests.unit.test_household_graph import MEMBERS, STARTER_AGENT, World
 from tests.unit.test_household_instant import RESTAURANTS, SoloWorld
 
 # Agents §13: the maximum Spark calls in each graph for each flow.
@@ -35,11 +34,6 @@ class Calls:
 
     def of(self, agent_class: str) -> int:
         return sum(n for (cls, _), n in self.nodes.items() if cls == agent_class)
-
-
-@pytest.fixture(autouse=True)
-def _secret(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(tokens, "_secret", lambda: SECRET)
 
 
 @pytest.fixture

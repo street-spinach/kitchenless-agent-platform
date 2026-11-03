@@ -15,6 +15,7 @@ from starlette.testclient import TestClient
 from services.api import main as api
 from services.common import modes, runs
 from services.common.config import Settings
+from tests.unit.identity_world import grant_household
 
 HOUSEHOLD_ID = "us-2-eval"
 LIVE_HOUSEHOLD_ID = "us-2"
@@ -62,6 +63,14 @@ def seed(pg: str) -> None:
             _card(conn, consumer, "consumer", f"user:{user_id}", "agents")
         _card(conn, f"household:{HOUSEHOLD_ID}", "household", f"household:{HOUSEHOLD_ID}", "agents")
         _card(conn, WHATSAPP, "channel", "system", "api")
+        # Identity (identity-authz I39): `runs.start` needs each household agent's active
+        # grant, held by the admin; `api` has the `svc.api` client for its service token.
+        grant_household(conn, HOUSEHOLD_ID, ADMIN)
+        grant_household(conn, LIVE_HOUSEHOLD_ID, LIVE_ADMIN)
+        conn.execute(
+            "INSERT INTO agent_clients (agent_id, client_id, kind)"
+            " VALUES ('system:api', 'svc.api', 'service')"
+        )
 
 
 def _card(conn: psycopg.Connection, agent_id: str, cls: str, owner: str, host: str) -> None:

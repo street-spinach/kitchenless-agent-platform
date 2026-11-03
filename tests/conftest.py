@@ -3,6 +3,7 @@
 import os
 import uuid
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from typing import Any
 
 import psycopg
@@ -57,6 +58,34 @@ def mock_signing_key() -> str:
         serialization.PrivateFormat.PKCS8,
         serialization.NoEncryption(),
     ).decode()
+
+
+@dataclass
+class IdentitySettings:
+    """The settings `services.identity.tokens` reads (identity-authz §13), mock by default."""
+
+    mock_signing_key: str | None
+    token_source: str | None = "mock"
+    domain: str = "localhost"
+    issuer_url: str | None = "https://localhost/auth/realms/kitchenless"
+    keycloak_url: str | None = None
+
+
+@pytest.fixture(autouse=True)
+def identity_settings(
+    monkeypatch: pytest.MonkeyPatch, mock_signing_key: str
+) -> Iterator[IdentitySettings]:
+    """Every test validates and signs tokens under `TOKEN_SOURCE=mock` with a fresh test key
+    (CLAUDE.md: tests use mock). Tests change the returned object to try other modes."""
+    from services.identity import token_source, tokens
+
+    settings = IdentitySettings(mock_signing_key=mock_signing_key)
+    monkeypatch.setattr(tokens, "get_settings", lambda: settings)
+    token_source._SOURCES.clear()
+    tokens._jwks_by_url.clear()
+    yield settings
+    token_source._SOURCES.clear()
+    tokens._jwks_by_url.clear()
 
 
 Tuple = tuple[str, str, str]

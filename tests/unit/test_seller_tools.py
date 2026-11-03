@@ -12,15 +12,15 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
 from services.common import db, ids, orders
-from services.identity import fga, tokens
+from services.identity import fga
 from services.mcp import seller
 from services.mcp.grocery import server as grocery
 from services.mcp.meta import CallContext
 from services.safety.guard import GuardRefused
+from tests.unit import identity_world as w
 
 pytestmark = pytest.mark.db
 
-SECRET = "unit-test-mock-token-secret-32-bytes-long"
 HOUSEHOLD = "us-1"
 ZONE = "us-oh-45202"
 SELLER = "grocery:mock-us"
@@ -37,7 +37,6 @@ STOCK = 10
 
 @pytest.fixture(autouse=True)
 def _auth(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, str]]:
-    monkeypatch.setattr(tokens, "_secret", lambda: SECRET)
     checks: list[tuple[str, str, str]] = []
 
     def check(user: str, relation: str, object: str) -> tuple[bool, str]:
@@ -52,6 +51,17 @@ def _query(pg: str, sql: str, *params: Any) -> list[dict[str, Any]]:
     with psycopg.connect(pg) as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute(sql, params)
         return cur.fetchall()
+
+
+def _clients(conn: psycopg.Connection) -> None:
+    """An `agent_clients` row (`service`) for every business card, so the guard maps the
+    callers' service tokens (identity-authz §8 step 1)."""
+    for (agent_id,) in conn.execute("SELECT agent_id FROM agent_cards").fetchall():
+        conn.execute(
+            "INSERT INTO agent_clients (agent_id, client_id, kind) VALUES (%s, %s, 'service')"
+            " ON CONFLICT DO NOTHING",
+            (agent_id, ids.keycloak_client_id(agent_id)),
+        )
 
 
 def _seed(pg: str) -> uuid.UUID:
@@ -85,6 +95,7 @@ def _seed(pg: str) -> uuid.UUID:
                 "INSERT INTO mock_stock (env, agent_id, sku, qty) VALUES ('live', %s, %s, %s)",
                 (SELLER, item["sku"], STOCK),
             )
+        _clients(conn)
         run_id = uuid.uuid4()
         conn.execute(
             "INSERT INTO runs (run_id, household_id, kind, trigger, modes)"
@@ -126,7 +137,7 @@ def _ctx(run_id: uuid.UUID) -> CallContext:
         agent_id=SELLER,
         conversation_id=None,
         attempt=1,
-        token=tokens.MockIssuer(secret=SECRET).issue(ORG, SELLER, ["orders"]),
+        token=w.service_token(SELLER),
         env="live",
         modes={},
         on_behalf_of=ORG,
@@ -216,7 +227,7 @@ def test_place_order_limits_then_places_once(
     }
     # MOCK-EGGS-12 sorts before MOCK-MILK-WHOLE.
     assert _stock(pg) == [STOCK - 1, STOCK - 2]
-    assert ("agent:" + SELLER, "member_of", ORG) in _auth
+    assert (fga.agent_object(SELLER), "member_of", ORG) in _auth
 
     # A replay returns the stored result and places nothing more.
     assert _place(pg, monkeypatch, run_id, order_id) == result

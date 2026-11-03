@@ -15,15 +15,15 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
 from services.common import db, ids
-from services.identity import fga, tokens
+from services.identity import fga
 from services.mcp.delivery import server as delivery
 from services.mcp.meta import AdapterFailure, CallContext
 from services.mocks import courier
 from services.safety.guard import GuardRefused
+from tests.unit import identity_world as w
 
 pytestmark = pytest.mark.db
 
-SECRET = "unit-test-mock-token-secret-32-bytes-long"
 HOUSEHOLD = "us-1"
 ZONE = "us-oh-45202"
 COURIER = "delivery:mock-us"
@@ -37,7 +37,6 @@ RULE = {"fee_minor": 599, "slot_minutes": 60, "slot_capacity": 2}
 
 @pytest.fixture(autouse=True)
 def _auth(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, str]]:
-    monkeypatch.setattr(tokens, "_secret", lambda: SECRET)
     settings = SimpleNamespace(mock_courier_step_seconds=20, api_url="http://api.invalid")
     monkeypatch.setattr(courier, "get_settings", lambda: settings)
     checks: list[tuple[str, str, str]] = []
@@ -54,6 +53,17 @@ def _query(pg: str, sql: str, *params: Any) -> list[dict[str, Any]]:
     with psycopg.connect(pg) as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute(sql, params)
         return cur.fetchall()
+
+
+def _clients(conn: psycopg.Connection) -> None:
+    """An `agent_clients` row (`service`) for every business card, so the guard maps the
+    callers' service tokens (identity-authz §8 step 1)."""
+    for (agent_id,) in conn.execute("SELECT agent_id FROM agent_cards").fetchall():
+        conn.execute(
+            "INSERT INTO agent_clients (agent_id, client_id, kind) VALUES (%s, %s, 'service')"
+            " ON CONFLICT DO NOTHING",
+            (agent_id, ids.keycloak_client_id(agent_id)),
+        )
 
 
 def _seed(pg: str) -> tuple[uuid.UUID, uuid.UUID]:
@@ -87,6 +97,7 @@ def _seed(pg: str) -> tuple[uuid.UUID, uuid.UUID]:
                 "INSERT INTO business_rules (agent_id, kind, value) VALUES (%s, 'delivery', %s)",
                 (agent_id, Jsonb(RULE)),
             )
+        _clients(conn)
         run_id = uuid.uuid4()
         conn.execute(
             "INSERT INTO runs (run_id, household_id, kind, trigger, modes)"
@@ -114,7 +125,7 @@ def _ctx(run_id: uuid.UUID, agent_id: str = COURIER, modes: dict[str, str] | Non
         agent_id=agent_id,
         conversation_id=None,
         attempt=1,
-        token=tokens.MockIssuer(secret=SECRET).issue(ORG, agent_id, ["orders"]),
+        token=w.service_token(agent_id),
         env="live",
         modes=modes or {},
         on_behalf_of=ORG,
@@ -200,7 +211,7 @@ def test_book_delivery_limits_then_books_once(
         order_id,
     )
     assert row == {"state": "courier_booked", "external_delivery_id": edi, "start": start}
-    assert ("agent:" + COURIER, "can_deliver_for", f"household:{HOUSEHOLD}") in _auth
+    assert (fga.agent_object(COURIER), "can_deliver_for", f"household:{HOUSEHOLD}") in _auth
     [share] = _data_shares(pg)
     assert share["payload"] == {
         "address_ref": str(address_ref),

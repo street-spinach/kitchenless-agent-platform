@@ -19,13 +19,14 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
 from services.common import db, ids, orders
-from services.identity import fga, tokens
+from services.identity import fga
 from services.mcp.grocery import server as grocery
 from services.mcp.household import server as household
 from services.mcp.knowledge.adapters.neo4j_knowledge import AllergenCheck, AllergenHit
 from services.mcp.meta import AdapterFailure, CallContext
 from services.safety import limits
 from services.safety.guard import GuardRefused
+from tests.unit import identity_world as w
 
 ORDER_ID = uuid.UUID("8a4f6c1e-0000-4000-8000-000000000067")
 SHORTFALL_ID = ids.shortfall_id(ORDER_ID)
@@ -236,7 +237,6 @@ def test_amendment_limit_exceptions_are_guard_refused() -> None:
 
 # --- the shortfall tools (db) ---------------------------------------------------------
 
-SECRET = "unit-test-mock-token-secret-32-bytes-long"
 HH = "us-1"
 HH_AGENT = f"household:{HH}"
 STORE = "grocery:mock-us"
@@ -244,6 +244,8 @@ ORG = "org:mock-grocery-us"
 API = "system:api"
 ZONE = "us-oh-45202"
 ASHA = ids.seed_user_id("us-1-a")
+# ASHA's Keycloak user id: the `sub` of the household agent's tokens (its grant holder).
+ASHA_SUB = "4ec40af4-f3ed-45f8-aece-861a4bca8cdb"
 BEN = ids.seed_user_id("us-1-b")
 STRANGER = ids.seed_user_id("us-2-a")
 EXTERNAL_ORDER = "mock-order-1"
@@ -279,7 +281,6 @@ NOTICE = [
 
 @pytest.fixture
 def _auth(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(tokens, "_secret", lambda: SECRET)
     monkeypatch.setattr(fga, "check", lambda user, relation, object: (True, "model-1"))
 
 
@@ -323,6 +324,15 @@ def _seed(pg: str) -> tuple[uuid.UUID, uuid.UUID]:
                 " 'agents', 'mock')",
                 (agent_id, cls, owner, [ZONE]),
             )
+        # The identity rows the guard checks (identity-authz §8 step 1).
+        conn.execute("UPDATE users SET keycloak_sub = %s WHERE user_id = %s", (ASHA_SUB, ASHA))
+        for agent_id, owner in ((HH_AGENT, HH_AGENT), (STORE, ORG)):
+            w.add_agent(conn, agent_id, owner)
+        conn.execute(
+            "INSERT INTO agent_clients (agent_id, client_id, kind) VALUES (%s, %s, 'service')",
+            (API, w.API_CLIENT),
+        )
+        w.add_grant(conn, HH_AGENT, w.Person(ASHA, ASHA_SUB), HH)
         conn.execute(
             "INSERT INTO runs (run_id, household_id, kind, trigger, modes)"
             " VALUES (%s, %s, 'weekly', %s, '{}')",
@@ -365,13 +375,20 @@ def _seed(pg: str) -> tuple[uuid.UUID, uuid.UUID]:
     return run_id, order_id
 
 
+def _token(agent_id: str) -> str:
+    """The household agent's delegated token from ASHA's grant, or a service token."""
+    if agent_id == HH_AGENT:
+        return w.people_token(HH_AGENT, ASHA_SUB)
+    return w.service_token(agent_id)
+
+
 def _ctx(run_id: uuid.UUID, agent_id: str, sub: str) -> CallContext:
     return CallContext(
         run_id=run_id,
         agent_id=agent_id,
         conversation_id=None,
         attempt=1,
-        token=tokens.MockIssuer(secret=SECRET).issue(sub, agent_id, ["orders"]),
+        token=_token(agent_id),
         env="live",
         modes={},
         on_behalf_of=None if agent_id == API else sub,
@@ -515,10 +532,11 @@ def test_non_member_reply_refused(world: World) -> None:
     with pytest.raises(GuardRefused) as e:
         world.choose(1, "MOCK-MILK-OAT", STRANGER)
     assert e.value.reason == household.AUTHZ_DENIED
-    # Only `api`, with its service token, may record a pick.
+    # Only `api`, with its service token, may record a pick: a household agent's delegated
+    # token on this `svc.api` tool is refused by §8 step 1b.
     with pytest.raises(GuardRefused) as e:
         world.choose(1, "MOCK-MILK-OAT", ASHA, agent_id=HH_AGENT)
-    assert e.value.reason == household.AUTHZ_DENIED
+    assert e.value.reason == "scope_missing"
     assert world.row()["picks"] == {}
 
 

@@ -62,9 +62,10 @@ class FakeCourier:
     def of(self, tool: str) -> list[dict[str, Any]]:
         return [c for c in self.calls if c["tool"] == tool]
 
-    async def __call__(self, server: str, tool: str, args: dict, *, ctx: Any, token: str) -> dict:
+    async def __call__(self, server: str, tool: str, args: dict, *, ctx: Any) -> dict:
+        # No `token` argument: `call_tool_as` obtains it (identity-authz I6).
         assert server == "delivery"
-        self.calls.append({"tool": tool, "args": args, "ctx": ctx, "token": token})
+        self.calls.append({"tool": tool, "args": args, "ctx": ctx})
         if tool == "quote_delivery":
             return {"price_minor": 599, "currency": "USD", "windows": list(self.windows)}
         if tool == "book_delivery":
@@ -118,7 +119,6 @@ class World:
             traces=self.traces,
             store=self.store,
             call_tool=self.courier,
-            issue_token=lambda sub, act, scopes: f"token:{sub}:{act}",
             clock=lambda: NOW,
             quote_ttl_seconds=TTL,
         )
@@ -164,7 +164,8 @@ def test_window_defaults_to_the_earliest_allowed_slot() -> None:
 
     call = w.courier.of("quote_delivery")[0]
     assert call["args"] == {"order_id": str(w.order_id), "zone_id": sf.ZONE, "window": REQUESTED}
-    assert call["ctx"].agent_id == COURIER and call["token"] == "token:org:courier:delivery:mock-us"
+    # The courier calls as itself; `call_tool_as` obtains its service token (identity-authz I6).
+    assert call["ctx"].agent_id == COURIER and "token" not in call
     [msg] = result.messages
     assert (msg.type, msg.to_agent, msg.conversation_id) == ("delivery_quote", STORE, conv)
     assert msg.body["window"] == _slot(0)

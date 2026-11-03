@@ -5,7 +5,9 @@
 *   `CallContext.from_meta(meta)` builds the call context from `_meta` (`run_id`,
     `agent_id`, `conversation_id`, `attempt`), the token, the run and the caller's card.
 *   `AdapterFailure` is what adapters raise; `tool_error()` builds the wire error result;
-    `tool_errors()` turns refusals and adapter failures into that result.
+    `tool_errors()` turns refusals, adapter failures and `DependencyUnavailable` (Keycloak
+    or OpenFGA down, a retryable `unavailable`, identity-authz I6) into that result.
+*   The guard sets `CallContext.claims` and `authz_form` (identity-authz I6).
 """
 
 import json
@@ -20,7 +22,8 @@ from mcp.types import CallToolResult, TextContent
 
 from services.common import db, directory
 from services.common.trace import TraceStore
-from services.identity.tokens import Claims
+from services.identity.claims import Claims
+from services.identity.errors import DependencyUnavailable
 from services.safety.guard import GuardRefused
 
 __all__ = [
@@ -95,6 +98,8 @@ class CallContext:
     env: str
     modes: dict[str, str]
     on_behalf_of: str | None
+    # The run's household (`runs.household_id`), for `scope.from_ctx`.
+    household_id: str | None = None
     # Set by the guard (identity-authz I6).
     claims: Claims | None = None
     authz_form: str | None = None
@@ -124,7 +129,7 @@ class CallContext:
             except directory.UnknownAgent:
                 raise GuardRefused(META_REFUSED) from None
             cur = await conn.execute(
-                "SELECT COALESCE(h.env, 'live'), r.modes FROM runs r"
+                "SELECT COALESCE(h.env, 'live'), r.modes, r.household_id FROM runs r"
                 " LEFT JOIN households h ON h.household_id = r.household_id"
                 " WHERE r.run_id = %s",
                 (run_id,),
@@ -132,7 +137,7 @@ class CallContext:
             row = await cur.fetchone()
         if row is None:
             raise GuardRefused(RUN_ENDED)
-        env, modes = row
+        env, modes, household_id = row
         return cls(
             run_id=run_id,
             agent_id=agent_id,
@@ -142,6 +147,7 @@ class CallContext:
             env=env,
             modes=dict(modes),
             on_behalf_of=None if card.owner_ref == "system" else card.owner_ref,
+            household_id=household_id,
         )
 
 
@@ -166,10 +172,12 @@ class ToolErrors:
 
 @asynccontextmanager
 async def tool_errors(ctx: CallContext, server: str, tool: str) -> AsyncIterator[ToolErrors]:
-    """Turn `GuardRefused` and `AdapterFailure` into the wire error result.
+    """Turn `GuardRefused`, `AdapterFailure` and `DependencyUnavailable` into the wire
+    error result.
 
-    An `AdapterFailure` first writes the §9 `error` trace row. Any other exception
-    propagates.
+    An `AdapterFailure` first writes the §9 `error` trace row. `DependencyUnavailable` is
+    `unavailable` with its reason, `retryable=True` (identity-authz I6). Any other
+    exception propagates.
 
         async with tool_errors(ctx, "household", "authorize_spend") as err:
             return await run_guarded(ctx, ...)
@@ -180,6 +188,8 @@ async def tool_errors(ctx: CallContext, server: str, tool: str) -> AsyncIterator
         yield err
     except GuardRefused as e:
         err.result = tool_error("refused", e.reason)
+    except DependencyUnavailable as e:
+        err.result = tool_error("unavailable", e.reason, retryable=True)
     except AdapterFailure as e:
         payload: dict[str, Any] = {
             "where": f"{server}.{tool}",

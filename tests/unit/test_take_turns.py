@@ -14,12 +14,10 @@ from services.agents.household import graph as hg
 from services.agents.household import stubs
 from services.common import ids
 from services.common.consumer import RunFinish, StepResult
-from services.identity import tokens
 from tests.unit.test_household_graph import (
     APPROVER,
     HOUSEHOLD,
     MEMBERS,
-    SECRET,
     STARTER,
     World,
 )
@@ -72,7 +70,6 @@ class DinnerWorld(World):
 
 @pytest.fixture(autouse=True)
 def _setup(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(tokens, "_secret", lambda: SECRET)
     monkeypatch.setattr(stubs, "LISTS", {"grocery": LIST, "dinner": LIST})
 
 
@@ -161,12 +158,8 @@ def test_advance_turn_called_once_when_on() -> None:
     assert done.finish == RunFinish("completed")
     [call] = w.household.of("advance_turn")
     assert call["args"] == {"order_id": w.order_id}
-    claims = tokens.validate(call["token"])
-    assert (claims.sub, claims.act, claims.scopes) == (
-        f"user:{STARTER}",
-        HOUSEHOLD,
-        ("orders:place",),
-    )
+    # Agent code passes no token; the scopes are `tokens.TOOL_SCOPES` (identity-authz I6).
+    assert "token" not in call and call["ctx"].agent_id == HOUSEHOLD
     assert "turn_advanced" in _finish_choices(w)
     # A redelivered `delivered` does not run `finish` again.
     w.step(w.delivered_msg())

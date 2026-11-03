@@ -114,6 +114,9 @@ _AUTHORIZE_FROM = ("negotiating", "awaiting_approval")
 _DECISIONS = frozenset({"approved", "rejected"})
 
 AUTHZ_DENIED = "authz_denied"
+# `ctx.authz_form` of `get_constraints` (identity-authz §8 step 2).
+CONSTRAINTS_FORM_PERSON = "person"
+CONSTRAINTS_FORM_HOUSEHOLD = "household"
 INVALID_STATE = "invalid_state"
 STATE_NOT_ALLOWED = "state_not_allowed"
 QUOTE_MISMATCH = "quote_mismatch"
@@ -217,7 +220,15 @@ def _qty(value: Decimal) -> int | str:
 
 
 async def get_constraints(ctx: CallContext, *, user_id: uuid.UUID) -> dict[str, Any]:
-    """The person's own constraint rows. Relation `agent acts_for user:<user_id>`."""
+    """The person's own constraint rows. Relation `agent acts_for user:<user_id>`.
+
+    Called by a household agent (identity-authz §8 step 2, I-D10, I-CUJ 11), the form is
+    `household`: relation `agent acts_for household:<h>` for the run's household, and the
+    result is the `allergy` and `diet` rows of every member of `h`, never `dislike`. The
+    named `user_id` must be a member of `h`.
+    """
+    if ids.parse_agent_id(ctx.agent_id)[0] == "household":
+        return await _household_constraints(ctx, user_id)
 
     async def call() -> dict[str, Any]:
         async with db.get_pool().connection() as conn:
@@ -246,6 +257,54 @@ async def get_constraints(ctx: CallContext, *, user_id: uuid.UUID) -> dict[str, 
         request={"user_id": str(user_id)},
         call=call,
         apply=None,
+        authz_form=CONSTRAINTS_FORM_PERSON,
+    )
+
+
+async def _household_constraints(ctx: CallContext, user_id: uuid.UUID) -> dict[str, Any]:
+    """The `household` form of `get_constraints`."""
+    household = await _run_household(ctx)
+
+    async def check(conn: AsyncConnection) -> None:
+        h = _require_household(household)
+        cur = await conn.execute(
+            "SELECT 1 FROM household_members WHERE household_id = %s AND user_id = %s",
+            (h, user_id),
+        )
+        if await cur.fetchone() is None:
+            raise GuardRefused(AUTHZ_DENIED)
+
+    async def call() -> dict[str, Any]:
+        async with db.get_pool().connection() as conn:
+            cur = await conn.execute(
+                "SELECT m.user_id, c.kind, c.value FROM household_members m"
+                " LEFT JOIN member_constraints c ON c.user_id = m.user_id"
+                "  AND c.kind IN ('allergy', 'diet')"
+                " WHERE m.household_id = %s ORDER BY m.user_id, c.kind, c.value",
+                (household,),
+            )
+            rows = await cur.fetchall()
+        members: dict[str, dict[str, Any]] = {}
+        for member, kind, value in rows:
+            entry = members.setdefault(
+                str(member), {"user_id": str(member), "allergies": [], "diets": []}
+            )
+            if kind == "allergy":
+                entry["allergies"].append(value)
+            elif kind == "diet":
+                entry["diets"].append(value)
+        return {"household_id": household, "members": list(members.values())}
+
+    return await run_guarded(
+        ctx,
+        tool=f"{AREA}.get_constraints",
+        relation=_household_relation("acts_for", household),
+        limits=check,
+        key=None,
+        request={"user_id": str(user_id)},
+        call=call,
+        apply=None,
+        authz_form=CONSTRAINTS_FORM_HOUSEHOLD,
     )
 
 

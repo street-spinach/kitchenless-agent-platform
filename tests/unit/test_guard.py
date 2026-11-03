@@ -18,38 +18,68 @@ from services.identity import fga, tokens
 from services.mcp.meta import AdapterFailure
 from services.safety import guard
 from services.safety.guard import GuardRefused, run_guarded
+from tests.unit import identity_world as w
 
 pytestmark = pytest.mark.db
 
-SECRET = "unit-test-mock-token-secret-32-bytes-long"
 SELLER = "grocery:mock-us"
+OTHER_SELLER = "grocery:someone-else"
 ORDER_ID = uuid.UUID("8a4f6c1e-0000-4000-8000-000000000001")
 KEY = ids.idempotency_key(ORDER_ID, "place_order", SELLER)
 REQUEST = {"order_id": str(ORDER_ID), "quote_id": "q-1", "items_hash": "abc"}
 RESULT = {"vendor_order_id": "v-1", "state": "placed", "total_minor": 4200}
 
 
-@dataclass(frozen=True)
+@dataclass
 class Ctx:
     run_id: uuid.UUID
     agent_id: str
     token: str | None
     on_behalf_of: str | None = "org:mock"
     conversation_id: uuid.UUID | None = None
-
-
-@pytest.fixture(autouse=True)
-def _secret(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(tokens, "_secret", lambda: SECRET)
+    env: str = "live"
+    # Set by the guard (identity-authz I6).
+    claims: Any = None
+    authz_form: str | None = None
 
 
 def _token(act: str = SELLER) -> str:
-    return tokens.MockIssuer(secret=SECRET).issue("user:us-1-a", act, ["orders"])
+    """A seller's service token (identity-authz §8 step 1b: `place_order` is a service
+    tool)."""
+    return w.service_token(act)
+
+
+def _identity(**changes: Any) -> dict[str, Any]:
+    """The identity-authz §14 fields a seller's service-token call carries."""
+    return {
+        "sub_user_id": None,
+        "act_agent_id": SELLER,
+        "grant_id": None,
+        "token_source": "mock",
+        "authz": {
+            "relation": "member_of",
+            "object": "org:mock",
+            "allowed": True,
+            "model_id": "model-1",
+        },
+        **changes,
+    }
+
+
+NO_IDENTITY = {
+    "sub_user_id": None,
+    "act_agent_id": None,
+    "grant_id": None,
+    "token_source": None,
+    "authz": None,
+}
 
 
 def _seed_run(pg: str, status: str = "running", ended: bool = False) -> uuid.UUID:
     run_id = uuid.uuid4()
     with psycopg.connect(pg) as conn:
+        for agent in (SELLER, OTHER_SELLER):
+            w.add_agent(conn, agent, "org:mock")
         conn.execute(
             "INSERT INTO runs (run_id, kind, status, trigger, modes, ended_at)"
             " VALUES (%s, 'chat', %s, '{}', '{}', CASE WHEN %s THEN now() END)",
@@ -82,9 +112,9 @@ def test_guard_order_of_checks(pg: str, monkeypatch: pytest.MonkeyPatch) -> None
     steps: list[str] = []
     real_validate, real_write = tokens.validate, TraceStore.write
 
-    def validate(token: str) -> tokens.Claims:
+    async def validate(conn: AsyncConnection, token: str, ctx: Any) -> tokens.Claims:
         steps.append("token")
-        return real_validate(token)
+        return await real_validate(conn, token, ctx)
 
     def check(user: str, relation: str, object: str) -> tuple[bool, str]:
         steps.append(f"fga {user} {relation} {object}")
@@ -132,7 +162,7 @@ def test_guard_order_of_checks(pg: str, monkeypatch: pytest.MonkeyPatch) -> None
     assert result == RESULT
     assert steps == [
         "token",
-        f"fga agent:{SELLER} member_of org:mock",
+        f"fga {fga.agent_object(SELLER)} member_of org:mock",
         "limits",
         "trace tool_call",
         "adapter",
@@ -147,6 +177,7 @@ def test_guard_order_of_checks(pg: str, monkeypatch: pytest.MonkeyPatch) -> None
         "tool": "place_order",
         "args": REQUEST,
         "idempotency_key": KEY,
+        **_identity(),
     }
     assert rows[1]["payload"] == {
         "server": "grocery",
@@ -154,6 +185,7 @@ def test_guard_order_of_checks(pg: str, monkeypatch: pytest.MonkeyPatch) -> None
         "result": RESULT,
         "refused": False,
         "reason": None,
+        **_identity(),
     }
     assert {(r["agent_id"], r["on_behalf_of"]) for r in rows} == {(SELLER, "org:mock")}
     with psycopg.connect(pg) as conn:
@@ -189,7 +221,7 @@ def test_ended_run_refused(
     run_id = _seed_run(pg, status=status, ended=ended)
     called: list[str] = []
 
-    def validate(token: str) -> tokens.Claims:
+    async def validate(conn: AsyncConnection, token: str, ctx: Any) -> tokens.Claims:
         called.append("token")
         raise AssertionError("token checked after the run ended")
 
@@ -273,7 +305,7 @@ def test_refusal_writes_tool_result(
     token: str | None = {
         "no_token": None,
         "bad_token": "not-a-jwt",
-        "other_agent": _token(act="grocery:someone-else"),
+        "other_agent": _token(act=OTHER_SELLER),
     }.get(case, _token())
     monkeypatch.setattr(
         fga, "check", lambda user, relation, object: (case != "fga_denied", "model-1")
@@ -312,6 +344,15 @@ def test_refusal_writes_tool_result(
 
     assert exc.value.reason == reason
     assert called == []
+    # A refusal before the token is accepted carries no identity; after it, the caller's,
+    # and the relation's result once OpenFGA answered (identity-authz §14).
+    denied = {"relation": "member_of", "object": "org:mock", "allowed": False}
+    expected_identity = {
+        "no_token": NO_IDENTITY,
+        "bad_token": NO_IDENTITY,
+        "other_agent": NO_IDENTITY,
+        "fga_denied": _identity(authz=denied | {"model_id": "model-1"}),
+    }.get(case, _identity())
     rows = _traces(pg, run_id)
     assert [r["kind"] for r in rows] == ["tool_result"]
     assert rows[0]["payload"] == {
@@ -320,6 +361,7 @@ def test_refusal_writes_tool_result(
         "result": None,
         "refused": True,
         "reason": reason,
+        **expected_identity,
     }
     assert (rows[0]["agent_id"], rows[0]["on_behalf_of"]) == (SELLER, "org:mock")
 

@@ -12,6 +12,8 @@ from psycopg.rows import dict_row
 
 from services.common import ids, modes, runs
 from services.common.config import Settings
+from services.identity.errors import GrantMissing, GrantRevoked
+from tests.unit import identity_world as w
 
 pytestmark = pytest.mark.db
 
@@ -62,6 +64,8 @@ def world(pg: str) -> str:
             " VALUES (%s, %s, '1 Main St', 'Cincinnati', 'OH', '45202', 'US')",
             (ADDRESS, HOUSEHOLD_ID),
         )
+        # `runs.start` needs the household agent's active grant (identity-authz I39).
+        w.grant_household(conn, HOUSEHOLD_ID)
     return pg
 
 
@@ -149,7 +153,8 @@ def test_eval_household_run_pins_mock_under_mode_real(
 
     run_id = _start(world)
 
-    all_mock = dict.fromkeys(modes.VENDORS, "mock")
+    # Every vendor mock, and the run's token source (identity-authz §12) mock too.
+    all_mock = {**dict.fromkeys(modes.VENDORS, "mock"), "token_source": "mock"}
     assert _run_row(world, run_id)["modes"] == all_mock
     [start_row] = _traces(world, run_id, "run_start")
     assert start_row["payload"]["modes"] == all_mock
@@ -167,7 +172,7 @@ def test_finish_writes_single_outcome(world: str) -> None:
     [start_row] = _traces(world, run_id, "run_start")
     assert start_row["agent_id"] == runs.RUNS_AGENT
     assert start_row["payload"]["kind"] == "weekly"
-    assert set(start_row["payload"]["modes"]) == modes.VENDORS
+    assert set(start_row["payload"]["modes"]) == modes.VENDORS | {"token_source"}
     [timer] = _query(world, "SELECT * FROM timers WHERE run_id = %s", run_id)
     assert timer["kind"] == "run_timeout"
     assert _run(world, lambda conn: runs.is_ended(conn, run_id)) is False
@@ -416,3 +421,61 @@ def test_run_timeout_uses_run_timeout_seconds(world: str, _settings: Settings) -
         run_id,
     )
     assert abs(float(timer["s"]) - _settings.run_timeout_seconds) < 5
+
+
+# --- identity (identity-authz I39, build step 5) -------------------------------------------
+
+
+def _set_grants(pg: str, status: str) -> None:
+    with psycopg.connect(pg) as conn:
+        conn.execute("UPDATE agent_grants SET status = %s", (status,))
+
+
+def test_start_refused_without_household_grant(world: str) -> None:
+    with psycopg.connect(world) as conn:
+        conn.execute("DELETE FROM agent_grants")
+    with pytest.raises(GrantMissing):
+        _start(world)
+    assert _query(world, "SELECT run_id FROM runs") == []
+
+
+def test_start_refused_after_household_grant_revoked(world: str) -> None:
+    _set_grants(world, "revoked")
+    with pytest.raises(GrantRevoked):
+        _start(world)
+    assert _query(world, "SELECT run_id FROM runs") == []
+
+
+@pytest.mark.parametrize("kind", ["hello", "a2a_demo"])
+def test_start_grant_exempt_kinds(world: str, kind: str) -> None:
+    _set_grants(world, "revoked")
+    assert _run_row(world, _start(world, kind=kind))["status"] == "running"
+
+
+def test_start_without_household_needs_no_grant(world: str) -> None:
+    _set_grants(world, "revoked")
+    run_id = _start(world, kind="chat", household_id=None)
+    assert _run_row(world, run_id)["household_id"] is None
+
+
+def test_start_records_token_source(world: str) -> None:
+    assert _run_row(world, _start(world))["modes"]["token_source"] == "mock"
+
+
+def test_finish_grant_revoked_fails_unplaced_orders(world: str) -> None:
+    run_id = _start(world)
+    _add_order(world, run_id, "authorized", None)
+    _add_order(world, run_id, "placed", "delivery:mock-us")
+    assert _finish(world, run_id, HOUSEHOLD, "error", "grant_revoked")
+    states = sorted(
+        r["state"] for r in _query(world, "SELECT state FROM orders WHERE run_id = %s", run_id)
+    )
+    assert states == ["failed", "placed"]
+
+
+def test_finish_other_error_leaves_orders(world: str) -> None:
+    run_id = _start(world)
+    _add_order(world, run_id, "authorized", None)
+    assert _finish(world, run_id, HOUSEHOLD, "error", "model_unavailable")
+    [order] = _query(world, "SELECT state FROM orders WHERE run_id = %s", run_id)
+    assert order["state"] == "authorized"

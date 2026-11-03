@@ -105,7 +105,6 @@ from services.common.money import Money
 from services.common.money import format as money_format
 from services.common.protocol.schemas import RequestItem
 from services.common.run_context import RunContext
-from services.identity.tokens import MockIssuer
 
 __all__ = [
     "EXPLAIN_TIMEOUT_SECONDS",
@@ -156,22 +155,6 @@ HOUSEHOLD_SERVER = "household"
 WHATSAPP = "channel:whatsapp"
 SELLER_CLASS = {"grocery": "grocery", "dinner": "restaurant"}
 START_KIND = {"start_weekly_order": "grocery", "start_dinner": "dinner"}
-# Scopes per household tool (identity-authz §8 step 1b).
-SCOPES: Mapping[str, tuple[str, ...]] = {
-    "create_order": ("orders:place",),
-    "authorize_spend": ("orders:place",),
-    "request_approval": ("approvals:request",),
-    "record_delivery": ("pantry:write",),
-    "get_pantry": ("pantry:read",),
-    "get_budget": (),
-    "get_household_rules": (),  # agents §10: no scope
-    "get_household_allergens": ("constraints:read",),  # agents §6, AG-A6
-    "set_order_state": ("orders:place",),
-    "open_shortfall": (),
-    "get_shortfall": (),
-    "authorize_amendment": ("orders:place",),
-    "advance_turn": ("orders:place",),  # agents §10
-}
 HANDLED_TYPES = frozenset(
     {
         "start_weekly_order",
@@ -303,7 +286,6 @@ LoadRun = Callable[[UUID], Awaitable[RunInfo]]
 LoadMembers = Callable[[str], Awaitable[Members]]
 FindSellers = Callable[[str, str, str, str], Awaitable[Sequence[str]]]
 CallTool = Callable[..., Awaitable[dict[str, Any]]]
-IssueToken = Callable[[str, str, Sequence[str]], str]
 Clock = Callable[[], datetime]
 Sleep = Callable[[float], Awaitable[None]]
 # The vendor label text of a seller card in a run (adapters §6): `(run_id, agent_id)`.
@@ -314,11 +296,6 @@ LoadVocabulary = Callable[[], pantry.Vocabulary]
 async def _agent_id_label(run_id: UUID, agent_id: str) -> str:
     # Without a label source the seller is named by its agent id, with no badge.
     return agent_id
-
-
-def _mock_token(sub: str, act: str, scopes: Sequence[str]) -> str:
-    # Every run uses the mock issuer until identity-authz replaces the token source (Q4).
-    return MockIssuer().issue(sub, act, list(scopes))
 
 
 def _now() -> datetime:
@@ -572,7 +549,6 @@ def build_graph(
     model: ModelClient,
     traces: TraceSink,
     call_tool: CallTool,
-    issue_token: IssueToken,
     load_members: LoadMembers,
     find_sellers: FindSellers,
     clock: Clock = _now,
@@ -593,14 +569,11 @@ def build_graph(
     async def tool(
         state: HouseholdState, name: str, args: dict[str, Any], conversation_id: str | None = None
     ) -> dict[str, Any]:
-        user_id = state.get("user_id")
-        if not user_id:
-            # Fails closed: a tool call needs the member the household agent acts for.
+        if not state.get("user_id"):
+            # Fails closed: a household run always names the member who started it.
             raise ValueError("the run names no member to act for")
-        token = issue_token(f"user:{user_id}", state["agent_id"], SCOPES[name])
-        return await call_tool(
-            HOUSEHOLD_SERVER, name, args, ctx=_ctx(state, conversation_id), token=token
-        )
+        # `call_tool_as` obtains the household grant's token (identity-authz I6).
+        return await call_tool(HOUSEHOLD_SERVER, name, args, ctx=_ctx(state, conversation_id))
 
     async def trace_decision(
         state: HouseholdState,
@@ -1638,8 +1611,7 @@ class HouseholdGraph:
         load_run: LoadRun,
         load_members: LoadMembers,
         find_sellers: FindSellers,
-        call_tool: CallTool = mcp_client.call_tool,
-        issue_token: IssueToken = _mock_token,
+        call_tool: CallTool = mcp_client.call_tool_as,
         clock: Clock = _now,
         sleep: Sleep = asyncio.sleep,
         offer_ttl_seconds: int = OFFER_TTL_SECONDS,
@@ -1653,7 +1625,6 @@ class HouseholdGraph:
             model,
             traces,
             call_tool,
-            issue_token,
             load_members,
             find_sellers,
             clock,

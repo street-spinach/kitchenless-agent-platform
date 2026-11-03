@@ -23,10 +23,8 @@ from services.common.directory import AgentCard
 from services.common.mcp_client import ToolRefused
 from services.common.protocol.a2a import AgentMessageRow
 from services.common.protocol.schemas import SCHEMAS
-from services.identity import tokens
 from tests.unit import model_fakes as mf
 
-SECRET = "unit-test-mock-token-secret-32-bytes-long"
 HOUSEHOLD = "household:us-1"
 STARTER = "11111111-1111-4111-8111-111111111111"
 MEMBERS = {
@@ -108,9 +106,10 @@ class FakeHousehold:
     def of(self, tool: str) -> list[dict[str, Any]]:
         return [c for c in self.calls if c["tool"] == tool]
 
-    async def __call__(self, server: str, tool: str, args: dict, *, ctx: Any, token: str) -> dict:
+    async def __call__(self, server: str, tool: str, args: dict, *, ctx: Any) -> dict:
+        # No `token` argument: `call_tool_as` obtains it (identity-authz I6).
         assert server == "household"
-        self.calls.append({"tool": tool, "args": args, "ctx": ctx, "token": token})
+        self.calls.append({"tool": tool, "args": args, "ctx": ctx})
         if tool in self.refuse:
             raise ToolRefused(self.refuse[tool])
         if tool == "create_order":
@@ -203,9 +202,6 @@ class World:
             load_members=self.load_members,
             find_sellers=self.find_sellers,
             call_tool=self.household,
-            issue_token=lambda sub, act, scopes: tokens.MockIssuer(secret=SECRET).issue(
-                sub, act, list(scopes)
-            ),
             clock=lambda: NOW,
             sleep=self.sleep,
             load_whatsapp_members=self.load_whatsapp_members,
@@ -353,11 +349,6 @@ class World:
         return accept
 
 
-@pytest.fixture(autouse=True)
-def _secret(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(tokens, "_secret", lambda: SECRET)
-
-
 # The main path, draft to delivered ---------------------------------------------------
 
 
@@ -366,9 +357,8 @@ def test_start_creates_order_and_asks_each_member() -> None:
     result = w.start()
     [create] = w.household.of("create_order")
     assert create["args"] == {"order_id": w.order_id, "kind": "grocery"}
-    claims = tokens.validate(create["token"])
-    assert (claims.sub, claims.act) == (f"user:{STARTER}", HOUSEHOLD)
-    assert claims.scopes == ("orders:place",)
+    # Agent code passes no token; the scopes are `tokens.TOOL_SCOPES` (identity-authz I6).
+    assert "token" not in create and create["ctx"].agent_id == HOUSEHOLD
     assert [(m.type, m.to_agent) for m in result.messages] == [
         ("constraints_request", agent) for agent in sorted(MEMBERS)
     ]
@@ -436,7 +426,7 @@ def test_runs_draft_to_delivered_with_the_stub_model() -> None:
     done = w.order_update("order_status", "delivered", "system:api")
     [recorded] = w.household.of("record_delivery")
     assert recorded["args"] == {"order_id": w.order_id}
-    assert tokens.validate(recorded["token"]).scopes == ("pantry:write",)
+    assert "token" not in recorded and recorded["ctx"].agent_id == HOUSEHOLD
     assert done.finish == RunFinish("completed")
     [summary] = done.messages
     assert (summary.type, summary.to_agent) == ("whatsapp_out", "channel:whatsapp")
@@ -1020,12 +1010,7 @@ def test_shortfall_applied_on_closed() -> None:
         "shortfall_id": _shortfall_id(w),
         "picks": {"1": SUB, "2": "drop"},
     }
-    claims = tokens.validate(authorize["token"])
-    assert (claims.sub, claims.act, claims.scopes) == (
-        f"user:{STARTER}",
-        HOUSEHOLD,
-        ("orders:place",),
-    )
+    assert "token" not in authorize and authorize["ctx"].agent_id == HOUSEHOLD
     [decision] = result.messages
     assert (decision.type, decision.to_agent) == ("shortfall_decision", SELLER)
     assert decision.body == {

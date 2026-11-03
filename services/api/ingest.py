@@ -12,12 +12,13 @@
 3.  Buttons.
     *   A payload starting `sf:` (agent-protocol §10 and P29, #70) is parsed as
         `sf:<shortfall_id>:<line>:<sku | drop>` and calls the household tool
-        `choose_shortfall_option` with the `api` service token, in a `RunContext` for the
-        shortfall's run. On `already_decided` the member gets `already_decided`; nothing
-        else is sent, because the tool sends `shortfall_closed` when the last line is
-        picked. A malformed payload, an unknown shortfall or a refused call starts nothing.
-        If the tool is unavailable the error propagates, so the transaction rolls back and
-        the inbound row is not kept: a redelivered tap is tried again.
+        `choose_shortfall_option` with the `api` service token (obtained by
+        `call_tool_as`), in a `RunContext` for the shortfall's run. On `already_decided`
+        the member gets `already_decided`; nothing else is sent, because the tool sends
+        `shortfall_closed` when the last line is picked. A malformed payload, an unknown
+        shortfall or a refused call starts nothing. If the tool is unavailable the error
+        propagates, so the transaction rolls back and the inbound row is not kept: a
+        redelivered tap is tried again.
     *   An approval button (`ap:<approval_id>:approved|rejected`, #63) calls
         `/mcp/household decide_approval` with `api`'s service token; see `_approval_tap`.
     *   A take-turns button (`tt:<order_id>:on|off`, agents §10), checked before the
@@ -46,9 +47,9 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from services.common import ids, mcp_client, outbox, runs
-from services.common.mcp_client import ToolRefused, call_tool
+from services.common.mcp_client import ToolRefused, call_tool_as
 from services.common.run_context import RunContext
-from services.identity.tokens import MockIssuer
+from services.safety.scope import unscoped
 
 __all__ = [
     "ALREADY_DECIDED",
@@ -114,12 +115,6 @@ def parse_shortfall_button(payload: str) -> ShortfallPick | None:
     return ShortfallPick(shortfall_id, int(raw_line), pick)
 
 
-def _service_token() -> str:
-    # The `api` service token. Every caller uses the mock issuer until identity-authz
-    # moves `ingest` to `call_tool_as` (identity-authz Q4 and its `ingest.py` row).
-    return MockIssuer().issue(API_AGENT, API_AGENT, ())
-
-
 @dataclass(frozen=True)
 class Content:
     """One inbound message: `text`, a `button` press (its payload) or `media`."""
@@ -165,7 +160,7 @@ LIMIT 2
 
 async def _member(conn: AsyncConnection, phone: str) -> _Member | None:
     """The phone's member, or `None` if unknown or ambiguous (fails closed)."""
-    async with conn.cursor(row_factory=dict_row) as cur:
+    async with unscoped(conn, "ingest").cursor(row_factory=dict_row) as cur:
         await cur.execute(_MEMBER_SQL, (phone,))
         rows = await cur.fetchall()
     if len(rows) != 1:
@@ -174,7 +169,7 @@ async def _member(conn: AsyncConnection, phone: str) -> _Member | None:
 
 
 async def _run_row(conn: AsyncConnection, run_id: uuid.UUID) -> dict[str, Any]:
-    async with conn.cursor(row_factory=dict_row) as cur:
+    async with unscoped(conn, "ingest").cursor(row_factory=dict_row) as cur:
         await cur.execute(
             "SELECT kind, household_id, trigger FROM runs WHERE run_id = %s", (run_id,)
         )
@@ -221,7 +216,7 @@ async def ingest(
     kind: str = CHAT,
     overrides: dict[str, Any] | None = None,
     run_id: uuid.UUID | None = None,
-    call_tool: CallTool = mcp_client.call_tool,
+    call_tool: CallTool = mcp_client.call_tool_as,
 ) -> uuid.UUID | None:
     """Handle one inbound message in one transaction; return the run it started, if any
     (for an approval button, the approval's run).
@@ -231,14 +226,14 @@ async def ingest(
     for an approval button.
     """
     async with conn.transaction():
-        cur = await conn.execute(_INSERT_INBOUND_SQL, (channel, external_id))
+        cur = await unscoped(conn, "ingest").execute(_INSERT_INBOUND_SQL, (channel, external_id))
         inserted = await cur.fetchone()
         if inserted is None:
             log.info("duplicate inbound %s message ignored", channel)
             return None
         # Before any routing, for every content kind (experience EX-I10). An unknown phone
         # matches no row.
-        await conn.execute(_SET_LAST_INBOUND_SQL, (inserted[1], phone))
+        await unscoped(conn, "ingest").execute(_SET_LAST_INBOUND_SQL, (inserted[1], phone))
 
         member = await _member(conn, phone)
         if member is None:
@@ -255,7 +250,9 @@ async def ingest(
             if content.button.startswith(SHORTFALL_PREFIX):
                 run = await _shortfall_button(conn, member, inbound, content.button)
                 if run is not None:
-                    await conn.execute(_SET_RUN_SQL, (run, channel, external_id))
+                    await unscoped(conn, "ingest").execute(
+                        _SET_RUN_SQL, (run, channel, external_id)
+                    )
                 return None
             # The take-turns tap is checked before the approval button (agents §10).
             take_turns = ids.parse_take_turns_button(content.button)
@@ -266,14 +263,16 @@ async def ingest(
                     return None
                 approval_run = await _approval_tap(conn, member, inbound, *tap, call_tool=call_tool)
                 if approval_run is not None:
-                    await conn.execute(_SET_RUN_SQL, (approval_run, channel, external_id))
+                    await unscoped(conn, "ingest").execute(
+                        _SET_RUN_SQL, (approval_run, channel, external_id)
+                    )
                 return approval_run
             # A new `chat` run, since the order's run has ended. It is committed below,
             # before the tool call, so that the guard's step 0 sees it running.
             started = await runs.start(
                 conn, household_id=member.household_id, kind=CHAT, trigger=trigger
             )
-            await conn.execute(_SET_RUN_SQL, (started, channel, external_id))
+            await unscoped(conn, "ingest").execute(_SET_RUN_SQL, (started, channel, external_id))
         else:
             if overrides:
                 trigger["overrides"] = overrides
@@ -285,7 +284,7 @@ async def ingest(
                     conn, member, inbound, trigger, content.text, kind, run_id
                 )
 
-            await conn.execute(_SET_RUN_SQL, (started, channel, external_id))
+            await unscoped(conn, "ingest").execute(_SET_RUN_SQL, (started, channel, external_id))
             return started
 
     # Only a take-turns tap gets here.
@@ -326,15 +325,13 @@ async def _take_turns_tap(
     ctx = RunContext(run_id=run_id, agent_id=API_AGENT, conversation_id=None)
     reason: str | None = None
     try:
-        result = await call_tool(
-            HOUSEHOLD_SERVER, SET_TAKE_TURNS, args, ctx=ctx, token=_service_token()
-        )
+        result = await call_tool(HOUSEHOLD_SERVER, SET_TAKE_TURNS, args, ctx=ctx)
     except ToolRefused as refused:
         log.info("take-turns tap refused: %s", refused.reason)
         result, reason = {}, refused.reason
     async with conn.transaction():
         if reason == WRONG_APPROVER:
-            cur = await conn.execute(_APPROVER_NAME_SQL, (member.household_id,))
+            cur = await unscoped(conn, "ingest").execute(_APPROVER_NAME_SQL, (member.household_id,))
             (name,) = await cur.fetchone() or (None,)
             params = {"approver": name or "the approver"}
             await _reply(conn, run_id, member, inbound, TAKE_TURNS_NOT_APPROVER, params)
@@ -390,15 +387,9 @@ WHERE run_id = %s AND kind = 'approval_expiry' AND status = 'pending' AND ref @>
 
 
 async def _approval(conn: AsyncConnection, approval_id: uuid.UUID) -> dict[str, Any] | None:
-    async with conn.cursor(row_factory=dict_row) as cur:
+    async with unscoped(conn, "ingest").cursor(row_factory=dict_row) as cur:
         await cur.execute(_APPROVAL_SQL, (approval_id,))
         return await cur.fetchone()
-
-
-def _service_token() -> str:
-    # `api`'s own service token (identity-authz §8). Every caller uses the mock issuer
-    # until identity-authz replaces the token source (Q4).
-    return MockIssuer().issue(API_AGENT, API_AGENT, [])
 
 
 async def _approval_tap(
@@ -432,9 +423,7 @@ async def _approval_tap(
     }
     ctx = RunContext(run_id=run_id, agent_id=API_AGENT, conversation_id=None)
     try:
-        result = await call_tool(
-            HOUSEHOLD_SERVER, "decide_approval", args, ctx=ctx, token=_service_token()
-        )
+        result = await call_tool(HOUSEHOLD_SERVER, "decide_approval", args, ctx=ctx)
         status = result.get("status")
     except ToolRefused as refused:
         if refused.reason == WRONG_APPROVER:
@@ -464,7 +453,9 @@ async def _approval_tap(
                 "status": status,
             },
         )
-        await conn.execute(_CANCEL_EXPIRY_SQL, (run_id, Jsonb({"approval_id": str(approval_id)})))
+        await unscoped(conn, "ingest").execute(
+            _CANCEL_EXPIRY_SQL, (run_id, Jsonb({"approval_id": str(approval_id)}))
+        )
         await runs.resume_timeout(conn, run_id)
     elif status == "expired":
         await _reply(conn, run_id, member, inbound, APPROVAL_EXPIRED, {})
@@ -533,7 +524,7 @@ async def _shortfall_button(
     if parsed is None:
         log.info("inbound shortfall button ignored: malformed payload")
         return None
-    cur = await conn.execute(
+    cur = await unscoped(conn, "ingest").execute(
         "SELECT run_id FROM shortfalls WHERE shortfall_id = %s", (parsed.shortfall_id,)
     )
     row = await cur.fetchone()
@@ -547,7 +538,7 @@ async def _shortfall_button(
         conversation_id=ids.shortfall_conversation_id(parsed.shortfall_id),
     )
     try:
-        result = await call_tool(
+        result = await call_tool_as(
             HOUSEHOLD_SERVER,
             CHOOSE_SHORTFALL_OPTION,
             {
@@ -557,7 +548,6 @@ async def _shortfall_button(
                 "user_id": str(member.user_id),
             },
             ctx=ctx,
-            token=_service_token(),
         )
     except ToolRefused as exc:
         log.info("shortfall pick refused", extra={"reason": exc.reason})
