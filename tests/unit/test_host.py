@@ -89,6 +89,43 @@ def test_dispatch_routes_by_to_agent() -> None:
     ]
 
 
+def test_dispatch_reloads_cards_seeded_after_startup() -> None:
+    """#59: `agents` started on an unseeded database still serves cards seeded later."""
+    calls: list[str] = []
+    loads: list[int] = []
+    seeded: list[AgentCard] = []
+
+    async def handle(msg: Inbound, card: AgentCard) -> StepResult:
+        calls.append(card.agent_id)
+        return StepResult()
+
+    async def reload() -> list[AgentCard]:
+        loads.append(1)
+        return list(seeded)
+
+    dispatch = host.Dispatcher([], {"grocery": handle, "delivery": handle}, reload=reload)
+
+    async def go() -> None:
+        # Not seeded yet: one reload, still unknown, so the step fails (fail closed).
+        with pytest.raises(host.NoHandler):
+            await dispatch(_inbound(GROCERY))
+        assert len(loads) == 1
+        seeded.append(_card(GROCERY, "grocery"))
+        await dispatch(_inbound(GROCERY))
+        assert len(loads) == 2
+        # A loaded card does not reload again.
+        await dispatch(_inbound(GROCERY))
+        assert len(loads) == 2
+        # A reload replaces the loaded set, so a card no longer hosted drops out.
+        seeded.clear()
+        seeded.append(_card(DELIVERY, "delivery"))
+        await dispatch(_inbound(DELIVERY))
+        assert set(dispatch.cards) == {DELIVERY}
+
+    asyncio.run(go())
+    assert calls == [GROCERY, GROCERY, DELIVERY]
+
+
 def test_serve_passes_runs_finish_to_consumer(monkeypatch: pytest.MonkeyPatch) -> None:
     """The final-attempt wrapper: the consumer's poison rule calls `runs.finish(error)`."""
     seen: dict[str, Any] = {}
