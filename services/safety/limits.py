@@ -5,7 +5,9 @@ Architecture item 51 (amended 2026-11-02, #44) and agent-protocol P28 (the
 subclass with a fixed wire reason, so a broken limit fails closed through the guard.
 
 `authorize_spend()` runs the `authorize_spend` limits in the §5 order (amended by agents
-AG-A8, #186): allergens, budget, child requester, currency, `a2a_demo`.
+AG-A8, #186, and identity-authz §8 step 3): allergens, approval needed (the band and the
+budget as one check, `check_approval_needed`, identity-authz §9), child requester,
+currency, `a2a_demo`.
 
 `authorize_amendment()` and `check_amend_order()` are the shortfall amendment limits
 (agent-protocol §10 "Applying" and "Amending", P28, #67).
@@ -24,6 +26,7 @@ from services.common.directory import AgentCard
 from services.common.money import Money
 from services.mcp.knowledge.adapters.neo4j_knowledge import Knowledge
 from services.safety.guard import GuardRefused
+from services.safety.scope import unscoped
 
 __all__ = [
     "A2ADemoOrder",
@@ -40,11 +43,13 @@ __all__ = [
     "ShortfallPending",
     "WrongApprover",
     "WrongOrderState",
+    "approval_limits",
     "authorize_amendment",
     "authorize_spend",
     "check_amend_order",
     "check_a2a_demo",
     "check_allergens",
+    "check_approval_needed",
     "check_approver",
     "check_budget",
     "check_child_requester",
@@ -55,8 +60,12 @@ __all__ = [
 
 
 class NeedsApproval(GuardRefused):
-    def __init__(self) -> None:
+    """`detail.limits` names the limits that were hit (`band`, `budget`), computed in code
+    (identity-authz §9); empty for the child-requester rule."""
+
+    def __init__(self, hit: Sequence[str] = ()) -> None:
         super().__init__("needs_approval")
+        self.detail: dict[str, list[str]] = {"limits": list(hit)}
 
 
 class WrongApprover(GuardRefused):
@@ -171,14 +180,62 @@ async def check_budget(
     if not over:
         return
     if not await _approval_covers(conn, household_id, order_id, total):
-        raise NeedsApproval()
+        raise NeedsApproval([LIMIT_BUDGET])
+
+
+LIMIT_BAND = "band"
+LIMIT_BUDGET = "budget"
+
+
+async def _band(conn: AsyncConnection, household_id: str) -> int | None:
+    """`approval_rules.per_order_minor`, or `None` when it is null or there are no rules."""
+    cur = await unscoped(conn, "limits").execute(
+        "SELECT per_order_minor FROM approval_rules WHERE household_id = %s", (household_id,)
+    )
+    row = await cur.fetchone()
+    return None if row is None or row[0] is None else int(row[0])
+
+
+async def approval_limits(conn: AsyncConnection, household_id: str, total: Money) -> list[str]:
+    """The limits `total` is over (identity-authz §9), in the order `band`, `budget`.
+
+    `band`: the household's `per_order_minor` is set and `total` is above it (in the
+    household's currency, the budget's). `budget`: `total` is above what is left of the
+    weekly budget. A total in another currency than the budget raises `CurrencyMismatch`.
+    """
+    remaining = await orders.remaining_weekly_budget(conn, household_id)
+    try:
+        over_budget = total > remaining
+    except money.CurrencyMismatch:
+        raise CurrencyMismatch() from None
+    band = await _band(conn, household_id)
+    hit: list[str] = []
+    if band is not None and total.amount_minor > band:
+        hit.append(LIMIT_BAND)
+    if over_budget:
+        hit.append(LIMIT_BUDGET)
+    return hit
+
+
+async def check_approval_needed(
+    conn: AsyncConnection, household_id: str, order_id: uuid.UUID, total: Money
+) -> None:
+    """One approval, two triggers (identity-authz §9, I20).
+
+    Raise `NeedsApproval` with `detail.limits` when `total` is over the band, the budget or
+    both, unless the order has an `approved` approval of at least `total` in the same
+    currency (a re-quote at or below the approved total stays covered).
+    """
+    hit = await approval_limits(conn, household_id, total)
+    if hit and not await _approval_covers(conn, household_id, order_id, total):
+        raise NeedsApproval(hit)
 
 
 async def _approval_covers(
     conn: AsyncConnection, household_id: str, order_id: uuid.UUID, total: Money
 ) -> bool:
     """True when the order has an `approved` approval of at least `total`, same currency."""
-    cur = await conn.execute(
+    cur = await unscoped(conn, "limits").execute(
         "SELECT 1 FROM approvals WHERE order_id = %s AND household_id = %s"
         " AND status = 'approved' AND amount_minor >= %s AND currency = %s LIMIT 1",
         (order_id, household_id, total.amount_minor, total.currency),
@@ -195,7 +252,7 @@ async def check_child_requester(
     starts, whatever its total or kind, unless an `approved` approval for the order covers
     `total` (the same rule as `check_budget`).
     """
-    cur = await conn.execute(
+    cur = await unscoped(conn, "limits").execute(
         "SELECT hm.role FROM orders o JOIN runs r ON r.run_id = o.run_id"
         " JOIN household_members hm ON hm.household_id = o.household_id"
         " AND hm.user_id::text = r.trigger->>'user_id'"
@@ -236,7 +293,7 @@ async def check_allergens(
 
 async def check_approver(conn: AsyncConnection, household_id: str, user_id: Any) -> None:
     """Raise `WrongApprover` unless `user_id` is the household's `approval_rules` approver."""
-    cur = await conn.execute(
+    cur = await unscoped(conn, "limits").execute(
         "SELECT approver_user_id FROM approval_rules WHERE household_id = %s", (household_id,)
     )
     row = await cur.fetchone()
@@ -246,7 +303,9 @@ async def check_approver(conn: AsyncConnection, household_id: str, user_id: Any)
 
 async def check_currency(conn: AsyncConnection, order_id: uuid.UUID, total: Money) -> None:
     """Raise `CurrencyMismatch` unless `total` is in `orders.currency` (also for no order)."""
-    cur = await conn.execute("SELECT currency FROM orders WHERE order_id = %s", (order_id,))
+    cur = await unscoped(conn, "limits").execute(
+        "SELECT currency FROM orders WHERE order_id = %s", (order_id,)
+    )
     row = await cur.fetchone()
     if row is None or str(row[0]).strip() != total.currency:
         raise CurrencyMismatch()
@@ -254,7 +313,7 @@ async def check_currency(conn: AsyncConnection, order_id: uuid.UUID, total: Mone
 
 async def check_a2a_demo(conn: AsyncConnection, order_id: uuid.UUID) -> None:
     """Raise `A2ADemoOrder` when the order's run is an `a2a_demo` run (or has no run)."""
-    cur = await conn.execute(
+    cur = await unscoped(conn, "limits").execute(
         "SELECT r.kind FROM orders o JOIN runs r ON r.run_id = o.run_id WHERE o.order_id = %s",
         (order_id,),
     )
@@ -292,9 +351,10 @@ async def authorize_spend(
     member_allergens: Mapping[Any, Iterable[str]],
     knowledge: Knowledge,
 ) -> None:
-    """The `authorize_spend` limits, in order: allergens, budget, child, currency, `a2a_demo`."""
+    """The `authorize_spend` limits, in order: allergens, approval needed (band and budget,
+    identity-authz §9), child, currency, `a2a_demo`."""
     await check_allergens(items, member_allergens, knowledge)
-    await check_budget(conn, household_id, order_id, total)
+    await check_approval_needed(conn, household_id, order_id, total)
     await check_child_requester(conn, household_id, order_id, total)
     await check_currency(conn, order_id, total)
     await check_a2a_demo(conn, order_id)
@@ -363,7 +423,7 @@ async def authorize_amendment(
     *   it conflicts with any member's allergies, or is unknown to the knowledge graph, or
         the graph call fails (every substitute is then refused).
     """
-    cur = await conn.execute(
+    cur = await unscoped(conn, "limits").execute(
         "SELECT s.lines, s.status, o.state FROM shortfalls s"
         " JOIN orders o ON o.order_id = s.order_id"
         " WHERE s.shortfall_id = %s AND s.order_id = %s",
@@ -429,7 +489,7 @@ async def check_amend_order(
     `idempotency_key(order_id, "authorize_amendment", household_agent_id,
     scope=shortfall_id)` (`AmendmentNotAuthorized`, also when there is no finished result).
     """
-    cur = await conn.execute(
+    cur = await unscoped(conn, "limits").execute(
         "SELECT 1 FROM shortfalls"
         " WHERE shortfall_id = %s AND order_id = %s AND seller_agent_id = %s",
         (shortfall_id, order_id, seller_agent_id),
@@ -439,7 +499,7 @@ async def check_amend_order(
     key = ids.idempotency_key(
         order_id, "authorize_amendment", household_agent_id, scope=shortfall_id
     )
-    cur = await conn.execute(
+    cur = await unscoped(conn, "limits").execute(
         "SELECT result FROM idempotency_keys WHERE key = %s AND status = 'done'", (key,)
     )
     row = await cur.fetchone()

@@ -58,7 +58,6 @@ from zoneinfo import ZoneInfo
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import CallToolResult, TextContent
 from psycopg import AsyncConnection
-from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, ValidationError
 
@@ -68,11 +67,12 @@ from services.common.money import Money
 from services.common.money import format as money_format
 from services.common.protocol.schemas import Currency, OrderLine, ShortfallLine
 from services.common.trace import TraceStore
+from services.identity import audit
 from services.mcp.knowledge.adapters.neo4j_knowledge import AllergenCheck
 from services.mcp.knowledge.server import get_knowledge
 from services.mcp.meta import CallContext, tool_error, tool_errors
 from services.mcp.traced import Tool, traced
-from services.safety import limits
+from services.safety import limits, scope
 from services.safety.guard import GuardRefused, run_guarded
 
 __all__ = [
@@ -182,30 +182,44 @@ def _require_household(household: str | None) -> str:
     return household
 
 
+def _scoped(conn: AsyncConnection, household: str | None) -> scope.Scoped:
+    """Queries bound to the run's household (`runs.household_id`, identity-authz §8
+    "Scoping helper"); with no household the call is refused `authz_denied`."""
+    return scope.scoped(conn, scope.HouseholdScope(_require_household(household), "run"))
+
+
 async def _order(conn: AsyncConnection, order_id: uuid.UUID, household: str) -> dict[str, Any]:
     """The order, refused like `addresses.resolve` when it is missing or another household's."""
-    async with conn.cursor(row_factory=dict_row) as cur:
-        await cur.execute(
-            "SELECT household_id, kind, state, currency FROM orders WHERE order_id = %s",
-            (order_id,),
-        )
-        row = await cur.fetchone()
-    if row is None or row["household_id"] != household:
+    rows = await _scoped(conn, household).fetch(
+        "SELECT household_id, kind, state, currency FROM orders"
+        " WHERE order_id = %(order)s AND household_id = %(household)s",
+        order=order_id,
+    )
+    if not rows:
         raise GuardRefused(AUTHZ_DENIED)
-    return row
+    household_id, kind, state, currency = rows[0]
+    return {"household_id": household_id, "kind": kind, "state": state, "currency": currency}
 
 
 async def _member_allergens(conn: AsyncConnection, household: str) -> dict[str, list[str]]:
-    cur = await conn.execute(
+    rows = await _scoped(conn, household).fetch(
         "SELECT m.user_id, c.value FROM household_members m"
         " JOIN member_constraints c ON c.user_id = m.user_id AND c.kind = 'allergy'"
-        " WHERE m.household_id = %s ORDER BY m.user_id, c.value",
-        (household,),
+        " WHERE m.household_id = %(household)s ORDER BY m.user_id, c.value"
     )
     allergens: dict[str, list[str]] = {}
-    for user_id, code in await cur.fetchall():
+    for user_id, code in rows:
         allergens.setdefault(str(user_id), []).append(code)
     return allergens
+
+
+async def _is_member(conn: AsyncConnection, household: str | None, user_id: Any) -> bool:
+    """Whether `user_id` is a member of the run's household (refused with no household)."""
+    rows = await _scoped(conn, household).fetch(
+        "SELECT 1 FROM household_members WHERE household_id = %(household)s AND user_id = %(user)s",
+        user=user_id,
+    )
+    return bool(rows)
 
 
 def _money(value: MoneyArg | Mapping[str, Any]) -> Money:
@@ -229,15 +243,17 @@ async def get_constraints(ctx: CallContext, *, user_id: uuid.UUID) -> dict[str, 
     """
     if ids.parse_agent_id(ctx.agent_id)[0] == "household":
         return await _household_constraints(ctx, user_id)
+    household = await _run_household(ctx)
 
     async def call() -> dict[str, Any]:
         async with db.get_pool().connection() as conn:
-            cur = await conn.execute(
-                "SELECT kind, value FROM member_constraints WHERE user_id = %s"
-                " ORDER BY kind, value",
-                (user_id,),
+            rows = await _scoped(conn, household).fetch(
+                "SELECT c.kind, c.value FROM member_constraints c"
+                " JOIN household_members m ON m.user_id = c.user_id"
+                " AND m.household_id = %(household)s"
+                " WHERE c.user_id = %(user)s ORDER BY c.kind, c.value",
+                user=user_id,
             )
-            rows = await cur.fetchall()
         by_kind: dict[str, list[str]] = {"allergy": [], "diet": [], "dislike": []}
         for kind, value in rows:
             by_kind[kind].append(value)
@@ -266,24 +282,17 @@ async def _household_constraints(ctx: CallContext, user_id: uuid.UUID) -> dict[s
     household = await _run_household(ctx)
 
     async def check(conn: AsyncConnection) -> None:
-        h = _require_household(household)
-        cur = await conn.execute(
-            "SELECT 1 FROM household_members WHERE household_id = %s AND user_id = %s",
-            (h, user_id),
-        )
-        if await cur.fetchone() is None:
+        if not await _is_member(conn, household, user_id):
             raise GuardRefused(AUTHZ_DENIED)
 
     async def call() -> dict[str, Any]:
         async with db.get_pool().connection() as conn:
-            cur = await conn.execute(
+            rows = await _scoped(conn, household).fetch(
                 "SELECT m.user_id, c.kind, c.value FROM household_members m"
                 " LEFT JOIN member_constraints c ON c.user_id = m.user_id"
                 "  AND c.kind IN ('allergy', 'diet')"
-                " WHERE m.household_id = %s ORDER BY m.user_id, c.kind, c.value",
-                (household,),
+                " WHERE m.household_id = %(household)s ORDER BY m.user_id, c.kind, c.value"
             )
-            rows = await cur.fetchall()
         members: dict[str, dict[str, Any]] = {}
         for member, kind, value in rows:
             entry = members.setdefault(
@@ -316,26 +325,36 @@ async def create_order(ctx: CallContext, *, order_id: uuid.UUID, kind: str) -> d
         h = _require_household(household)
         if kind not in ("grocery", "dinner"):
             raise GuardRefused(INVALID_KIND)
-        cur = await conn.execute("SELECT household_id FROM orders WHERE order_id = %s", (order_id,))
-        row = await cur.fetchone()
-        if row is not None and row[0] != h:
+        # An order id already used by another household is refused.
+        other = await _scoped(conn, h).fetch(
+            "SELECT 1 FROM orders WHERE order_id = %(order)s"
+            " AND household_id IS DISTINCT FROM %(household)s",
+            order=order_id,
+        )
+        if other:
             raise GuardRefused(AUTHZ_DENIED)
 
     async def call() -> dict[str, Any]:
         return {"order_id": str(order_id), "kind": kind, "state": "draft"}
 
     async def apply(conn: AsyncConnection, result: Any) -> None:
-        cur = await conn.execute(
+        q = _scoped(conn, household)
+        cur = await q.execute(
             "INSERT INTO orders (order_id, run_id, household_id, kind, currency, address_ref)"
-            " SELECT %s, %s, h.household_id, %s, h.currency, a.address_ref"
+            " SELECT %(order)s, %(run)s, h.household_id, %(kind)s, h.currency, a.address_ref"
             " FROM households h JOIN household_addresses a ON a.household_id = h.household_id"
-            " WHERE h.household_id = %s ORDER BY a.created_at, a.address_ref LIMIT 1"
+            " WHERE h.household_id = %(household)s ORDER BY a.created_at, a.address_ref LIMIT 1"
             " ON CONFLICT (order_id) DO NOTHING",
-            (order_id, ctx.run_id, kind, household),
+            order=order_id,
+            run=ctx.run_id,
+            kind=kind,
         )
         if cur.rowcount == 0:
-            cur = await conn.execute("SELECT 1 FROM orders WHERE order_id = %s", (order_id,))
-            if await cur.fetchone() is None:
+            found = await q.fetch(
+                "SELECT 1 FROM orders WHERE order_id = %(order)s AND household_id = %(household)s",
+                order=order_id,
+            )
+            if not found:
                 raise LookupError(f"household {household} has no address")
 
     return await run_guarded(
@@ -422,16 +441,25 @@ async def authorize_spend(
         )
         if not moved:
             raise RuntimeError(f"order {order_id} is no longer awaiting authorization")
-        await conn.execute("DELETE FROM order_items WHERE order_id = %s", (order_id,))
-        async with conn.cursor() as cur:
-            await cur.executemany(
+        q = _scoped(conn, household)
+        await q.execute(
+            "DELETE FROM order_items WHERE order_id = %(order)s AND order_id IN"
+            " (SELECT order_id FROM orders WHERE household_id = %(household)s)",
+            order=order_id,
+        )
+        for i in lines:
+            await q.execute(
                 "INSERT INTO order_items"
                 " (order_id, line, sku, name, qty, unit_minor, substituted_for)"
-                " VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                [
-                    (order_id, i.line, i.sku, i.name, i.qty, i.unit_minor, i.substituted_for)
-                    for i in lines
-                ],
+                " SELECT o.order_id, %(line)s, %(sku)s, %(name)s, %(qty)s, %(unit)s, %(sub)s"
+                " FROM orders o WHERE o.order_id = %(order)s AND o.household_id = %(household)s",
+                order=order_id,
+                line=i.line,
+                sku=i.sku,
+                name=i.name,
+                qty=i.qty,
+                unit=i.unit_minor,
+                sub=i.substituted_for,
             )
 
     return await run_guarded(
@@ -541,6 +569,7 @@ async def request_approval(
     money = _money(amount)
     approval_id = ids.approval_id(order_id)
     approver: list[str] = []
+    hit: list[str] = []
 
     async def check(conn: AsyncConnection) -> None:
         h = _require_household(household)
@@ -548,13 +577,15 @@ async def request_approval(
         if order["state"] not in ("negotiating", "awaiting_approval"):
             raise GuardRefused(INVALID_STATE)
         await limits.check_currency(conn, order_id, money)
-        cur = await conn.execute(
-            "SELECT approver_user_id FROM approval_rules WHERE household_id = %s", (h,)
+        rows = await _scoped(conn, h).fetch(
+            "SELECT approver_user_id FROM approval_rules WHERE household_id = %(household)s"
         )
-        row = await cur.fetchone()
-        if row is None:
+        if not rows:
             raise GuardRefused(NO_APPROVER)
-        approver.append(str(row[0]))
+        approver.append(str(rows[0][0]))
+        # Which limits sent the order here (identity-authz §9), stored in
+        # `approvals.limits`; empty when only the child-requester rule applies.
+        hit.extend(await limits.approval_limits(conn, h, money))
 
     async def call() -> dict[str, Any]:
         return {
@@ -567,11 +598,17 @@ async def request_approval(
         }
 
     async def apply(conn: AsyncConnection, result: Any) -> None:
-        await conn.execute(
+        await _scoped(conn, household).execute(
             "INSERT INTO approvals"
-            " (approval_id, run_id, household_id, order_id, amount_minor, currency)"
-            " VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (approval_id) DO NOTHING",
-            (approval_id, ctx.run_id, household, order_id, money.amount_minor, money.currency),
+            " (approval_id, run_id, household_id, order_id, amount_minor, currency, limits)"
+            " VALUES (%(approval)s, %(run)s, %(household)s, %(order)s, %(amount)s,"
+            " %(currency)s, %(limits)s) ON CONFLICT (approval_id) DO NOTHING",
+            approval=approval_id,
+            run=ctx.run_id,
+            order=order_id,
+            amount=money.amount_minor,
+            currency=money.currency,
+            limits=hit,
         )
         if not await orders.transition(conn, order_id, "negotiating", "awaiting_approval"):
             raise RuntimeError(f"order {order_id} is no longer negotiating")
@@ -612,35 +649,59 @@ async def decide_approval(
 ) -> dict[str, Any]:
     """The approver's decision, from `api` with its service token.
 
-    `user_id` must be `approval_rules.approver_user_id`. The update is conditional on
+    `user_id` must be `approval_rules.approver_user_id`. The approval must belong to the
+    run's household (the call's run is the approval's run). The update is conditional on
     `pending`: the result's `outcome` is `decided`, or `already_decided` with the current
-    status (for example `expired` by the sweeper).
+    status (for example `expired` by the sweeper). A decision writes the
+    `approval_decided` audit event in the same transaction (identity-authz §14, I30).
     """
+    household = await _run_household(ctx)
 
     async def check(conn: AsyncConnection) -> None:
         if ctx.agent_id != API_AGENT:
             raise GuardRefused(AUTHZ_DENIED)
         if decision not in _DECISIONS:
             raise GuardRefused(INVALID_DECISION)
-        cur = await conn.execute(
-            "SELECT household_id FROM approvals WHERE approval_id = %s", (approval_id,)
+        rows = await _scoped(conn, household).fetch(
+            "SELECT 1 FROM approvals"
+            " WHERE approval_id = %(approval)s AND household_id = %(household)s",
+            approval=approval_id,
         )
-        row = await cur.fetchone()
-        if row is None:
+        if not rows:
             raise GuardRefused(AUTHZ_DENIED)
-        await limits.check_approver(conn, row[0], user_id)
+        await limits.check_approver(conn, household, user_id)
 
     async def call() -> dict[str, Any]:
         async with db.get_pool().connection() as conn, conn.transaction():
-            cur = await conn.execute(
-                "UPDATE approvals SET status = %s, decided_at = now(), decided_by = %s"
-                " WHERE approval_id = %s AND status = 'pending'"
-                " RETURNING order_id, amount_minor, currency",
-                (decision, user_id, approval_id),
+            q = _scoped(conn, household)
+            cur = await q.execute(
+                "UPDATE approvals SET status = %(decision)s, decided_at = now(),"
+                " decided_by = %(user)s WHERE approval_id = %(approval)s"
+                " AND household_id = %(household)s AND status = 'pending'"
+                " RETURNING order_id, amount_minor, currency, limits",
+                decision=decision,
+                user=user_id,
+                approval=approval_id,
             )
             row = await cur.fetchone()
             if row is not None:
-                order_id, amount_minor, currency = row
+                order_id, amount_minor, currency, hit = row
+                await audit.record(
+                    conn,
+                    "approval_decided",
+                    actor_user_id=user_id,
+                    agent_id=ctx.agent_id,
+                    household_id=household,
+                    run_id=ctx.run_id,
+                    detail={
+                        "approval_id": str(approval_id),
+                        "order_id": str(order_id),
+                        "decision": decision,
+                        "amount_minor": int(amount_minor),
+                        "currency": str(currency).strip(),
+                        "limits": list(hit or []),
+                    },
+                )
                 await _TRACES.write(
                     ctx.run_id,
                     ctx.agent_id,
@@ -658,11 +719,12 @@ async def decide_approval(
                 )
                 outcome, status = "decided", decision
             else:
-                cur = await conn.execute(
-                    "SELECT order_id, status FROM approvals WHERE approval_id = %s",
-                    (approval_id,),
+                rows = await q.fetch(
+                    "SELECT order_id, status FROM approvals"
+                    " WHERE approval_id = %(approval)s AND household_id = %(household)s",
+                    approval=approval_id,
                 )
-                order_id, status = await cur.fetchone() or (None, None)
+                order_id, status = rows[0] if rows else (None, None)
                 outcome = "already_decided"
         return {
             "approval_id": str(approval_id),
@@ -699,17 +761,19 @@ async def record_delivery(ctx: CallContext, *, order_id: uuid.UUID) -> dict[str,
 
     async def call() -> dict[str, Any]:
         async with db.get_pool().connection() as conn, conn.transaction():
-            cur = await conn.execute(
+            cur = await _scoped(conn, household).execute(
                 "INSERT INTO pantry_events"
                 " (household_id, item, pantry_item, kind, delta, unit, source, order_id, run_id)"
-                " SELECT %s, oi.sku, ci.pantry_item, 'add', sum(oi.qty), 'each', 'delivery',"
-                " oi.order_id, %s FROM order_items oi"
+                " SELECT %(household)s, oi.sku, ci.pantry_item, 'add', sum(oi.qty), 'each',"
+                " 'delivery', oi.order_id, %(run)s FROM order_items oi"
                 " JOIN orders o ON o.order_id = oi.order_id"
                 " LEFT JOIN catalog_items ci"
                 " ON ci.agent_id = o.seller_agent_id AND ci.sku = oi.sku"
-                " WHERE oi.order_id = %s GROUP BY oi.order_id, oi.sku, ci.pantry_item"
+                " WHERE oi.order_id = %(order)s AND o.household_id = %(household)s"
+                " GROUP BY oi.order_id, oi.sku, ci.pantry_item"
                 " ON CONFLICT (order_id, item) WHERE order_id IS NOT NULL DO NOTHING",
-                (household, ctx.run_id, order_id),
+                run=ctx.run_id,
+                order=order_id,
             )
         return {"order_id": str(order_id), "recorded": cur.rowcount}
 
@@ -764,34 +828,47 @@ async def record_dislike(
     Both branches are safe to repeat, so there is no key.
     """
     normalized = dislikes.check_value(value)
+    household = await _run_household(ctx)
 
     async def check(conn: AsyncConnection) -> None:
         if normalized is None or action not in _DISLIKE_ACTIONS:
             raise GuardRefused(INVALID_VALUE)
+        if not await _is_member(conn, household, user_id):
+            raise GuardRefused(AUTHZ_DENIED)
 
     async def call() -> dict[str, Any]:
         async with db.get_pool().connection() as conn, conn.transaction():
+            q = _scoped(conn, household)
             if action == "add":
-                cur = await conn.execute(
-                    "SELECT 1 FROM member_constraints"
-                    " WHERE user_id = %s AND kind = 'dislike' AND lower(value) = %s",
-                    (user_id, normalized),
+                found = await q.fetch(
+                    "SELECT 1 FROM member_constraints WHERE user_id = %(user)s"
+                    " AND user_id IN (SELECT user_id FROM household_members"
+                    " WHERE household_id = %(household)s)"
+                    " AND kind = 'dislike' AND lower(value) = %(value)s",
+                    user=user_id,
+                    value=normalized,
                 )
-                if await cur.fetchone() is not None:
+                if found:
                     outcome = "already_present"
                 else:
-                    cur = await conn.execute(
+                    cur = await q.execute(
                         "INSERT INTO member_constraints (user_id, kind, value, source)"
-                        " VALUES (%s, 'dislike', %s, 'learned')"
+                        " SELECT user_id, 'dislike', %(value)s, 'learned'"
+                        " FROM household_members"
+                        " WHERE household_id = %(household)s AND user_id = %(user)s"
                         " ON CONFLICT (user_id, value) WHERE source = 'learned' DO NOTHING",
-                        (user_id, normalized),
+                        user=user_id,
+                        value=normalized,
                     )
                     outcome = "added" if cur.rowcount == 1 else "already_present"
             else:
-                cur = await conn.execute(
-                    "DELETE FROM member_constraints"
-                    " WHERE user_id = %s AND value = %s AND source = 'learned'",
-                    (user_id, normalized),
+                cur = await q.execute(
+                    "DELETE FROM member_constraints WHERE user_id = %(user)s"
+                    " AND user_id IN (SELECT user_id FROM household_members"
+                    " WHERE household_id = %(household)s)"
+                    " AND value = %(value)s AND source = 'learned'",
+                    user=user_id,
+                    value=normalized,
                 )
                 outcome = "removed" if cur.rowcount > 0 else "not_learned"
         return {"user_id": str(user_id), "value": normalized, "outcome": outcome}
@@ -821,16 +898,16 @@ async def get_household_rules(ctx: CallContext) -> dict[str, Any]:
 
     async def call() -> dict[str, Any]:
         async with db.get_pool().connection() as conn:
-            cur = await conn.execute(
-                "SELECT take_turns, turn_index FROM household_rules WHERE household_id = %s",
-                (household,),
+            q = _scoped(conn, household)
+            found = await q.fetch(
+                "SELECT take_turns, turn_index FROM household_rules"
+                " WHERE household_id = %(household)s"
             )
-            rules = await cur.fetchone()
-            cur = await conn.execute(
-                "SELECT approver_user_id FROM approval_rules WHERE household_id = %s",
-                (household,),
+            approvers = await q.fetch(
+                "SELECT approver_user_id FROM approval_rules WHERE household_id = %(household)s"
             )
-            approver = await cur.fetchone()
+        rules = found[0] if found else None
+        approver = approvers[0] if approvers else None
         take_turns, turn_index = rules if rules is not None else (False, 0)
         return {
             "take_turns": bool(take_turns),
@@ -861,22 +938,22 @@ async def advance_turn(ctx: CallContext, *, order_id: uuid.UUID) -> dict[str, An
     household = await _run_household(ctx)
 
     async def check(conn: AsyncConnection) -> None:
-        h = _require_household(household)
-        cur = await conn.execute(
-            "SELECT household_id, kind, state FROM orders WHERE order_id = %s", (order_id,)
+        rows = await _scoped(conn, household).fetch(
+            "SELECT kind, state FROM orders"
+            " WHERE order_id = %(order)s AND household_id = %(household)s",
+            order=order_id,
         )
-        row = await cur.fetchone()
-        if row is None or tuple(row) != (h, "dinner", "delivered"):
+        if not rows or tuple(rows[0]) != ("dinner", "delivered"):
             raise GuardRefused(WRONG_ORDER_STATE)
 
     async def call() -> dict[str, Any]:
         async with db.get_pool().connection() as conn, conn.transaction():
-            cur = await conn.execute(
+            cur = await _scoped(conn, household).execute(
                 "UPDATE household_rules SET turn_index = turn_index + 1,"
-                " last_turn_order_id = %s, updated_at = now()"
-                " WHERE household_id = %s AND take_turns"
-                " AND last_turn_order_id IS DISTINCT FROM %s",
-                (order_id, household, order_id),
+                " last_turn_order_id = %(order)s, updated_at = now()"
+                " WHERE household_id = %(household)s AND take_turns"
+                " AND last_turn_order_id IS DISTINCT FROM %(order)s",
+                order=order_id,
             )
         return {"advanced": cur.rowcount == 1}
 
@@ -898,35 +975,33 @@ async def set_take_turns(
     """The approver's take-turns tap, from `api` with its service token (agents §10).
 
     Built like `decide_approval`: no relation; the caller must be `system:api`, the
-    order must exist (else `authz_denied`) and `user_id` must be its household's
+    order must be the run's household's (else `authz_denied`) and `user_id` must be its
     approver (else `wrong_approver`). `changed` says whether take-turns changed; writing
     the same value again is harmless, so there is no key.
     """
-    household: list[str] = []
+    household = await _run_household(ctx)
 
     async def check(conn: AsyncConnection) -> None:
         if ctx.agent_id != API_AGENT:
             raise GuardRefused(AUTHZ_DENIED)
-        cur = await conn.execute("SELECT household_id FROM orders WHERE order_id = %s", (order_id,))
-        row = await cur.fetchone()
-        if row is None:
-            raise GuardRefused(AUTHZ_DENIED)
-        await limits.check_approver(conn, row[0], user_id)
-        household.append(row[0])
+        await _order(conn, order_id, _require_household(household))
+        await limits.check_approver(conn, household, user_id)
 
     async def call() -> dict[str, Any]:
         async with db.get_pool().connection() as conn, conn.transaction():
-            cur = await conn.execute(
-                "SELECT take_turns FROM household_rules WHERE household_id = %s FOR UPDATE",
-                (household[0],),
+            q = _scoped(conn, household)
+            found = await q.fetch(
+                "SELECT take_turns FROM household_rules"
+                " WHERE household_id = %(household)s FOR UPDATE"
             )
-            before = await cur.fetchone()
-            await conn.execute(
+            before = found[0] if found else None
+            await q.execute(
                 "INSERT INTO household_rules (household_id, take_turns, set_by)"
-                " VALUES (%s, %s, %s) ON CONFLICT (household_id) DO UPDATE"
+                " VALUES (%(household)s, %(on)s, %(user)s) ON CONFLICT (household_id) DO UPDATE"
                 " SET take_turns = EXCLUDED.take_turns, set_by = EXCLUDED.set_by,"
                 " updated_at = now()",
-                (household[0], on, user_id),
+                on=on,
+                user=user_id,
             )
         was_on = False if before is None else bool(before[0])
         return {"changed": was_on != on, "take_turns": on}
@@ -963,26 +1038,24 @@ async def choose_shortfall_option(
     `pending` and the line has none, so the first valid pick per line wins. When that
     pick completes every line, the same transaction closes the row and sends
     `shortfall_closed {reason: all_picked}` from `system:api`. The result's `outcome` is
-    `chosen` or `already_decided`.
+    `chosen` or `already_decided`. The shortfall's order must be the run's household's
+    (the call's run is the shortfall's run).
     """
+    household = await _run_household(ctx)
 
     async def check(conn: AsyncConnection) -> None:
         if ctx.agent_id != API_AGENT:
             raise GuardRefused(AUTHZ_DENIED)
-        cur = await conn.execute(
-            "SELECT s.lines, o.household_id FROM shortfalls s"
-            " JOIN orders o ON o.order_id = s.order_id WHERE s.shortfall_id = %s",
-            (shortfall_id,),
+        rows = await _scoped(conn, household).fetch(
+            "SELECT s.lines FROM shortfalls s"
+            " JOIN orders o ON o.order_id = s.order_id"
+            " WHERE s.shortfall_id = %(shortfall)s AND o.household_id = %(household)s",
+            shortfall=shortfall_id,
         )
-        row = await cur.fetchone()
-        if row is None:
+        if not rows:
             raise limits.ShortfallNotFound()
-        lines, household = row
-        cur = await conn.execute(
-            "SELECT 1 FROM household_members WHERE household_id = %s AND user_id = %s",
-            (household, user_id),
-        )
-        if await cur.fetchone() is None:
+        (lines,) = rows[0]
+        if not await _is_member(conn, household, user_id):
             raise GuardRefused(AUTHZ_DENIED)
         if not _notice_pick_allowed(lines, line, pick):
             raise limits.PickNotInNotice(line)
@@ -1018,10 +1091,6 @@ async def choose_shortfall_option(
                 )
                 if cur.rowcount == 1:
                     status = "closed"
-                    cur = await conn.execute(
-                        "SELECT household_id FROM orders WHERE order_id = %s", (order_id,)
-                    )
-                    (household,) = await cur.fetchone() or (None,)
                     await outbox.send(
                         conn,
                         message_id=ids.shortfall_closed_id(shortfall_id),
@@ -1138,8 +1207,7 @@ async def set_order_state(
             changed = await orders.transition(conn, order_uuid, expected, new)
         except ValueError:
             raise GuardRefused(STATE_NOT_ALLOWED) from None
-        cur = await conn.execute("SELECT state FROM orders WHERE order_id = %s", (order_uuid,))
-        (state,) = await cur.fetchone() or (None,)
+        state = (await _order(conn, order_uuid, household))["state"]
     return {"order_id": order_id, "state": state, "changed": changed}
 
 
@@ -1155,28 +1223,29 @@ async def get_pantry(ctx: CallContext) -> dict[str, Any]:
     enabled = pantry.is_enabled(ctx.env)
     vocab = pantry.load_vocabulary() if enabled else None
     async with db.get_pool().connection() as conn:
-        cur = await conn.execute(
-            "SELECT item, unit, sum(delta) FROM pantry_events WHERE household_id = %s"
+        q = _scoped(conn, household)
+        rows = await q.fetch(
+            "SELECT item, unit, sum(delta) FROM pantry_events WHERE household_id = %(household)s"
             # COLLATE "C": the order is byte order on every database, whatever its locale.
             " GROUP BY item, unit HAVING sum(delta) > 0"
-            ' ORDER BY item COLLATE "C", unit COLLATE "C"',
-            (household,),
+            ' ORDER BY item COLLATE "C", unit COLLATE "C"'
         )
-        rows = await cur.fetchall()
         cur = await conn.execute("SELECT now()")
         row = await cur.fetchone()
         assert row is not None
         as_of: datetime = row[0]
         latest: list[dict[str, Any]] = []
         if vocab is not None:
-            async with conn.cursor(row_factory=dict_row) as dcur:
-                await dcur.execute(
-                    "SELECT DISTINCT ON (pantry_item) pantry_item, event_id, kind, ts"
-                    " FROM pantry_events WHERE household_id = %s AND pantry_item IS NOT NULL"
-                    " ORDER BY pantry_item, event_id DESC",
-                    (household,),
-                )
-                latest = await dcur.fetchall()
+            found = await q.fetch(
+                "SELECT DISTINCT ON (pantry_item) pantry_item, event_id, kind, ts"
+                " FROM pantry_events"
+                " WHERE household_id = %(household)s AND pantry_item IS NOT NULL"
+                " ORDER BY pantry_item, event_id DESC"
+            )
+            latest = [
+                {"pantry_item": item, "event_id": event_id, "kind": kind, "ts": ts}
+                for item, event_id, kind, ts in found
+            ]
     estimates = (
         [
             asdict(pantry.estimate(event, vocab.window_days[event["pantry_item"]], as_of))
@@ -1200,14 +1269,13 @@ async def get_budget(ctx: CallContext) -> dict[str, Any]:
     """The run household's weekly budget and what remains of it this week."""
     household = _require_household(await _run_household(ctx))
     async with db.get_pool().connection() as conn:
-        cur = await conn.execute(
+        found = await _scoped(conn, household).fetch(
             "SELECT amount_minor, currency FROM budgets"
-            " WHERE household_id = %s AND period = 'weekly'",
-            (household,),
+            " WHERE household_id = %(household)s AND period = 'weekly'"
         )
-        row = await cur.fetchone()
-        if row is None:
+        if not found:
             raise LookupError(f"no weekly budget for household {household}")
+        row = found[0]
         remaining = await orders.remaining_weekly_budget(conn, household)
     return {
         "household_id": household,
@@ -1267,11 +1335,14 @@ async def open_shortfall(
     if sf_uuid != ids.shortfall_id(order_uuid):
         raise GuardRefused(INVALID_SHORTFALL)
     async with db.get_pool().connection() as conn, conn.transaction():
-        await _order(conn, order_uuid, household)
-        cur = await conn.execute(
-            "SELECT seller_agent_id FROM orders WHERE order_id = %s", (order_uuid,)
+        found = await _scoped(conn, household).fetch(
+            "SELECT seller_agent_id FROM orders"
+            " WHERE order_id = %(order)s AND household_id = %(household)s",
+            order=order_uuid,
         )
-        (order_seller,) = await cur.fetchone() or (None,)
+        if not found:
+            raise GuardRefused(AUTHZ_DENIED)
+        (order_seller,) = found[0]
         if order_seller is None or order_seller != seller:
             raise GuardRefused(AUTHZ_DENIED)
         cur = await conn.execute(
@@ -1298,16 +1369,17 @@ async def get_shortfall(ctx: CallContext, *, shortfall_id: str) -> dict[str, Any
     sf_uuid = _uuid(shortfall_id)
     household = _require_household(await _run_household(ctx))
     async with db.get_pool().connection() as conn:
-        async with conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                "SELECT s.order_id, s.seller_agent_id, s.lines, s.picks, s.status, s.due_at,"
-                " s.closed_at, o.household_id FROM shortfalls s"
-                " JOIN orders o ON o.order_id = s.order_id WHERE s.shortfall_id = %s",
-                (sf_uuid,),
-            )
-            row = await cur.fetchone()
-    if row is None or row["household_id"] != household:
+        found = await _scoped(conn, household).fetch(
+            "SELECT s.order_id, s.seller_agent_id, s.lines, s.picks, s.status, s.due_at,"
+            " s.closed_at FROM shortfalls s"
+            " JOIN orders o ON o.order_id = s.order_id"
+            " WHERE s.shortfall_id = %(shortfall)s AND o.household_id = %(household)s",
+            shortfall=sf_uuid,
+        )
+    if not found:
         raise GuardRefused(AUTHZ_DENIED)
+    keys = ("order_id", "seller_agent_id", "lines", "picks", "status", "due_at", "closed_at")
+    row = dict(zip(keys, found[0], strict=True))
     return {
         "shortfall_id": shortfall_id,
         "order_id": str(row["order_id"]),

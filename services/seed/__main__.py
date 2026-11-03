@@ -392,7 +392,12 @@ def _seed_household(
                 conn,
                 "approval_rules",
                 ["household_id"],
-                {"household_id": hid, "approver_user_id": user_id},
+                {
+                    "household_id": hid,
+                    "approver_user_id": user_id,
+                    # The band (identity-authz I27); NULL means no band limit.
+                    "per_order_minor": hh.get("per_order_minor"),
+                },
             )
         phone, mode = None, "sim"
         if from_env and us1_phones is not None:

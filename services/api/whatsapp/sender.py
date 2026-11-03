@@ -42,6 +42,7 @@ from services.api.whatsapp import templates
 from services.common.config import Settings
 from services.common.consumer import Inbound, StepFailed, StepResult
 from services.common.trace import TraceStore
+from services.safety.scope import unscoped
 
 __all__ = [
     "ATTEMPTS",
@@ -405,7 +406,7 @@ class Sender:
         body = msg.body.model_dump(mode="json")
         user_id = body["user_id"]
         async with self._connect() as conn:
-            async with conn.cursor(row_factory=dict_row) as cur:
+            async with unscoped(conn, "whatsapp_sender").cursor(row_factory=dict_row) as cur:
                 await cur.execute(_PHONE_SQL, {"window": WINDOW, "user_id": user_id})
                 phone = await cur.fetchone()
                 if phone is None:
@@ -474,7 +475,7 @@ async def _sim(
     outcome, in one transaction."""
     message_id = str(msg.row.message_id)
     async with conn.transaction():
-        await conn.execute(
+        await unscoped(conn, "whatsapp_sender").execute(
             _SIM_SQL,
             {
                 "phone": phone,
@@ -504,7 +505,7 @@ async def _hold_or_skip(conn: AsyncConnection, msg: Inbound, body: dict[str, Any
     ref = body.get("ref") or {}
     if templates.holdable(key, ref.get("kind")):
         async with conn.transaction():
-            await conn.execute(
+            await unscoped(conn, "whatsapp_sender").execute(
                 _HOLD_SQL,
                 (msg.row.message_id, body["user_id"], Jsonb(body), ref["kind"], ref["id"]),
             )
@@ -524,7 +525,7 @@ async def _record(
 ) -> None:
     """One `whatsapp_sends` row and one `decision` trace row for a send's outcome (§5)."""
     async with conn.transaction():
-        await conn.execute(
+        await unscoped(conn, "whatsapp_sender").execute(
             _SENDS_SQL, (msg.row.message_id, user_id, outcome, reason, graph_message_id)
         )
         await _TRACES.write(

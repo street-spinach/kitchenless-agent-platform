@@ -63,6 +63,7 @@ from services.common.directory import AgentCard
 from services.common.mcp_client import ToolRefused
 from services.common.protocol.schemas import AllergenCode, Constraints, DietCode
 from services.common.run_context import RunContext
+from services.safety.scope import unscoped
 
 __all__ = [
     "CHAT_REPLY_TEMPLATE",
@@ -581,7 +582,7 @@ def _build_default() -> ConsumerGraph:
 
     async def load_run(run_id: UUID) -> RunInfo:
         async with pool.connection() as conn:
-            cur = await conn.execute(_RUN_SQL, (run_id,))
+            cur = await unscoped(conn, "consumer_graph").execute(_RUN_SQL, (run_id,))
             row = await cur.fetchone()
         if row is None:
             raise LookupError(f"run {run_id} does not exist")

@@ -21,6 +21,7 @@ from starlette.routing import Route
 
 from services.api.ingest import Content, ingest
 from services.common import directory, ids, vendors
+from services.safety.scope import unscoped
 
 __all__ = ["ALLOWED_OVERRIDES", "RUNS_CHANNEL", "SCENARIOS", "routes"]
 
@@ -103,13 +104,15 @@ async def _first_member_phone(conn: AsyncConnection, household_id: object) -> st
     """
     if not isinstance(household_id, str) or not household_id:
         raise _Refused(400, "household_id is required")
-    cur = await conn.execute("SELECT env FROM households WHERE household_id = %s", (household_id,))
+    cur = await unscoped(conn, "runs_route").execute(
+        "SELECT env FROM households WHERE household_id = %s", (household_id,)
+    )
     row = await cur.fetchone()
     if row is None:
         raise _Refused(404, f"unknown household {household_id}")
     if row[0] != "eval":
         raise _Refused(403, "runs for live households are refused")
-    cur = await conn.execute(_FIRST_MEMBER_SQL, (household_id,))
+    cur = await unscoped(conn, "runs_route").execute(_FIRST_MEMBER_SQL, (household_id,))
     phone = await cur.fetchone()
     if phone is None:
         raise _Refused(409, f"household {household_id} has no member with a phone")
@@ -142,7 +145,7 @@ async def _label(
     if agent_id is None:
         return None
     card = await directory.card(conn, agent_id)
-    cur = await conn.execute(_ORG_NAME_SQL, (card.owner_ref,))
+    cur = await unscoped(conn, "runs_route").execute(_ORG_NAME_SQL, (card.owner_ref,))
     org = await cur.fetchone()
     org_name = org[0] if org else card.owner_ref
     return vendors.vendor_label(card.agent_class, card, org_name, run_modes or {}).text
@@ -186,7 +189,10 @@ async def get_run(request: Request) -> JSONResponse:
         run_id = uuid.UUID(request.path_params["run_id"])
     except ValueError:
         return _error(404, "unknown run")
-    async with request.app.state.connect() as conn, conn.cursor(row_factory=dict_row) as cur:
+    async with (
+        request.app.state.connect() as conn,
+        unscoped(conn, "runs_route").cursor(row_factory=dict_row) as cur,
+    ):
         await cur.execute("SELECT status, reason, modes FROM runs WHERE run_id = %s", (run_id,))
         run = await cur.fetchone()
         if run is None:
