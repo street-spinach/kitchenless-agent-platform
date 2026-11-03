@@ -109,10 +109,39 @@ def test_non_gating_category_does_not_fail_suite() -> None:
     assert summary["passed"]
 
 
-def test_token_budget_fails_suite() -> None:
-    summary = run.summarize([result("task", True, tokens=101)], THRESHOLDS)
-    assert summary["over_budget"]
-    assert not summary["passed"]
+def test_budget_exhausted_is_reported_not_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Replaces `test_token_budget_fails_suite`: the runner no longer starts an attempt it
+    can't afford, so a suite can't go over budget; the attempts it didn't start make the
+    outcome `budget_exhausted`, exit 0 (evals.md §5, §7)."""
+    skipped = RunResult(
+        "c", "task", 2, passed=False, verdict="skipped", error_kind="budget_skipped"
+    )
+    summary = run.summarize([result("task", True, tokens=60), skipped], THRESHOLDS)
+    assert (summary["outcome"], summary["outcome_detail"], summary["exit_code"]) == (
+        "budget_exhausted",
+        "budget_skipped",
+        0,
+    )
+    assert summary["categories"]["task"]["pass_rate"] == 1.0
+    # Through `main`: the second attempt would need 60 tokens with 40 left, so it never starts.
+    write_case(tmp_path, "task", case(id="a"))
+    monkeypatch.setenv("RUN_TOKEN_CEILING", "60")
+    started: list[int] = []
+
+    def spend(c: dict[str, Any], repeat: int, dsn: str, timeout: float, mode: str = "stub"):
+        started.append(repeat)
+        return RunResult(c["id"], c["category"], repeat, passed=True, tokens=60)
+
+    status = main_status(tmp_path, monkeypatch, ["--all"], run_case=spend)
+    assert started == [1]
+    assert (status["outcome"], status["detail"], status["exit_code"]) == (
+        "budget_exhausted",
+        "budget_skipped",
+        0,
+    )
+    assert status["failed_cases"] == []
 
 
 def test_slow_cases_warn_only() -> None:
@@ -208,20 +237,76 @@ def validate(data: dict[str, Any]) -> dict[str, Any]:
     return run.validate_case(data, f"cases/{data['category']}/{data['id']}.yaml", CATEGORIES)
 
 
-def main_on(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, argv: list[str]) -> int:
-    """`run.main` over the cases written under `tmp_path`, with no attempt run for real."""
+def _passing_run(
+    c: dict[str, Any], repeat: int, dsn: str, timeout: float, mode: str = "stub"
+) -> RunResult:
+    return RunResult(c["id"], c["category"], repeat, passed=True)
+
+
+class FakeHistory:
+    """Stands in for `run.History` in tests with no database."""
+
+    def __init__(self, dsn: str, eval_run_id: str) -> None:
+        self.errors = 0
+        self.attempts: list[RunResult] = []
+
+    def last_green_sha(self, mode: str, trigger: str) -> str | None:
+        return None
+
+    def start(self, run_info: dict[str, Any], selection: list[str], thresholds: Any) -> None:
+        pass
+
+    def attempt(self, r: RunResult, case_hash: str) -> None:
+        self.attempts.append(r)
+
+    def finish(self, summary: dict[str, Any]) -> None:
+        pass
+
+
+def main_on(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    argv: list[str],
+    *,
+    run_case: Any = _passing_run,
+    db: bool = False,
+    written: dict[str, Any] | None = None,
+) -> int:
+    """`run.main` over the cases written under `tmp_path`, with no attempt run for real.
+    Unless `db`, the eval lock and the history are faked (they need Postgres). `written`
+    receives the results JSON v1."""
     load = LOAD_CASES
+
+    def write(summary: dict[str, Any], results: list[RunResult], md: str) -> Path:
+        if written is not None:
+            written.update(run.results_json(summary, results))
+        return Path("r.json")
+
     monkeypatch.setattr(run, "load_thresholds", lambda: THRESHOLDS)
     monkeypatch.setattr(run, "load_cases", lambda categories: load(categories, tmp_path))
-    monkeypatch.setattr(run, "write_results", lambda summary, results, md: Path("r.json"))
-    monkeypatch.setattr(
-        run,
-        "run_case",
-        lambda c, repeat, dsn, timeout, mode="stub": RunResult(
-            c["id"], c["category"], repeat, passed=True
-        ),
-    )
+    monkeypatch.setattr(run, "write_results", write)
+    monkeypatch.setattr(run, "run_case", run_case)
+    if not db:
+        monkeypatch.setattr(run, "take_lock", lambda dsn, **kw: object())
+        monkeypatch.setattr(run, "release_lock", lambda conn: None)
+        monkeypatch.setattr(run, "History", FakeHistory)
     return run.main(argv)
+
+
+def main_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, argv: list[str], **kw: Any
+) -> dict[str, Any]:
+    """`main_on`, returning its `EVAL_STATUS` line (printed last) plus `json`, the results
+    JSON v1 it would have written."""
+    lines: list[str] = []
+    monkeypatch.setattr(
+        run, "print", lambda *a, **k: lines.append(" ".join(map(str, a))), raising=False
+    )
+    written: dict[str, Any] = {}
+    code = main_on(tmp_path, monkeypatch, argv, written=written, **kw)
+    status = json.loads(lines[-1].removeprefix("EVAL_STATUS "))
+    assert status["exit_code"] == code
+    return {**status, "json": written}
 
 
 LOAD_CASES = run.load_cases
@@ -336,6 +421,8 @@ def test_mode_filters_by_model_modes_and_picks_repeats(
         return RunResult(c["id"], c["category"], repeat, passed=True)
 
     monkeypatch.setattr(run, "run_case", fake_run)
+    # Real mode first confirms the mode on `agents` /health (build step 5c).
+    monkeypatch.setattr(run, "agents_health", lambda: {"model_mode": "real"})
     assert run.main(["--all", "--mode", "real"]) == 0
     assert calls == [(i, r) for i in ("both", "real-only") for r in (1, 2, 3, 4)]
 
@@ -800,6 +887,215 @@ def test_timeout_runs_checks_over_partial_trace(
     allergen = weekly(expect=[{"check": "no_allergen_in_order"}])
     res = run.run_case(allergen, 1, "dsn", timeout=0, mode="real")
     assert (res.verdict, res.error_kind) == ("fail", "timeout")
+
+
+# --- budget, deadline, history and the eval-run checks (evals.md §5, §7, build step 5c) ------
+
+
+def _budget(**kw: Any) -> run.Budget:
+    base = {"max_tokens": 100, "run_ceiling": 60, "timeout": 4.0, "deadline": 10.0, "started": 0.0}
+    return run.Budget(**{**base, **kw})
+
+
+def test_attempt_not_started_below_run_ceiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    budget = _budget()
+    assert budget.affords(40, now=0.0)  # 60 tokens left: exactly one run's ceiling
+    assert not budget.affords(41, now=0.0)
+    write_case(tmp_path, "task", case(id="a"))
+    write_case(tmp_path, "task", case(id="b"))
+    monkeypatch.setenv("RUN_TOKEN_CEILING", "60")
+    started: list[str] = []
+
+    def spend(c: dict[str, Any], repeat: int, dsn: str, timeout: float, mode: str = "stub"):
+        started.append(c["id"])
+        return RunResult(c["id"], c["category"], repeat, passed=True, tokens=41)
+
+    status = main_status(tmp_path, monkeypatch, ["--all", "--repeats", "1"], run_case=spend)
+    assert started == ["a"]
+    attempts = status["json"]["attempts"]
+    assert [(a["case_id"], a["verdict"], a["error_kind"]) for a in attempts] == [
+        ("a", "pass", "none"),
+        ("b", "skipped", "budget_skipped"),
+    ]
+    assert attempts[1]["agent_run_ids"] == [] and attempts[1]["tokens"] == 0
+    assert status["json"]["tokens"] <= THRESHOLDS["budget"]["max_tokens_per_suite"]
+    assert status["outcome"] == "budget_exhausted"
+    # Unset, the ceiling is the whole suite budget: only an untouched budget starts a run.
+    monkeypatch.delenv("RUN_TOKEN_CEILING")
+    assert run.run_token_ceiling(100) == 100
+
+
+class Clock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def test_deadline_marks_rest_budget_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    budget = _budget(started=0.0)
+    assert budget.affords(0, now=6.0)  # 4 s left: exactly one attempt's timeout
+    assert not budget.affords(0, now=6.1)
+    for name in ("a", "b", "c"):
+        write_case(tmp_path, "task", case(id=name))
+    monkeypatch.setenv("EVAL_DEADLINE_SECONDS", "10")
+    monkeypatch.setenv("EVAL_TIMEOUT_SECONDS", "4")
+    clock = Clock()
+    monkeypatch.setattr(run, "time", clock)
+    started: list[str] = []
+
+    def slow(c: dict[str, Any], repeat: int, dsn: str, timeout: float, mode: str = "stub"):
+        assert timeout == 4.0
+        started.append(c["id"])
+        clock.now += 5  # each attempt takes 5 s
+        return RunResult(c["id"], c["category"], repeat, passed=True)
+
+    status = main_status(tmp_path, monkeypatch, ["--all", "--repeats", "1"], run_case=slow)
+    # a starts with 10 s left, b with 5 s; c would have 0 s, below one attempt's 4 s.
+    assert started == ["a", "b"]
+    assert [a["error_kind"] for a in status["json"]["attempts"]] == [
+        "none",
+        "none",
+        "budget_skipped",
+    ]
+    assert (status["outcome"], status["exit_code"]) == ("budget_exhausted", 0)
+
+
+class FailingConnect:
+    """`psycopg.connect` for the history: every call raises `error`."""
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+        self.calls = 0
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        self.calls += 1
+        raise self.error
+
+
+def _history_main(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, connect: FailingConnect
+) -> dict[str, Any]:
+    write_case(tmp_path, "safety", case(id="s1", category="safety"))
+    write_case(tmp_path, "task", case(id="t1"))
+    monkeypatch.setenv("GIT_SHA", "abc123")
+    monkeypatch.setattr(run.psycopg, "connect", connect)
+    monkeypatch.setattr(run, "take_lock", lambda dsn, **kw: object())
+    monkeypatch.setattr(run, "release_lock", lambda conn: None)
+
+    def mixed(c: dict[str, Any], repeat: int, dsn: str, timeout: float, mode: str = "stub"):
+        return RunResult(c["id"], c["category"], repeat, passed=c["id"] != "s1")
+
+    return main_status(
+        tmp_path,
+        monkeypatch,
+        ["--all", "--repeats", "1", "--trigger", "nightly"],
+        run_case=mixed,
+        db=True,
+    )
+
+
+def test_history_failure_keeps_verdict(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    connect = FailingConnect(psycopg.OperationalError("connection refused"))
+    status = _history_main(tmp_path, monkeypatch, connect)
+    assert [a["verdict"] for a in status["json"]["attempts"]] == ["fail", "pass"]
+    assert (status["outcome"], status["detail"], status["exit_code"]) == ("regression", "safety", 1)
+    # The last-green read, the eval_runs row, two attempts and the finish all failed.
+    assert connect.calls == 5
+    assert status["json"]["history_write_errors"] == 5
+    assert status["last_green_sha"] is None
+
+
+def test_runs_without_history_tables(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    connect = FailingConnect(psycopg.errors.UndefinedTable('relation "eval_runs" does not exist'))
+    status = _history_main(tmp_path, monkeypatch, connect)
+    assert [a["verdict"] for a in status["json"]["attempts"]] == ["fail", "pass"]
+    assert status["outcome"] == "regression"
+    assert connect.calls == 1  # logged once, nothing more written
+    assert status["json"]["history_write_errors"] == 0
+
+
+def test_no_trigger_takes_no_lock_and_writes_no_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_case(tmp_path, "task", case(id="a"))
+    monkeypatch.delenv("GIT_SHA", raising=False)
+    connect = FailingConnect(AssertionError("no database access without --trigger"))
+    monkeypatch.setattr(run.psycopg, "connect", connect)
+    status = main_status(tmp_path, monkeypatch, ["--all"], db=True)
+    assert (status["outcome"], status["trigger"], status["git_sha"]) == ("pass", None, None)
+    assert connect.calls == 0
+
+
+def test_trigger_without_git_sha_is_infra(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    write_case(tmp_path, "task", case(id="a"))
+    locked: list[str] = []
+    monkeypatch.setattr(run, "take_lock", lambda dsn, **kw: locked.append(dsn))
+
+    def never(*a: Any, **k: Any) -> RunResult:
+        raise AssertionError("no attempt may start")
+
+    for unset in (None, "", "  "):
+        if unset is None:
+            monkeypatch.delenv("GIT_SHA", raising=False)
+        else:
+            monkeypatch.setenv("GIT_SHA", unset)
+
+        status = main_status(
+            tmp_path, monkeypatch, ["--all", "--trigger", "nightly"], run_case=never, db=True
+        )
+        assert (status["outcome"], status["detail"], status["exit_code"]) == (
+            "infra",
+            "no_git_sha",
+            3,
+        )
+        assert status["json"]["attempts"] == [] and locked == []
+    # The PR check passes no trigger and needs no GIT_SHA.
+    assert main_on(tmp_path, monkeypatch, ["--all"]) == 0
+
+
+def test_real_mode_health_mismatch_is_infra(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_case(tmp_path, "task", case(id="a"))
+    started: list[str] = []
+
+    def track(c: dict[str, Any], repeat: int, dsn: str, timeout: float, mode: str = "stub"):
+        started.append(mode)
+        return RunResult(c["id"], c["category"], repeat, passed=True, mode=mode)
+
+    def unreachable() -> dict[str, Any]:
+        raise urllib.error.URLError(ConnectionRefusedError(61, "Connection refused"))
+
+    for health in ({"model_mode": "stub"}, {"status": "ok"}, unreachable):
+        monkeypatch.setattr(
+            run, "agents_health", health if callable(health) else (lambda h=health: h)
+        )
+        status = main_status(tmp_path, monkeypatch, ["--all", "--mode", "real"], run_case=track)
+        assert (status["outcome"], status["detail"], status["exit_code"]) == (
+            "infra",
+            "mode_mismatch",
+            3,
+        )
+        assert started == []
+    real = {"model_mode": "real", "model_name": "people-1", "model_business_name": "biz-1"}
+    monkeypatch.setattr(run, "agents_health", lambda: real)
+    status = main_status(
+        tmp_path, monkeypatch, ["--all", "--mode", "real", "--repeats", "1"], run_case=track
+    )
+    assert status["outcome"] == "pass" and started == ["real"]
+    assert status["json"]["models"] == {"people": "people-1", "business": "biz-1"}
+    # Stub mode never reads /health.
+    monkeypatch.setattr(run, "agents_health", unreachable)
+    assert main_on(tmp_path, monkeypatch, ["--all"]) == 0
 
 
 # --- inject (db) ----------------------------------------------------------------------------

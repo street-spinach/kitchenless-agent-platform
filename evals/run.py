@@ -14,13 +14,30 @@ Cases follow the format of evals.md §4 and are validated before any attempt (ex
 `--mode stub|real` (default `stub`; only cases whose `model_modes` include it run, each its
 category's `repeats[mode]` times) and `--trigger`.
 
-Config (env): ORCHESTRATOR_URL, DATABASE_URL, EVAL_TIMEOUT_SECONDS.
+Budget, deadline, lock and history (evals.md §5, §7; build step 5c):
+
+*   Before each attempt the runner checks that the remaining tokens (`max_tokens_per_suite`
+    minus the tokens used) are at least `RUN_TOKEN_CEILING` and the remaining time (until
+    `EVAL_DEADLINE_SECONDS` after the runner started) is at least `EVAL_TIMEOUT_SECONDS`.
+    Otherwise the attempt is `budget_skipped`.
+*   With `--trigger`: `GIT_SHA` must be set (else outcome `infra`, `no_git_sha`); the runner
+    takes the eval lock (`pg_try_advisory_lock(hashtext('evals:eval'))` every 5 s for up to
+    10 minutes, else `infra`, `lock_timeout`) and holds it on its own connection for the
+    whole eval run; it writes the `eval_runs` row, one `eval_results` row per attempt and the
+    outcome at the end (`History`). A failed write never changes a verdict.
+*   With `--mode real`: `$AGENTS_URL/health` must report `model_mode: real` (else `infra`,
+    `mode_mismatch`).
+
+Config (env): ORCHESTRATOR_URL, DATABASE_URL, AGENTS_URL, EVAL_TIMEOUT_SECONDS,
+EVAL_DEADLINE_SECONDS, RUN_TOKEN_CEILING, GIT_SHA.
 """
 
 import argparse
 import asyncio
+import hashlib
 import inspect
 import json
+import logging
 import os
 import sys
 import time
@@ -114,6 +131,20 @@ RESULTS_SCHEMA = 1
 # A runner error after the agent run started is a failed invariant check, so it can never
 # become a skip (see the PR's Decisions).
 RUNNER_ERROR_CHECK = "runner_error"
+
+# evals.md §5 and §7 (build step 5c).
+DEFAULT_AGENTS_URL = "http://localhost:8003"
+DEFAULT_TIMEOUT_SECONDS = 300.0
+DEFAULT_DEADLINE_SECONDS = 3000.0
+LOCK_KEY = "evals:eval"
+LOCK_POLL_SECONDS = 5.0
+LOCK_WAIT_SECONDS = 600.0
+# `outcome_detail` of an eval run that ended `infra` before any attempt.
+NO_GIT_SHA = "no_git_sha"
+MODE_MISMATCH = "mode_mismatch"
+LOCK_TIMEOUT = "lock_timeout"
+
+log = logging.getLogger("evals.run")
 
 
 class CaseError(ValueError):
@@ -283,14 +314,21 @@ def validate_case(case: Any, source: str, categories: set[str]) -> dict[str, Any
     return case
 
 
+# sha256 of each loaded case's file, by case id (evals.md §6 `case_hash`), set by `load_cases`.
+CASE_HASHES: dict[str, str] = {}
+
+
 def load_cases(categories: set[str], cases_dir: Path = CASES_DIR) -> list[dict[str, Any]]:
-    cases, seen = [], set()
+    cases, seen, hashes = [], set(), {}
     for path in sorted(cases_dir.glob("*/*.yaml")):
-        case = validate_case(yaml.safe_load(path.read_text()), str(path), categories)
+        raw = path.read_bytes()
+        case = validate_case(yaml.safe_load(raw), str(path), categories)
         if case["id"] in seen:
             raise CaseError(f"{path}: duplicate case id {case['id']!r}")
         seen.add(case["id"])
+        hashes[case["id"]] = hashlib.sha256(raw).hexdigest()
         cases.append(case)
+    CASE_HASHES.update(hashes)
     return cases
 
 
@@ -332,6 +370,15 @@ def load_case_ids(path: Path, known: set[str]) -> list[str]:
     if unknown:
         raise CaseError(f"{path}: unknown case ids {unknown}")
     return data
+
+
+def case_hash(case: dict[str, Any]) -> str:
+    """sha256 of the case's file as `load_cases` read it (evals.md §6), so a changed case
+    starts a new trend. A case not loaded from a file hashes its canonical JSON instead."""
+    known = CASE_HASHES.get(case["id"])
+    if known is not None:
+        return known
+    return hashlib.sha256(json.dumps(case, sort_keys=True, default=str).encode()).hexdigest()
 
 
 # --- scenarios ------------------------------------------------------------------------------
@@ -980,8 +1027,8 @@ def write_results(summary: dict[str, Any], results: list[RunResult], markdown: s
 
 
 def status_line(summary: dict[str, Any], results: list[RunResult]) -> str:
-    """The last line of standard output (evals.md §5). `last_green_sha` is null until the
-    history of build step 5c exists."""
+    """The last line of standard output (evals.md §5). `last_green_sha` is read from the
+    history with `--trigger` (`History.last_green_sha`), else null."""
     mode = summary.get("model_mode", "stub")
     failed = sorted({r.case_id for r in results if r.verdict == outcome.FAIL})
     real_safety_failed = mode == "real" and any(
@@ -1008,6 +1055,242 @@ def print_report(markdown: str, status: str) -> None:
     print(markdown.rstrip("\n"))
     print(SUMMARY_END)
     print(status, flush=True)
+
+
+# --- budget, /health, the eval lock and history (evals.md §5, §7; build step 5c) -------------
+
+
+@dataclass(frozen=True)
+class Budget:
+    """The two checks before each attempt (evals.md §7). `started` is the runner's start on
+    the monotonic clock."""
+
+    max_tokens: int
+    run_ceiling: int
+    timeout: float
+    deadline: float
+    started: float
+
+    def affords(self, tokens_used: int, now: float) -> bool:
+        tokens_left = self.max_tokens - tokens_used
+        time_left = self.deadline - (now - self.started)
+        return tokens_left >= self.run_ceiling and time_left >= self.timeout
+
+
+def run_token_ceiling(max_tokens: int) -> int:
+    """`RUN_TOKEN_CEILING`, or, when it is unset, `max_tokens_per_suite` itself, so a real
+    attempt starts only on an untouched suite budget (see the PR's Decisions)."""
+    raw = (os.environ.get("RUN_TOKEN_CEILING") or "").strip()
+    return int(raw) if raw else max_tokens
+
+
+def budget_skipped(case: dict[str, Any], repeat: int, mode: str) -> RunResult:
+    """An attempt not started because the budget or the deadline could not afford it."""
+    result = RunResult(
+        case["id"],
+        case["category"],
+        repeat,
+        passed=False,
+        mode=mode,
+        stopped=outcome.BUDGET_SKIPPED,
+    )
+    result.judge()
+    return result
+
+
+def agents_health() -> dict[str, Any]:
+    url = os.environ.get("AGENTS_URL", DEFAULT_AGENTS_URL).rstrip("/") + "/health"
+    with urllib.request.urlopen(url, timeout=30) as resp:
+        return json.loads(resp.read())
+
+
+def check_real_mode() -> tuple[dict[str, Any] | None, str | None]:
+    """`({people, business}, None)` when `agents` `/health` reports `model_mode: real`;
+    otherwise `(None, MODE_MISMATCH)`. An unreachable `/health` reports no mode, so it is a
+    mismatch too (fail closed)."""
+    try:
+        health = agents_health()
+    except Exception as err:
+        print(f"agents /health unreachable: {type(err).__name__}: {err}", file=sys.stderr)
+        return None, MODE_MISMATCH
+    if health.get("model_mode") != "real":
+        print(f"agents /health reports model_mode {health.get('model_mode')!r}", file=sys.stderr)
+        return None, MODE_MISMATCH
+    return {"people": health.get("model_name"), "business": health.get("model_business_name")}, None
+
+
+def take_lock(
+    dsn: str,
+    *,
+    wait: float = LOCK_WAIT_SECONDS,
+    poll: float = LOCK_POLL_SECONDS,
+) -> psycopg.Connection | None:
+    """Take the eval lock on a connection of its own, trying every `poll` seconds for up to
+    `wait` seconds. Returns the connection holding it (close it to release), or None. A
+    failed connection counts as a try that did not get the lock."""
+    give_up = time.monotonic() + wait
+    while True:
+        conn = None
+        try:
+            conn = psycopg.connect(dsn, autocommit=True)
+            row = conn.execute("SELECT pg_try_advisory_lock(hashtext(%s))", (LOCK_KEY,)).fetchone()
+            if row is not None and row[0]:
+                return conn
+        except psycopg.Error as err:
+            log.warning("eval lock: %s", err)
+        if conn is not None:
+            conn.close()
+        if time.monotonic() + poll > give_up:
+            return None
+        time.sleep(poll)
+
+
+def release_lock(conn: psycopg.Connection | None) -> None:
+    if conn is None:
+        return
+    try:
+        conn.execute("SELECT pg_advisory_unlock(hashtext(%s))", (LOCK_KEY,))
+    except psycopg.Error as err:
+        log.warning("eval lock release: %s", err)
+    finally:
+        conn.close()
+
+
+_LAST_GREEN_SQL = """
+SELECT git_sha FROM eval_runs
+WHERE model_mode = %s AND trigger = %s AND outcome = 'pass'
+ORDER BY started_at DESC, finished_at DESC NULLS LAST LIMIT 1
+"""
+_INSERT_RUN_SQL = """
+INSERT INTO eval_runs (eval_run_id, trigger, git_sha, model_mode, models, selection, thresholds)
+VALUES (%s, %s, %s, %s, %s, %s, %s)
+"""
+_INSERT_RESULT_SQL = """
+INSERT INTO eval_results
+  (eval_run_id, case_id, repeat, category, case_hash, model_mode, agent_run_ids, verdict,
+   error_kind, reason, seconds, tokens, models_used, checks)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+"""
+_FINISH_RUN_SQL = """
+UPDATE eval_runs SET outcome = %s, outcome_detail = %s, tokens = %s, reason_counts = %s,
+  error_kind_counts = %s, finished_at = now()
+WHERE eval_run_id = %s
+"""
+
+
+class History:
+    """The eval history writes (evals.md §5, §6), only with `--trigger`. Each write uses its
+    own connection and transaction. A failed write is logged and counted in `errors`; it
+    never raises. When the tables don't exist, it logs once and writes nothing more."""
+
+    def __init__(self, dsn: str, eval_run_id: str) -> None:
+        self.dsn = dsn
+        self.eval_run_id = eval_run_id
+        self.errors = 0
+        self.missing = False
+
+    def _do(self, what: str, sql: str, params: tuple[Any, ...]) -> list[tuple[Any, ...]] | None:
+        if self.missing:
+            return None
+        try:
+            with psycopg.connect(self.dsn) as conn:
+                cur = conn.execute(sql, params)
+                return cur.fetchall() if cur.description else []
+        except psycopg.errors.UndefinedTable as err:
+            self.missing = True
+            log.warning("eval history tables missing; no history is written: %s", err)
+        except Exception as err:
+            self.errors += 1
+            log.warning("eval history %s failed: %s", what, err)
+        return None
+
+    def last_green_sha(self, mode: str, trigger: str) -> str | None:
+        """The `git_sha` of the newest earlier eval run with the same mode and trigger that
+        passed. Read before this eval run's row is written."""
+        rows = self._do("read", _LAST_GREEN_SQL, (mode, trigger))
+        return rows[0][0] if rows else None
+
+    def start(self, run_info: dict[str, Any], selection: list[str], thresholds: Any) -> None:
+        self._do(
+            "eval_runs insert",
+            _INSERT_RUN_SQL,
+            (
+                self.eval_run_id,
+                run_info["trigger"],
+                run_info["git_sha"],
+                run_info["model_mode"],
+                Jsonb(run_info["models"]),
+                selection,
+                Jsonb(thresholds),
+            ),
+        )
+
+    def attempt(self, r: RunResult, case_hash: str) -> None:
+        checks = [
+            {**c, "args": c.get("args") or {}, "invariant": outcome.is_invariant(c)}
+            for c in r.checks
+        ]
+        self._do(
+            "eval_results insert",
+            _INSERT_RESULT_SQL,
+            (
+                self.eval_run_id,
+                r.case_id,
+                r.repeat,
+                r.category,
+                case_hash,
+                r.mode,
+                [uuid.UUID(r.run_id)] if r.run_id else [],
+                r.verdict,
+                r.error_kind,
+                r.reason,
+                r.seconds,
+                r.tokens,
+                list(r.models_used),
+                Jsonb(json.loads(json.dumps(checks, default=str))),
+            ),
+        )
+
+    def finish(self, summary: dict[str, Any]) -> None:
+        self._do(
+            "eval_runs finish",
+            _FINISH_RUN_SQL,
+            (
+                summary["outcome"],
+                summary["outcome_detail"],
+                summary["tokens"],
+                Jsonb(summary["reason_counts"]),
+                Jsonb(summary["error_kind_counts"]),
+                self.eval_run_id,
+            ),
+        )
+
+
+def run_attempts(
+    selected: list[dict[str, Any]],
+    thresholds: dict[str, Any],
+    repeats: int | None,
+    mode: str,
+    dsn: str,
+    budget: Budget,
+    history: History | None = None,
+) -> list[RunResult]:
+    """Each case's repeats in order. An attempt the budget can't afford is `budget_skipped`
+    and not started. With `history`, each attempt's row is written when it finishes."""
+    results: list[RunResult] = []
+    tokens = 0
+    for case in selected:
+        digest = case_hash(case) if history is not None else ""
+        for repeat in range(1, repeats_for(case, thresholds, repeats, mode) + 1):
+            if budget.affords(tokens, time.monotonic()):
+                res = run_case(case, repeat, dsn, budget.timeout, mode=mode)
+            else:
+                res = budget_skipped(case, repeat, mode)
+            tokens += res.tokens
+            results.append(res)
+            if history is not None:
+                history.attempt(res, digest)
+    return results
 
 
 # --- entry point ----------------------------------------------------------------------------
@@ -1049,13 +1332,12 @@ def _now() -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    started = time.monotonic()
     args = parse_args(argv)
     run_info: dict[str, Any] = {
         "eval_run_id": str(ids.new_eval_run_id()),
         "trigger": args.trigger,
-        # Without --trigger the runner writes no history (evals.md §5); the GIT_SHA
-        # requirement, the history and `last_green_sha` come with build step 5c.
-        "git_sha": os.environ.get("GIT_SHA") or None,
+        "git_sha": (os.environ.get("GIT_SHA") or "").strip() or None,
         "model_mode": args.mode,
         "models": {"people": None, "business": None},
         "last_green_sha": None,
@@ -1094,19 +1376,59 @@ def main(argv: list[str] | None = None) -> int:
         return exit_code
 
     dsn = os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL)
-    timeout = float(os.environ.get("EVAL_TIMEOUT_SECONDS", "300"))
-    results = [
-        run_case(case, repeat, dsn, timeout, mode=args.mode)
-        for case in selected
-        for repeat in range(1, repeats_for(case, thresholds, args.repeats, args.mode) + 1)
-    ]
-    summary = {
-        **summarize(results, thresholds, args.mode),
-        **run_info,
-        "selection": [c["id"] for c in selected],
-        "history_write_errors": 0,
-        "finished_at": _now(),
-    }
+    max_tokens = int(thresholds["budget"]["max_tokens_per_suite"])
+    budget = Budget(
+        max_tokens=max_tokens,
+        run_ceiling=run_token_ceiling(max_tokens),
+        timeout=float(os.environ.get("EVAL_TIMEOUT_SECONDS") or DEFAULT_TIMEOUT_SECONDS),
+        deadline=float(os.environ.get("EVAL_DEADLINE_SECONDS") or DEFAULT_DEADLINE_SECONDS),
+        started=started,
+    )
+    selection = [c["id"] for c in selected]
+
+    # Eval-run-level checks, before any attempt (evals.md §5).
+    run_error = None
+    if args.trigger is not None and run_info["git_sha"] is None:
+        run_error = NO_GIT_SHA
+    if run_error is None and args.mode == "real":
+        models, run_error = check_real_mode()
+        if models is not None:
+            run_info["models"] = models
+    lock = None
+    if run_error is None and args.trigger is not None:
+        lock = take_lock(dsn, wait=LOCK_WAIT_SECONDS, poll=LOCK_POLL_SECONDS)
+        if lock is None:
+            run_error = LOCK_TIMEOUT
+
+    results: list[RunResult] = []
+    history = None
+    try:
+        if run_error is None:
+            if args.trigger is not None:
+                history = History(dsn, run_info["eval_run_id"])
+                run_info["last_green_sha"] = history.last_green_sha(args.mode, args.trigger)
+                history.start(run_info, selection, thresholds)
+            results = run_attempts(
+                selected, thresholds, args.repeats, args.mode, dsn, budget, history
+            )
+        name, detail, exit_code = outcome.outcome(
+            [_attempt_facts(r) for r in results], thresholds, args.mode, run_error=run_error
+        )
+        summary = {
+            **summarize(results, thresholds, args.mode),
+            "outcome": name,
+            "outcome_detail": detail,
+            "exit_code": exit_code,
+            "passed": name == outcome.PASS,
+            **run_info,
+            "selection": selection,
+        }
+        if history is not None:
+            history.finish(summary)
+        summary["history_write_errors"] = history.errors if history is not None else 0
+        summary["finished_at"] = _now()
+    finally:
+        release_lock(lock)
     markdown = to_markdown(summary, results)
     path = write_results(summary, results, markdown)
     print(f"Results: {path}")
