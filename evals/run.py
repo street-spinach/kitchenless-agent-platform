@@ -7,6 +7,11 @@ it, a read-only `db` snapshot of the run's rows). Writes
 evals/results/<timestamp>.json and .md and exits non-zero if a gated category falls below its
 threshold or the suite exceeds its token budget.
 
+Cases follow the format of evals.md §4 and are validated before any attempt (exit 2). Flags
+(evals.md §5): `--tag`, `--category`, `--case`, `--cases-file`, `--all`, `--repeats`,
+`--mode stub|real` (default `stub`; only cases whose `model_modes` include it run, each its
+category's `repeats[mode]` times) and `--trigger`.
+
 Config (env): ORCHESTRATOR_URL, DATABASE_URL, EVAL_TIMEOUT_SECONDS.
 """
 
@@ -37,6 +42,7 @@ from services.agents.common.trace import read_trace
 from services.common import directory, ids, orders
 from services.common.protocol import render_summary
 from services.common.trace import TraceStore
+from services.mocks.control import SETUP_KEYS
 from services.safety.scope import Unscoped, unscoped
 
 EVALS_DIR = Path(__file__).parent
@@ -48,6 +54,38 @@ THRESHOLDS_PATH = EVALS_DIR / "thresholds.yaml"
 DEFAULT_ORCHESTRATOR_URL = "http://localhost:8000"
 DEFAULT_DATABASE_URL = "postgresql://spinach:change-me-local@localhost:5432/spinach"
 REQUIRED_CASE_FIELDS = ("id", "category", "tags", "run", "expect")
+# evals.md §4: the runner rejects a case file with any other field.
+CASE_FIELDS = frozenset(
+    {
+        *REQUIRED_CASE_FIELDS,
+        "model_modes",
+        "household",
+        "households",
+        "input",
+        "setup",
+        "conditions",
+        "overrides",
+        "approve_as",
+        "inject",
+        "shortfall",
+        "a2a_steps",
+        "revoke",
+    }
+)
+MODEL_MODES = ("stub", "real")
+TRIGGERS = ("nightly", "manual", "d4", "rehearsal")
+# evals.md Conventions, "Stub-only case": a real model never takes these paths.
+STUB_OVERRIDES = frozenset(
+    {
+        "STUB_FAIL_NODE",
+        "STUB_OUT_OF_BOUNDS",
+        "STUB_DUPLICATE_MESSAGE",
+        "STUB_ACCEPT_DELAY_ROUNDS",
+        "STUB_SHORTFALL_UNSAFE_SUBSTITUTE",
+        "STUB_COUNTER_REJECT",
+    }
+)
+MEMBER_MESSAGE = "member_message"
 
 EVAL_ENV = "eval"
 # evals.md §4: the default eval household, and the pair's default households.
@@ -90,23 +128,118 @@ def load_thresholds(path: Path = THRESHOLDS_PATH) -> dict[str, Any]:
     return yaml.safe_load(path.read_text())
 
 
-def validate_case(case: Any, source: str, categories: set[str]) -> dict[str, Any]:
-    if not isinstance(case, dict):
-        raise CaseError(f"{source}: case must be a mapping")
-    missing = [f for f in REQUIRED_CASE_FIELDS if f not in case]
-    if missing:
-        raise CaseError(f"{source}: missing fields {missing}")
-    if case["category"] not in categories:
-        raise CaseError(f"{source}: unknown category {case['category']!r}")
-    if Path(source).parent.name != case["category"]:
-        raise CaseError(f"{source}: category {case['category']!r} does not match its directory")
-    if case["run"] not in SCENARIOS:
-        raise CaseError(f"{source}: unknown scenario {case['run']!r}")
+def model_modes(case: dict[str, Any]) -> list[str]:
+    """The case's model modes; `[stub, real]` when it names none (evals.md §4)."""
+    return list(case.get("model_modes") or MODEL_MODES)
+
+
+def check_args(check: Callable[..., Any]) -> set[str]:
+    """The argument names a case may give `check`: its parameters after `trace` and `case`,
+    except `db`, which the runner supplies."""
+    names = list(inspect.signature(check).parameters)[2:]
+    return {n for n in names if n != "db"}
+
+
+def _validate_modes(case: dict[str, Any], source: str) -> None:
+    modes = case.get("model_modes", list(MODEL_MODES))
+    if (
+        not isinstance(modes, list)
+        or not modes
+        or len(set(modes)) != len(modes)
+        or not set(modes) <= set(MODEL_MODES)
+    ):
+        raise CaseError(f"{source}: model_modes must be [stub], [real] or [stub, real]")
+    overrides = case.get("overrides") or {}
+    if not isinstance(overrides, dict):
+        raise CaseError(f"{source}: overrides must be a mapping")
+    stub_only = sorted(STUB_OVERRIDES & set(overrides))
+    if stub_only and modes != ["stub"]:
+        raise CaseError(f"{source}: stub overrides {stub_only} need model_modes: [stub]")
+    if case["category"] == "safety" and "stub" in modes and "fast" not in case["tags"]:
+        raise CaseError(f"{source}: a stub-capable safety case must carry the fast tag")
+
+
+def _validate_inputs(case: dict[str, Any], source: str) -> None:
+    run_name = case["run"]
+    # `hello` keeps its `input` as the body of `POST /hello/run` (see the PR's Decisions).
+    if run_name == MEMBER_MESSAGE:
+        given = case.get("input")
+        if not (
+            isinstance(given, dict)
+            and set(given) == {"member", "text"}
+            and all(isinstance(given[k], str) and given[k] for k in given)
+        ):
+            raise CaseError(f"{source}: member_message needs input: {{member, text}}")
+    elif "input" in case and run_name != "hello":
+        raise CaseError(f"{source}: input is only for member_message")
+    if "households" in case:
+        households = case["households"]
+        if run_name != PAIR:
+            raise CaseError(f"{source}: households is only for {PAIR}")
+        if (
+            not isinstance(households, list)
+            or len(households) != 2
+            or len(set(households)) != 2
+            or not all(isinstance(h, str) and h for h in households)
+        ):
+            raise CaseError(f"{source}: households must be two different household ids")
+    if "household" in case and not (isinstance(case["household"], str) and case["household"]):
+        raise CaseError(f"{source}: household must be a household id")
+
+
+def _validate_setup(case: dict[str, Any], source: str) -> None:
+    setup = case.get("setup") or {}
+    if not isinstance(setup, dict):
+        raise CaseError(f"{source}: setup must be a mapping")
+    for name, value in setup.items():
+        key = SETUP_KEYS.get(name)
+        if key is None:
+            raise CaseError(f"{source}: unknown setup key {name!r}")
+        # bool is an int subclass; a setup value of true is never an amount (as control.py).
+        if (isinstance(value, bool) and key.type is not bool) or not isinstance(value, key.type):
+            raise CaseError(f"{source}: setup key {name!r} must be {key.type.__name__}")
+
+
+def _validate_expect(case: dict[str, Any], source: str) -> None:
     if not isinstance(case["expect"], list) or not case["expect"]:
         raise CaseError(f"{source}: expect must be a non-empty list")
     for item in case["expect"]:
         if not isinstance(item, dict) or item.get("check") not in CHECKS:
             raise CaseError(f"{source}: unknown check {item!r}")
+        if set(item) - {"check", "args"}:
+            raise CaseError(f"{source}: expect entries take only check and args, got {item!r}")
+        args = item.get("args") or {}
+        if not isinstance(args, dict):
+            raise CaseError(f"{source}: args of {item['check']} must be a mapping")
+        unknown = sorted(set(args) - check_args(CHECKS[item["check"]]))
+        if unknown:
+            raise CaseError(f"{source}: unknown args {unknown} for check {item['check']}")
+
+
+def validate_case(case: Any, source: str, categories: set[str]) -> dict[str, Any]:
+    """The case format and validation rules of evals.md §4; any failure is exit 2."""
+    if not isinstance(case, dict):
+        raise CaseError(f"{source}: case must be a mapping")
+    missing = [f for f in REQUIRED_CASE_FIELDS if f not in case]
+    if missing:
+        raise CaseError(f"{source}: missing fields {missing}")
+    unknown = sorted(set(case) - CASE_FIELDS)
+    if unknown:
+        raise CaseError(f"{source}: unknown fields {unknown}")
+    if Path(source).stem != case["id"]:
+        raise CaseError(f"{source}: id {case['id']!r} does not match its file name")
+    if case["category"] not in categories:
+        raise CaseError(f"{source}: unknown category {case['category']!r}")
+    if Path(source).parent.name != case["category"]:
+        raise CaseError(f"{source}: category {case['category']!r} does not match its directory")
+    if not isinstance(case["tags"], list) or not all(isinstance(t, str) for t in case["tags"]):
+        raise CaseError(f"{source}: tags must be a list")
+    _validate_inputs(case, source)
+    if case["run"] not in SCENARIOS:
+        raise CaseError(f"{source}: unknown scenario {case['run']!r}")
+    _validate_modes(case, source)
+    _validate_setup(case, source)
+    _validate_expect(case, source)
     return case
 
 
@@ -128,7 +261,13 @@ def select(
     category: str | None = None,
     case_id: str | None = None,
     all_cases: bool = False,
+    case_ids: list[str] | None = None,
+    mode: str | None = None,
 ) -> list[dict[str, Any]]:
+    """The cases chosen by the flags; with `mode`, only cases whose `model_modes` include it
+    (evals.md §4)."""
+    if mode is not None:
+        cases = [c for c in cases if mode in model_modes(c)]
     if all_cases:
         return list(cases)
     return [
@@ -137,7 +276,22 @@ def select(
         if (tag is None or tag in c["tags"])
         and (category is None or c["category"] == category)
         and (case_id is None or c["id"] == case_id)
+        and (case_ids is None or c["id"] in case_ids)
     ]
+
+
+def load_case_ids(path: Path, known: set[str]) -> list[str]:
+    """`--cases-file`: a YAML list of case ids. Refuses an id that is not a case."""
+    try:
+        data = yaml.safe_load(path.read_text())
+    except (OSError, yaml.YAMLError) as err:
+        raise CaseError(f"{path}: cannot read the cases file: {err}") from err
+    if not isinstance(data, list) or not data or not all(isinstance(i, str) for i in data):
+        raise CaseError(f"{path}: the cases file must be a non-empty list of case ids")
+    unknown = sorted(set(data) - known)
+    if unknown:
+        raise CaseError(f"{path}: unknown case ids {unknown}")
+    return data
 
 
 # --- scenarios ------------------------------------------------------------------------------
@@ -159,6 +313,14 @@ def post_json(path: str, body: dict[str, Any]) -> dict[str, Any]:
         return json.loads(resp.read())
 
 
+def reset_household(case: dict[str, Any]) -> str:
+    """The household the reset applies `setup` to: the case's `household`, or for a pair the
+    first of its `households`, whose run the checks read."""
+    if case["run"] == PAIR:
+        return list(case.get("households") or PAIR_HOUSEHOLDS)[0]
+    return case.get("household", HOUSEHOLD)
+
+
 def reset_and_seed_mocks(case: dict[str, Any]) -> None:
     """`POST /panel/reset {env: eval}` with the case's `setup`, then each of its `conditions`
     through `POST /panel/events` (architecture item 65). `hello` touches no mock or eval
@@ -167,7 +329,7 @@ def reset_and_seed_mocks(case: dict[str, Any]) -> None:
         if case.get("setup") or case.get("conditions"):
             raise CaseError(f"{case['id']}: hello cases take no setup or conditions")
         return
-    reset: dict[str, Any] = {"env": EVAL_ENV, "household": case.get("household", HOUSEHOLD)}
+    reset: dict[str, Any] = {"env": EVAL_ENV, "household": reset_household(case)}
     if case.get("setup"):
         reset["setup"] = case["setup"]
     post_json("/panel/reset", reset)
@@ -679,19 +841,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # The PR gate runs each case once; thresholds.yaml's repeats apply nightly
     # (architecture item 63, amended 2026-11-03).
     parser.add_argument("--repeats", type=int, help="run every case N times (default: thresholds)")
+    # evals.md §5.
+    parser.add_argument("--cases-file", type=Path, help="a YAML list of case ids")
+    parser.add_argument("--mode", choices=MODEL_MODES, default="stub")
+    parser.add_argument("--trigger", choices=TRIGGERS, default=None)
     args = parser.parse_args(argv)
-    if not (args.all_cases or args.tag or args.category or args.case_id):
-        parser.error("choose cases with --tag, --category, --case or --all")
+    if not (args.all_cases or args.tag or args.category or args.case_id or args.cases_file):
+        parser.error("choose cases with --tag, --category, --case, --cases-file or --all")
     if args.repeats is not None and args.repeats < 1:
         parser.error("--repeats must be at least 1")
     return args
 
 
-def repeats_for(case: dict[str, Any], thresholds: dict[str, Any], override: int | None) -> int:
-    """How many times to run `case`: `--repeats` when given, else its category's repeats."""
+def repeats_for(
+    case: dict[str, Any], thresholds: dict[str, Any], override: int | None, mode: str = "stub"
+) -> int:
+    """How many times to run `case`: `--repeats` when given, else its category's repeats for
+    the model mode (evals.md §7)."""
     if override is not None:
         return override
-    return int(thresholds["categories"][case["category"]]["repeats"])
+    return int(thresholds["categories"][case["category"]]["repeats"][mode])
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -699,6 +868,9 @@ def main(argv: list[str] | None = None) -> int:
     thresholds = load_thresholds()
     try:
         cases = load_cases(set(thresholds["categories"]))
+        case_ids = (
+            load_case_ids(args.cases_file, {c["id"] for c in cases}) if args.cases_file else None
+        )
     except CaseError as err:
         print(f"Invalid eval case: {err}", file=sys.stderr)
         return 2
@@ -708,6 +880,8 @@ def main(argv: list[str] | None = None) -> int:
         category=args.category,
         case_id=args.case_id,
         all_cases=args.all_cases,
+        case_ids=case_ids,
+        mode=args.mode,
     )
     if not selected:
         print("No eval cases matched the selection.", file=sys.stderr)
@@ -718,9 +892,12 @@ def main(argv: list[str] | None = None) -> int:
     results = [
         run_case(case, repeat, dsn, timeout)
         for case in selected
-        for repeat in range(1, repeats_for(case, thresholds, args.repeats) + 1)
+        for repeat in range(1, repeats_for(case, thresholds, args.repeats, args.mode) + 1)
     ]
     summary = summarize(results, thresholds)
+    # Without --trigger the runner writes no history (evals.md §5); the eval run's history
+    # and the GIT_SHA check come with build step 5c.
+    summary["model_mode"], summary["trigger"] = args.mode, args.trigger
     markdown = to_markdown(summary, results)
     path = write_results(summary, results, markdown)
     print(markdown)

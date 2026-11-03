@@ -1,6 +1,7 @@
 id: hello-run-completes
 category: task
 tags: [fast]
+model_modes: [stub, real]
 setup: {}
 conditions: {}
 run: hello
