@@ -14,8 +14,7 @@ from services.agents.household import graph as hg
 from services.agents.household import stubs
 from services.common import ids
 from services.common.consumer import StepResult
-from services.identity import tokens
-from tests.unit.test_household_graph import HOUSEHOLD, MEMBERS, SECRET, STARTER, World
+from tests.unit.test_household_graph import HOUSEHOLD, MEMBERS, STARTER, World
 
 A = "consumer:us-1-a"  # the starter, STARTER
 B = "consumer:us-1-b"
@@ -37,11 +36,6 @@ class DinnerWorld(World):
     def start(self) -> StepResult:
         msg = self.inbound("start_dinner", {"kind": "dinner"}, from_agent=A)
         return self.step(msg)
-
-
-@pytest.fixture(autouse=True)
-def _secret(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(tokens, "_secret", lambda: SECRET)
 
 
 def _list(monkeypatch: pytest.MonkeyPatch, items: list[dict[str, Any]]) -> None:
@@ -93,8 +87,8 @@ def test_start_order_snapshots_household_rules() -> None:
     w.start()
     [call] = w.household.of("get_household_rules")
     assert call["args"] == {}
-    claims = tokens.validate(call["token"])
-    assert (claims.sub, claims.act, claims.scopes) == (f"user:{STARTER}", HOUSEHOLD, ())
+    # Agent code passes no token; the scopes are `tokens.TOOL_SCOPES` (identity-authz I6).
+    assert "token" not in call and call["ctx"].agent_id == HOUSEHOLD
     saved = w.saved()
     assert (saved["take_turns"], saved["turn_index"], saved["approver_user_id"]) == (
         True,

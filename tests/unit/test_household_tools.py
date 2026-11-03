@@ -14,19 +14,22 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
 from services.common import db, ids, orders, pantry
-from services.identity import fga, tokens
+from services.identity import fga
 from services.mcp.household import server as household
 from services.mcp.meta import CallContext
 from services.safety.guard import GuardRefused
+from tests.unit import identity_world as w
 
 pytestmark = pytest.mark.db
 
-SECRET = "unit-test-mock-token-secret-32-bytes-long"
 HOUSEHOLD = "us-1"
 AGENT = f"household:{HOUSEHOLD}"
 SELLER = "grocery:mock-us"
 OTHER_SELLER = "grocery:other-us"
 USER = ids.seed_user_id("us-1-a")
+# USER's Keycloak user id: the `sub` of the household and consumer agents' tokens.
+USER_SUB = "4ec40af4-f3ed-45f8-aece-861a4bca8cdb"
+CONSUMER = "consumer:us-1-a"
 ITEMS = [
     {"line": 1, "sku": "milk-1l", "name": "Milk 1 l", "qty": 2, "unit_minor": 150},
     {"line": 2, "sku": "bread", "name": "Bread", "qty": 1, "unit_minor": 300},
@@ -35,7 +38,6 @@ ITEMS = [
 
 @pytest.fixture(autouse=True)
 def _auth(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, str]]:
-    monkeypatch.setattr(tokens, "_secret", lambda: SECRET)
     checks: list[tuple[str, str, str]] = []
 
     def check(user: str, relation: str, object: str) -> tuple[bool, str]:
@@ -65,7 +67,10 @@ def _seed(pg: str) -> uuid.UUID:
             " VALUES (%s, 'Test', 'us', 'us-oh-45202', 'America/New_York', 'USD')",
             (HOUSEHOLD,),
         )
-        conn.execute("INSERT INTO users (user_id, display_name) VALUES (%s, 'Asha')", (USER,))
+        conn.execute(
+            "INSERT INTO users (user_id, display_name, keycloak_sub) VALUES (%s, 'Asha', %s)",
+            (USER, USER_SUB),
+        )
         conn.execute(
             "INSERT INTO household_members (household_id, user_id, role) VALUES (%s, %s, 'admin')",
             (HOUSEHOLD, USER),
@@ -95,6 +100,7 @@ def _seed(pg: str) -> uuid.UUID:
                 " VALUES (%s, %s, %s, 'us', 'agents')",
                 (agent_id, cls, owner),
             )
+        _identity(conn)
         run_id = uuid.uuid4()
         conn.execute(
             "INSERT INTO runs (run_id, household_id, kind, trigger, modes)"
@@ -102,6 +108,26 @@ def _seed(pg: str) -> uuid.UUID:
             (run_id, HOUSEHOLD, Jsonb({"user_id": str(USER)})),
         )
     return run_id
+
+
+def _identity(conn: psycopg.Connection) -> None:
+    """The identity rows the guard checks (identity-authz §8 step 1): every caller's
+    `agent_clients` row, and USER's active grants for the household and consumer agents."""
+    for agent_id, owner in (
+        (AGENT, AGENT),
+        (CONSUMER, f"user:{USER}"),
+        (SELLER, "org:mock"),
+        (OTHER_SELLER, "org:other"),
+    ):
+        w.add_agent(conn, agent_id, owner)
+    # `system:api` has no card (identity-authz §3).
+    conn.execute(
+        "INSERT INTO agent_clients (agent_id, client_id, kind) VALUES (%s, %s, 'service')",
+        (household.API_AGENT, w.API_CLIENT),
+    )
+    holder = w.Person(USER, USER_SUB)
+    for agent_id in (AGENT, CONSUMER):
+        w.add_grant(conn, agent_id, holder, HOUSEHOLD)
 
 
 def _order(pg: str, run_id: uuid.UUID, state: str, kind: str = "grocery") -> uuid.UUID:
@@ -144,7 +170,7 @@ def _ctx(run_id: uuid.UUID, env: str = "live") -> CallContext:
         agent_id=AGENT,
         conversation_id=None,
         attempt=1,
-        token=tokens.MockIssuer(secret=SECRET).issue(f"user:{USER}", AGENT, ["orders"]),
+        token=w.people_token(AGENT, USER_SUB),
         env=env,
         modes={},
         on_behalf_of=AGENT,
@@ -273,7 +299,7 @@ def test_authorize_spend_sets_seller(
         pg, "SELECT line, sku FROM order_items WHERE order_id = %s ORDER BY line", order_id
     )
     assert [(r["line"], r["sku"]) for r in lines] == [(1, "milk-1l"), (2, "bread")]
-    assert ("agent:" + AGENT, "can_spend", f"budget:{HOUSEHOLD}") in _auth
+    assert (fga.agent_object(AGENT), "can_spend", f"budget:{HOUSEHOLD}") in _auth
     refusals = [r["reason"] for r in _results(pg, run_id, "authorize_spend") if r["refused"]]
     assert refusals == [household.QUOTE_MISMATCH, household.QUOTE_MISMATCH]
 
@@ -347,17 +373,16 @@ def test_set_order_state_limited_states(pg: str, monkeypatch: pytest.MonkeyPatch
 
 # --- agents tools (agents design §9, §10; file 13) ------------------------------------
 
-CONSUMER = "consumer:us-1-a"
 OTHER_USER = ids.seed_user_id("us-1-b")
 
 
-def _agent_ctx(run_id: uuid.UUID, agent: str, sub: str) -> CallContext:
+def _agent_ctx(run_id: uuid.UUID, agent: str, token: str) -> CallContext:
     return CallContext(
         run_id=run_id,
         agent_id=agent,
         conversation_id=None,
         attempt=1,
-        token=tokens.MockIssuer(secret=SECRET).issue(sub, agent, []),
+        token=token,
         env="live",
         modes={},
         on_behalf_of=agent,
@@ -365,11 +390,11 @@ def _agent_ctx(run_id: uuid.UUID, agent: str, sub: str) -> CallContext:
 
 
 def _consumer_ctx(run_id: uuid.UUID) -> CallContext:
-    return _agent_ctx(run_id, CONSUMER, f"user:{USER}")
+    return _agent_ctx(run_id, CONSUMER, w.people_token(CONSUMER, USER_SUB, w.CONSUMER_SCOPES))
 
 
 def _api_ctx(run_id: uuid.UUID) -> CallContext:
-    return _agent_ctx(run_id, household.API_AGENT, household.API_AGENT)
+    return _agent_ctx(run_id, household.API_AGENT, w.service_token(household.API_AGENT))
 
 
 def _add_member(pg: str, user_id: uuid.UUID, name: str, role: str = "member") -> None:
@@ -434,7 +459,7 @@ def test_record_dislike_add_remove(
     ]
     assert outcomes == ["removed", "not_learned"]
     assert _dislike_rows(pg) == []
-    assert ("agent:" + CONSUMER, "acts_for", f"user:{USER}") in _auth
+    assert (fga.agent_object(CONSUMER), "acts_for", f"user:{USER}") in _auth
     # The guard traced every call.
     assert len(_results(pg, run_id, "record_dislike")) == 4
 
@@ -453,7 +478,7 @@ def test_record_dislike_seeded_row_present(pg: str, monkeypatch: pytest.MonkeyPa
 def test_record_dislike_other_user_denied(pg: str, monkeypatch: pytest.MonkeyPatch) -> None:
     run_id = _seed(pg)
     _add_member(pg, OTHER_USER, "Ben")
-    allowed = (f"agent:{CONSUMER}", "acts_for", f"user:{USER}")
+    allowed = (fga.agent_object(CONSUMER), "acts_for", f"user:{USER}")
 
     def check(user: str, relation: str, object: str) -> tuple[bool, str]:
         return (user, relation, object) == allowed, "model-1"
@@ -506,7 +531,7 @@ def test_get_household_allergens_union(
     result = _with_pool(pg, monkeypatch, lambda: household.get_household_allergens(_ctx(run_id)))
 
     assert result == {"allergens": ["milk", "peanuts", "sesame"]}
-    assert ("agent:" + AGENT, "acts_for", f"household:{HOUSEHOLD}") in _auth
+    assert (fga.agent_object(AGENT), "acts_for", f"household:{HOUSEHOLD}") in _auth
 
 
 def test_get_household_rules_default(pg: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -603,7 +628,8 @@ def test_set_take_turns_approver_only(pg: str, monkeypatch: pytest.MonkeyPatch) 
 
     cases = [
         (_api_ctx(run_id), order_id, OTHER_USER, "wrong_approver"),
-        (_ctx(run_id), order_id, USER, household.AUTHZ_DENIED),
+        # A household agent's delegated token on a `svc.api` tool: §8 step 1b refuses it.
+        (_ctx(run_id), order_id, USER, "scope_missing"),
         (_api_ctx(run_id), uuid.uuid4(), USER, household.AUTHZ_DENIED),
     ]
     for ctx, order, user, reason in cases:

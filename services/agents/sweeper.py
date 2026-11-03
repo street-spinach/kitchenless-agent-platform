@@ -29,6 +29,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
 from services.common import db, ids, orders, outbox, runs
+from services.safety.scope import unscoped
 
 __all__ = ["CLAIM_LIMIT", "KINDS", "SWEEPER", "SWEEP_SECONDS", "sweep_forever", "sweep_once"]
 
@@ -68,13 +69,15 @@ _DONE_SQL = "UPDATE timers SET status = 'done' WHERE timer_id = %s"
 
 async def _approval_expiry(conn: AsyncConnection, timer: Mapping[str, Any]) -> None:
     approval_id = UUID(str(timer["ref"]["approval_id"]))
-    cur = await conn.execute(_EXPIRE_APPROVAL_SQL, (approval_id,))
+    cur = await unscoped(conn, "sweeper").execute(_EXPIRE_APPROVAL_SQL, (approval_id,))
     row = await cur.fetchone()
     if row is None:
         return  # already decided: the decision won
     (order_id,) = row
     await orders.transition(conn, order_id, "awaiting_approval", "expired")
-    cur = await conn.execute("SELECT household_id FROM orders WHERE order_id = %s", (order_id,))
+    cur = await unscoped(conn, "sweeper").execute(
+        "SELECT household_id FROM orders WHERE order_id = %s", (order_id,)
+    )
     (household_id,) = await cur.fetchone() or (None,)
     if household_id is None:
         raise LookupError(f"order {order_id} not found")
@@ -112,7 +115,7 @@ async def _quote_round(conn: AsyncConnection, timer: Mapping[str, Any]) -> None:
 
 async def _shortfall_expiry(conn: AsyncConnection, timer: Mapping[str, Any]) -> None:
     shortfall_id = UUID(str(timer["ref"]["shortfall_id"]))
-    cur = await conn.execute(_CLOSE_SHORTFALL_SQL, (shortfall_id,))
+    cur = await unscoped(conn, "sweeper").execute(_CLOSE_SHORTFALL_SQL, (shortfall_id,))
     row = await cur.fetchone()
     if row is None:
         return  # already closed: the last pick or the pickup won
@@ -143,14 +146,14 @@ async def sweep_once(conn: AsyncConnection, limit: int = CLAIM_LIMIT) -> int:
     """Fire up to `limit` due timers in one transaction; return how many were marked `done`."""
     fired = 0
     async with conn.transaction():
-        async with conn.cursor(row_factory=dict_row) as cur:
+        async with unscoped(conn, "sweeper").cursor(row_factory=dict_row) as cur:
             await cur.execute(_CLAIM_SQL, (sorted(KINDS), limit))
             timers = await cur.fetchall()
         for timer in timers:
             try:
                 async with conn.transaction():
                     await _ACTIONS[timer["kind"]](conn, timer)
-                    await conn.execute(_DONE_SQL, (timer["timer_id"],))
+                    await unscoped(conn, "sweeper").execute(_DONE_SQL, (timer["timer_id"],))
             except Exception:
                 log.exception(
                     "timer %s (%s) failed; left pending", timer["timer_id"], timer["kind"]

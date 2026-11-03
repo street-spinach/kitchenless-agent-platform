@@ -174,7 +174,6 @@ class World:
                     traces=TraceStore(pool),
                     store=PgSellerStore(pool),
                     call_tool=self.seller,
-                    issue_token=lambda sub, act, scopes: f"token:{sub}:{act}",
                     offer_ttl_seconds=600,
                     shortfall_reply_seconds=900,
                 )

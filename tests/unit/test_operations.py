@@ -156,6 +156,17 @@ def test_unsupported_refused_before_claim(
         "result": None,
         "refused": True,
         "reason": seller.UNSUPPORTED,
+        # The caller's identity (identity-authz §14): a service token has no person.
+        "sub_user_id": None,
+        "act_agent_id": SELLER,
+        "grant_id": None,
+        "token_source": "mock",
+        "authz": {
+            "relation": "member_of",
+            "object": "org:mock-grocery-us",
+            "allowed": True,
+            "model_id": "model-1",
+        },
     }
     [order] = _query(pg, "SELECT state FROM orders WHERE order_id = %s", order_id)
     assert order["state"] == "authorized"

@@ -22,16 +22,16 @@ from services.api.ingest import (
 from services.common import db, ids, runs
 from services.common.mcp_client import ToolRefused
 from services.common.run_context import RunContext
-from services.identity import fga, tokens
+from services.identity import fga
 from services.mcp.household import server as household
 from services.mcp.meta import CallContext
 from services.safety.guard import GuardRefused
 from tests.unit import api_world as w
+from tests.unit import identity_world as iw
 
 pytestmark = pytest.mark.db
 
 CHANNEL = "whatsapp"
-SECRET = "unit-test-mock-token-secret-32-bytes-long"
 HOUSEHOLD_AGENT = f"household:{w.HOUSEHOLD_ID}"
 
 
@@ -39,7 +39,6 @@ HOUSEHOLD_AGENT = f"household:{w.HOUSEHOLD_ID}"
 def _settings(monkeypatch: pytest.MonkeyPatch) -> None:
     w.patch_settings(monkeypatch)
     monkeypatch.setattr(household, "get_settings", runs.get_settings)  # the patched settings
-    monkeypatch.setattr(tokens, "_secret", lambda: SECRET)
     monkeypatch.setattr(fga, "check", lambda user, relation, object: (True, "model-1"))
 
 
@@ -140,15 +139,18 @@ def test_unknown_phone_starts_nothing(world: str) -> None:
 # through the real `decide_approval`, both in process on the test database.
 
 
-async def _call_tool(server: str, tool: str, args: dict, *, ctx: RunContext, token: str) -> dict:
-    """`mcp_client.call_tool` for the in-process household server."""
+async def _call_tool(server: str, tool: str, args: dict, *, ctx: RunContext, **kw: Any) -> dict:
+    """`mcp_client.call_tool_as` for the in-process household server: it obtains `api`'s
+    service token itself, so `ingest` passes none (identity-authz I6, I39)."""
     assert server == "household"
+    assert kw == {}, "ingest must not pass a token"
+    assert ctx.agent_id == API_AGENT
     call = CallContext(
         run_id=ctx.run_id,
         agent_id=ctx.agent_id,
         conversation_id=ctx.conversation_id,
         attempt=1,
-        token=token,
+        token=iw.service_token(ctx.agent_id),
         env="eval",
         modes={},
         on_behalf_of=None,
@@ -163,6 +165,11 @@ async def _call_tool(server: str, tool: str, args: dict, *, ctx: RunContext, tok
         return await fn(call, **typed)
     except GuardRefused as refused:
         raise ToolRefused(refused.reason) from None
+
+
+def _keycloak_sub(pg: str, user_id: uuid.UUID) -> str:
+    [row] = w.query(pg, "SELECT keycloak_sub FROM users WHERE user_id = %s", user_id)
+    return row["keycloak_sub"]
 
 
 def _with_pool[T](pg: str, monkeypatch: pytest.MonkeyPatch, fn: Any) -> T:
@@ -207,9 +214,7 @@ def _request_approval(pg: str, monkeypatch: pytest.MonkeyPatch, ttl: int | None 
             agent_id=HOUSEHOLD_AGENT,
             conversation_id=None,
             attempt=1,
-            token=tokens.MockIssuer().issue(
-                f"user:{w.ADMIN}", HOUSEHOLD_AGENT, ["approvals:request"]
-            ),
+            token=iw.people_token(HOUSEHOLD_AGENT, _keycloak_sub(pg, w.ADMIN)),
             env="eval",
             modes={},
             on_behalf_of=HOUSEHOLD_AGENT,

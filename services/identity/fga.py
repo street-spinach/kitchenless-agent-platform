@@ -23,6 +23,7 @@ from services.common import ids
 from services.common.config import get_settings
 from services.identity import audit
 from services.identity.errors import AuthzUnavailable
+from services.safety.scope import unscoped
 
 __all__ = [
     "AuthzUnavailable",
@@ -203,11 +204,15 @@ def _member_tuples(rows: Iterable[tuple[Any, ...]]) -> set[Tuple]:
 
 def _agent_tuples(conn: psycopg.Connection, where: str, params: tuple[Any, ...]) -> set[Tuple]:
     out: set[Tuple] = set()
-    cards = conn.execute(
-        "SELECT agent_id, class, owner_ref, region, zone_ids FROM agent_cards"
-        f" WHERE enabled AND {where}",
-        params,
-    ).fetchall()
+    cards = (
+        unscoped(conn, "fga.reconcile")
+        .execute(
+            "SELECT agent_id, class, owner_ref, region, zone_ids FROM agent_cards"
+            f" WHERE enabled AND {where}",
+            params,
+        )
+        .fetchall()
+    )
     for agent_id, cls, owner_ref, region, zone_ids in cards:
         kind, _, ref = owner_ref.partition(":")
         if not ref:
@@ -221,17 +226,25 @@ def _agent_tuples(conn: psycopg.Connection, where: str, params: tuple[Any, ...])
         elif kind == "org":
             out.add((agent, "member_of", f"org:{ref}"))
         if cls == "delivery" and zone_ids:
-            covered = conn.execute(
-                "SELECT household_id FROM households WHERE region = %s AND zone_id = ANY(%s)",
-                (region, list(zone_ids)),
-            ).fetchall()
+            covered = (
+                unscoped(conn, "fga.reconcile")
+                .execute(
+                    "SELECT household_id FROM households WHERE region = %s AND zone_id = ANY(%s)",
+                    (region, list(zone_ids)),
+                )
+                .fetchall()
+            )
             out.update((agent, "can_deliver_for", f"household:{h}") for (h,) in covered)
     return out
 
 
 def expected_tuples(conn: psycopg.Connection) -> set[Tuple]:
     """The structural tuples of §7, derived from Postgres."""
-    members = conn.execute("SELECT household_id, user_id, role FROM household_members").fetchall()
+    members = (
+        unscoped(conn, "fga.reconcile")
+        .execute("SELECT household_id, user_id, role FROM household_members")
+        .fetchall()
+    )
     return _member_tuples(members) | _agent_tuples(conn, "true", ())
 
 
@@ -242,11 +255,15 @@ def _missing(store_id: str, expected: Iterable[Tuple]) -> list[Tuple]:
 
 def sync_member(conn: psycopg.Connection, household_id: str, user_id: Any) -> None:
     """Write the member's tuple for their `household_members` role, if missing."""
-    rows = conn.execute(
-        "SELECT household_id, user_id, role FROM household_members"
-        " WHERE household_id = %s AND user_id = %s",
-        (household_id, user_id),
-    ).fetchall()
+    rows = (
+        unscoped(conn, "fga.reconcile")
+        .execute(
+            "SELECT household_id, user_id, role FROM household_members"
+            " WHERE household_id = %s AND user_id = %s",
+            (household_id, user_id),
+        )
+        .fetchall()
+    )
     store_id, _ = model_ids(conn)
     write(conn, _missing(store_id, _member_tuples(rows)))
 

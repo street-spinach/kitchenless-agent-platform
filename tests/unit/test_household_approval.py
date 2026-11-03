@@ -5,19 +5,11 @@ A refusal after an approval that covers the total ends the run `error, approval_
 approver is never asked twice for the same amount.
 """
 
-import pytest
-
 from services.agents.household import graph as hg
 from services.common.consumer import RunFinish
-from services.identity import tokens
-from tests.unit.test_household_graph import SECRET, World
+from tests.unit.test_household_graph import World
 
 SELLER = "grocery:square-us"
-
-
-@pytest.fixture(autouse=True)
-def _secret(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(tokens, "_secret", lambda: SECRET)
 
 
 def _refused_within_budget() -> tuple[World, object]:

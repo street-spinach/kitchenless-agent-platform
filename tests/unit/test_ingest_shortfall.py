@@ -78,11 +78,10 @@ class FakeCall:
         self.calls: list[dict[str, Any]] = []
 
     async def __call__(
-        self, server: str, tool: str, args: Mapping[str, Any], *, ctx: RunContext, token: str
+        self, server: str, tool: str, args: Mapping[str, Any], *, ctx: RunContext, **kw: Any
     ) -> dict[str, Any]:
-        self.calls.append(
-            {"server": server, "tool": tool, "args": dict(args), "ctx": ctx, "token": token}
-        )
+        # `ingest` passes no token: `call_tool_as` obtains api's (identity-authz I6, I39).
+        self.calls.append({"server": server, "tool": tool, "args": dict(args), "ctx": ctx, **kw})
         if self.error is not None:
             raise self.error
         return self.result
@@ -91,7 +90,6 @@ class FakeCall:
 @pytest.fixture(autouse=True)
 def _settings(monkeypatch: pytest.MonkeyPatch) -> None:
     w.patch_settings(monkeypatch)
-    monkeypatch.setattr(ingest_mod, "_service_token", lambda: "api-token")
 
 
 @pytest.fixture
@@ -138,7 +136,7 @@ def _shortfall(pg: str) -> tuple[uuid.UUID, uuid.UUID]:
 def _tap(
     pg: str, external_id: str, payload: str, fake: FakeCall, monkeypatch: pytest.MonkeyPatch
 ) -> Any:
-    monkeypatch.setattr(ingest_mod, "call_tool", fake)
+    monkeypatch.setattr(ingest_mod, "call_tool_as", fake)
     content = Content("button", button=payload)
     return w.run(pg, lambda conn: ingest(conn, CHANNEL, external_id, w.MEMBER_PHONE, content))
 
@@ -169,7 +167,7 @@ def test_shortfall_button_calls_choose_shortfall_option(
         agent_id=API_AGENT,
         conversation_id=ids.shortfall_conversation_id(shortfall_id),
     )
-    assert call["token"] == "api-token"
+    assert "token" not in call  # the service token is obtained inside call_tool_as
     # Nothing else is sent and no run starts; the tap is recorded against the shortfall run.
     assert _whatsapp_out(world) == []
     assert len(w.query(world, "SELECT * FROM runs")) == 1

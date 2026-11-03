@@ -16,6 +16,8 @@ import psycopg
 from psycopg import AsyncConnection
 from psycopg.types.json import Jsonb
 
+from services.safety.scope import unscoped
+
 __all__ = ["FORBIDDEN_KEY_PARTS", "KINDS", "record"]
 
 # The kinds in migrations/0010_identity.sql (I11), each with one writer (§14).
@@ -143,8 +145,8 @@ def record(
     if isinstance(conn, AsyncConnection):
 
         async def _write() -> None:
-            await conn.execute(_INSERT, params)
+            await unscoped(conn, "audit.record").execute(_INSERT, params)
 
         return _write()
-    conn.execute(_INSERT, params)
+    unscoped(conn, "audit.record").execute(_INSERT, params)
     return None

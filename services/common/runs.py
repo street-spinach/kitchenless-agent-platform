@@ -9,6 +9,12 @@ wins, and every later call changes nothing. When that call ends the run with `er
 unless the run is `a2a_demo` or the reason is in `NO_RETRY_PROMPT` (those callers send
 their own message).
 
+Identity (identity-authz I39, build step 5): `start` refuses a household run when the
+household agent has no active grant (`GrantMissing`, `GrantRevoked` or `GrantExpired`),
+except for `hello` and `a2a_demo` runs and runs with no household (I-D25), and records the
+run's token source in `modes["token_source"]`. `finish(reason='grant_revoked')` sets the
+run's orders that are not yet `placed` to `failed` (I-A6).
+
 `pause_timeout` and `resume_timeout` stop and restart `run_timeout` around an approval
 (architecture §4 timer table; #63).
 """
@@ -22,9 +28,13 @@ from psycopg.types.json import Jsonb
 
 from services.common import ids, outbox
 from services.common.config import get_settings
-from services.common.modes import pin_for_env, resolve_modes
+from services.common.modes import pin_for_env, resolve_modes, token_source
+from services.common.orders import BEFORE_PLACED
 from services.common.outbox import _on_behalf_of
 from services.common.trace import TraceStore
+from services.identity import grants
+from services.identity.claims import GRANT_REVOKED
+from services.safety.scope import unscoped
 
 __all__ = [
     "END_STATUSES",
@@ -54,6 +64,10 @@ _OPEN_STATUSES = ("running", "awaiting_approval")
 # `delivery_agent_id` means the order reached `placed` even if it later `failed`.
 _PLACED_OR_LATER = ("placed", "courier_booked", "in_delivery", "delivered")
 A2A_DEMO = "a2a_demo"
+# Runs that start without an active household grant (identity-authz I-D25).
+GRANT_EXEMPT_KINDS = frozenset({"hello", A2A_DEMO})
+# The key of the run's token source in `runs.modes` (identity-authz §12).
+TOKEN_SOURCE_KEY = "token_source"
 # Runs a person never retries (experience EX-A16): code-only replies, JOIN, `ob:` taps,
 # `/me` POSTs and reminders. They are skipped, so they never hide a failed run (EX-A15).
 _NOT_RETRY_SOURCES = ("code", "join", "tap", "me", "reminder")
@@ -78,6 +92,11 @@ _FINISH_SQL = """
 UPDATE runs SET status = %s, reason = %s, ended_at = now()
 WHERE run_id = %s AND status IN ('running', 'awaiting_approval')
 RETURNING kind, trigger
+"""
+
+_FAIL_UNPLACED_SQL = """
+UPDATE orders SET state = 'failed', updated_at = now()
+WHERE run_id = %s AND state = ANY(%s)
 """
 
 _RETRY_TARGET_SQL = f"""
@@ -119,12 +138,19 @@ async def start(
     async with conn.transaction():
         # An eval household's run never reaches a real vendor (adapters §3). A run with no
         # household counts as `live`, as `CallContext.from_meta` does.
-        cur = await conn.execute(
+        cur = await unscoped(conn, "runs").execute(
             "SELECT env FROM households WHERE household_id = %s", (household_id,)
         )
         row = await cur.fetchone()
-        modes = pin_for_env(await resolve_modes(conn), row[0] if row else "live")
-        cur = await conn.execute(
+        env = row[0] if row else "live"
+        if household_id is not None and kind not in GRANT_EXEMPT_KINDS:
+            # A household with no active household grant starts no run (I-D25). Raises
+            # `GrantMissing`, `GrantRevoked` or `GrantExpired`.
+            await grants.load_active(conn, f"household:{household_id}")
+        modes: dict[str, str] = dict(pin_for_env(await resolve_modes(conn), env))
+        # The run's token source (identity-authz §12): `mock` for an eval household.
+        modes[TOKEN_SOURCE_KEY] = token_source(env)
+        cur = await unscoped(conn, "runs").execute(
             _INSERT_RUN_SQL, (run_id, household_id, kind, Jsonb(trigger), Jsonb(modes))
         )
         if await cur.fetchone() is None:
@@ -137,7 +163,7 @@ async def start(
             on_behalf_of=None,
             conn=conn,
         )
-        await conn.execute(_INSERT_TIMER_SQL, (run_id, timeout))
+        await unscoped(conn, "runs").execute(_INSERT_TIMER_SQL, (run_id, timeout))
     return run_id
 
 
@@ -157,13 +183,13 @@ FROM runs WHERE run_id = %s AND status IN ('running', 'awaiting_approval')
 
 async def pause_timeout(conn: AsyncConnection, run_id: uuid.UUID) -> None:
     """Cancel the run's pending `run_timeout` while an approval is pending (§4 timers)."""
-    await conn.execute(_PAUSE_TIMEOUT_SQL, (run_id,))
+    await unscoped(conn, "runs").execute(_PAUSE_TIMEOUT_SQL, (run_id,))
 
 
 async def resume_timeout(conn: AsyncConnection, run_id: uuid.UUID) -> None:
     """A new `run_timeout` once an approval is decided (§4 timers): the full timeout again,
     for an open run with no pending one."""
-    cur = await conn.execute("SELECT kind FROM runs WHERE run_id = %s", (run_id,))
+    cur = await unscoped(conn, "runs").execute("SELECT kind FROM runs WHERE run_id = %s", (run_id,))
     row = await cur.fetchone()
     if row is None:
         return
@@ -171,7 +197,7 @@ async def resume_timeout(conn: AsyncConnection, run_id: uuid.UUID) -> None:
     timeout = (
         settings.a2a_demo_timeout_seconds if row[0] == A2A_DEMO else settings.run_timeout_seconds
     )
-    await conn.execute(_RESUME_TIMEOUT_SQL, (timeout, run_id, run_id))
+    await unscoped(conn, "runs").execute(_RESUME_TIMEOUT_SQL, (timeout, run_id, run_id))
 
 
 async def finish(
@@ -187,11 +213,15 @@ async def finish(
     if status not in END_STATUSES:
         raise ValueError(f"status must be one of {sorted(END_STATUSES)}, got {status!r}")
     async with conn.transaction():
-        cur = await conn.execute(_FINISH_SQL, (status, reason, run_id))
+        cur = await unscoped(conn, "runs").execute(_FINISH_SQL, (status, reason, run_id))
         row = await cur.fetchone()
         if row is None:
             return False
         kind, trigger = row
+        if reason == GRANT_REVOKED:
+            # Orders of the run not yet placed fail (identity-authz §11, I-A6); placed
+            # orders finish.
+            await unscoped(conn, "runs").execute(_FAIL_UNPLACED_SQL, (run_id, list(BEFORE_PLACED)))
         await _TRACES.write(
             run_id,
             agent_id,
@@ -222,7 +252,9 @@ async def finish(
 
 async def is_ended(conn: AsyncConnection, run_id: uuid.UUID) -> bool:
     """True if the run has an outcome. An unknown run counts as ended (fails closed)."""
-    cur = await conn.execute("SELECT status FROM runs WHERE run_id = %s", (run_id,))
+    cur = await unscoped(conn, "runs").execute(
+        "SELECT status FROM runs WHERE run_id = %s", (run_id,)
+    )
     row = await cur.fetchone()
     return row is None or row[0] not in _OPEN_STATUSES
 
@@ -231,7 +263,7 @@ async def retry_target(conn: AsyncConnection, user_id: uuid.UUID) -> uuid.UUID |
     """The user's latest run in the last 24 h if it ended `error` or `timeout` and its order
     never reached `placed`; otherwise `None` (architecture §9 "Retry"). Runs with no
     household or a `trigger.source` in `_NOT_RETRY_SOURCES` are skipped (experience EX-A16)."""
-    cur = await conn.execute(_RETRY_TARGET_SQL, (str(user_id),))
+    cur = await unscoped(conn, "runs").execute(_RETRY_TARGET_SQL, (str(user_id),))
     row = await cur.fetchone()
     if row is None:
         return None

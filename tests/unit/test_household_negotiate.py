@@ -10,20 +10,12 @@ import uuid
 from datetime import timedelta
 from typing import Any
 
-import pytest
-
 from services.agents.household import graph as hg
 from services.common import ids
-from services.identity import tokens
-from tests.unit.test_household_graph import HOUSEHOLD, NOW, SECRET, World
+from tests.unit.test_household_graph import HOUSEHOLD, NOW, World
 
 BEST = "grocery:square-us"
 RUNNER_UP = "grocery:mock-us"
-
-
-@pytest.fixture(autouse=True)
-def _secret(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(tokens, "_secret", lambda: SECRET)
 
 
 def _offer(w: World, seller: str, total: int, *, covered: int, lines: int = 2) -> Any:

@@ -8,12 +8,9 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-import pytest
-
 from services.agents.household import graph as hg
 from services.common.consumer import RunFinish, StepResult
-from services.identity import tokens
-from tests.unit.test_household_graph import MEMBERS, NOW, SECRET, STARTER, STARTER_AGENT, World
+from tests.unit.test_household_graph import MEMBERS, NOW, STARTER, STARTER_AGENT, World
 
 OTHER = "consumer:us-1-b"
 RESTAURANTS = ["restaurant:mock-us", "restaurant:square-us"]
@@ -43,11 +40,6 @@ class SoloWorld(World):
         return self.constraints(STARTER_AGENT, ["peanuts"])
 
 
-@pytest.fixture(autouse=True)
-def _secret(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(tokens, "_secret", lambda: SECRET)
-
-
 def _quote_requests(result: StepResult) -> list[Any]:
     return [m for m in result.messages if m.type == "quote_request"]
 
@@ -71,8 +63,8 @@ def test_solo_filters_household_allergens() -> None:
     result = w.to_quoting()
     [call] = w.household.of("get_household_allergens")
     assert call["args"] == {}
-    claims = tokens.validate(call["token"])
-    assert (claims.sub, claims.scopes) == (f"user:{STARTER}", ("constraints:read",))
+    # Agent code passes no token; the scopes are `tokens.TOOL_SCOPES` (identity-authz I6).
+    assert "token" not in call and call["ctx"].agent_id == "household:us-1"
     requests = _quote_requests(result)
     assert sorted(r.to_agent for r in requests) == RESTAURANTS
     for r in requests:

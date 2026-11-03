@@ -22,10 +22,8 @@ from services.common.directory import AgentCard
 from services.common.mcp_client import AdapterUnavailable, ToolRefused
 from services.common.protocol.a2a import AgentMessageRow
 from services.common.protocol.schemas import SCHEMAS
-from services.identity import tokens
 from tests.unit import model_fakes as mf
 
-SECRET = "unit-test-mock-token-secret-32-bytes-long"
 USER = uuid.UUID("11111111-1111-4111-8111-111111111111")
 CONSUMER = "consumer:us-1-a"
 ADMIN_NAME = "Asha"
@@ -71,10 +69,9 @@ class FakeHousehold:
             return {"outcome": "removed"}
         return {"outcome": "not_learned"}
 
-    async def __call__(self, server: str, tool: str, args: dict, *, ctx: Any, token: str) -> dict:
-        self.calls.append(
-            {"server": server, "tool": tool, "args": args, "ctx": ctx, "token": token}
-        )
+    async def __call__(self, server: str, tool: str, args: dict, *, ctx: Any) -> dict:
+        # No `token` argument: `call_tool_as` obtains it (identity-authz I6).
+        self.calls.append({"server": server, "tool": tool, "args": args, "ctx": ctx})
         if tool == "record_dislike":
             return self.record_dislike(args)
         if isinstance(self.result, Exception):
@@ -112,9 +109,6 @@ class World:
             checkpointer=self.checkpointer,
             load_run=self.load_run,
             call_tool=self.household,
-            issue_token=lambda sub, act, scopes: tokens.MockIssuer(secret=SECRET).issue(
-                sub, act, list(scopes)
-            ),
         )
 
     async def load_run(self, run_id: uuid.UUID) -> cg.RunInfo:
@@ -150,11 +144,6 @@ class World:
 
     def step(self, msg: Inbound) -> StepResult:
         return asyncio.run(self.agent(msg, CARD))
-
-
-@pytest.fixture(autouse=True)
-def _secret(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(tokens, "_secret", lambda: SECRET)
 
 
 def _valid(result: StepResult) -> None:
@@ -314,9 +303,7 @@ def test_learn_dislike_add_and_remove() -> None:
         {"user_id": str(USER), "value": "mushrooms", "action": "remove"},
     ]
     for call in calls:
-        claims = tokens.validate(call["token"])
-        assert (claims.sub, claims.act) == (f"user:{USER}", CONSUMER)
-        assert claims.scopes == (cg.DISLIKE_SCOPE,)
+        assert "token" not in call and call["ctx"].agent_id == CONSUMER
     choices = [d["choice"] for d in w.traces.of("decision") if d["node"] == "learn_dislike"]
     assert "dislike_added" in choices and "dislike_removed" in choices
     # The decision rows never carry the dislike value (agents §15).
@@ -460,7 +447,8 @@ def test_chat_prompt_has_member_codes() -> None:
     assert user["content"] == "<message>What could we cook this week?</message>"
     [call] = w.household.calls
     assert (call["tool"], call["args"]) == ("get_constraints", {"user_id": str(USER)})
-    assert tokens.validate(call["token"]).scopes == (cg.CONSTRAINTS_SCOPE,)
+    # Agent code passes no token; the scopes are `tokens.TOOL_SCOPES` (identity-authz I6).
+    assert "token" not in call and call["ctx"].agent_id == CONSUMER
 
 
 def test_member_text_is_marked_as_data() -> None:
@@ -537,9 +525,8 @@ def test_constraints_call_household_for_the_member() -> None:
     )
     assert call["ctx"].agent_id == CONSUMER
     assert call["ctx"].run_id == w.run_id
-    claims = tokens.validate(call["token"])
-    assert (claims.sub, claims.act) == (f"user:{USER}", CONSUMER)
-    assert claims.scopes == (cg.CONSTRAINTS_SCOPE,)
+    # Agent code passes no token; the scopes are `tokens.TOOL_SCOPES` (identity-authz I6).
+    assert "token" not in call
 
 
 def test_constraint_value_outside_the_codes_fails_closed() -> None:

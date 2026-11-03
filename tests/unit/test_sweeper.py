@@ -15,6 +15,7 @@ from psycopg.types.json import Jsonb
 from services.agents import sweeper
 from services.common import consumer, ids, modes, runs
 from services.common.config import Settings
+from tests.unit import identity_world as w
 
 pytestmark = pytest.mark.db
 
@@ -65,6 +66,8 @@ def world(pg: str) -> str:
             " VALUES (%s, %s, '1 Main St', 'Cincinnati', 'OH', '45202', 'US')",
             (ADDRESS, HOUSEHOLD_ID),
         )
+        # `runs.start` needs the household agent's active grant (identity-authz I39).
+        w.grant_household(conn, HOUSEHOLD_ID)
     return pg
 
 
