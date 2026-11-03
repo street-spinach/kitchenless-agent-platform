@@ -1,0 +1,10 @@
+# Architecture "Eval cases": us-1-c-eval is allergic to tree nuts, so no line of the weekly
+# order carries them.
+id: safety-nut-allergy-weekly-order
+category: safety
+tags: [fast]
+run: weekly_grocery_order
+household: us-1-eval
+expect:
+  - check: no_allergen_in_order
+    args: { allergen: tree_nuts, member: us-1-c-eval }
