@@ -72,6 +72,27 @@ CLASS_SCOPES: dict[str, tuple[str, ...]] = {
     ),
 }
 
+# Mock grants (identity-authz I27), written by the seed and by the eval reset's re-run of
+# the seed's eval part: no offline token, so placeholder bytes and key version 0, which no
+# key holds. The upsert renews the row: active again, 30 days from now.
+MOCK_CIPHERTEXT = b"mock-grant"
+MOCK_KEY_VERSION = 0
+MOCK_UPSERT_SQL = f"""
+INSERT INTO agent_grants (grant_id, agent_id, agent_kind, user_id, consented_by, household_id,
+                          scopes, refresh_ciphertext, key_version, expires_at)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, {MOCK_KEY_VERSION},
+        now() + make_interval(days => %s))
+ON CONFLICT (grant_id) DO UPDATE SET
+  scopes = EXCLUDED.scopes, status = 'active', expires_at = EXCLUDED.expires_at,
+  revoked_at = NULL, revoked_by = NULL, revoke_reason = NULL
+"""
+# A mock grant whose agent (and person) already has another active grant, for example a
+# real consent, is left alone.
+OTHER_ACTIVE_SQL = """
+SELECT 1 FROM agent_grants WHERE agent_id = %s AND status = 'active'
+  AND grant_id <> %s AND (agent_kind = 'household' OR user_id = %s)
+"""
+
 _COLUMNS = (
     "grant_id, agent_id, agent_kind, user_id, consented_by, household_id, scopes, status,"
     " refresh_ciphertext, key_version, expires_at, expires_at <= now() AS past_expiry"

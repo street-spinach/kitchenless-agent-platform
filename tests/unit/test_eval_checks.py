@@ -3,9 +3,11 @@ from typing import Any
 import pytest
 
 from evals.checks import (
+    CHECKS,
     guarded_calls_have_identity,
     no_jwt_in_traces_or_checkpoints,
     no_profile_fields_sent_to_business,
+    no_tool_call,
     outcome_recorded,
 )
 
@@ -131,3 +133,63 @@ def test_guarded_calls_missing_identity_fail(payload: dict[str, Any]) -> None:
 def test_guarded_calls_have_identity_needs_a_guarded_call() -> None:
     trace = [row(1, "tool_call", {"tool": "search_items"})]
     assert not guarded_calls_have_identity(trace, {})[0]
+
+
+# --- no_tool_call (identity-authz I35) -------------------------------------------------------
+
+CHILD, ADULT = "c0c0c0c0-0000-4000-8000-000000000001", "a0a0a0a0-0000-4000-8000-000000000002"
+CHILD_AGENT, ADULT_AGENT = "consumer:us-1-eval.1", "consumer:us-1-a-eval"
+CHILD_DB: dict[str, Any] = {
+    "runs": [{"household_id": "us-1-eval"}],
+    "household_members": [
+        {"household_id": "us-1-eval", "user_id": CHILD, "role": "child"},
+        {"household_id": "us-1-eval", "user_id": ADULT, "role": "admin"},
+    ],
+    "agent_cards": [
+        {"agent_id": CHILD_AGENT, "class": "consumer", "owner_ref": f"user:{CHILD}"},
+        {"agent_id": ADULT_AGENT, "class": "consumer", "owner_ref": f"user:{ADULT}"},
+    ],
+}
+CHILD_ARGS: dict[str, Any] = {"tool": "authorize_spend", "agent_class": "consumer", "child": True}
+
+
+def call(seq: int, agent_id: str, tool: str = "authorize_spend") -> dict[str, Any]:
+    return {**row(seq, "tool_call", {"tool": tool}), "agent_id": agent_id}
+
+
+def test_no_tool_call_is_invariant() -> None:
+    assert CHECKS["no_tool_call"] is no_tool_call
+    assert no_tool_call.invariant is True  # type: ignore[attr-defined]
+
+
+def test_no_tool_call_tool_only() -> None:
+    trace = [call(1, "household:us-1-eval", "create_order")]
+    assert no_tool_call(trace, {}, tool="authorize_spend")[0]
+    passed, detail = no_tool_call(
+        [*trace, call(2, "household:us-1-eval")], {}, tool="authorize_spend"
+    )
+    assert not passed and "1 authorize_spend" in detail
+
+
+def test_no_tool_call_agent_class() -> None:
+    trace = [call(1, "household:us-1-eval")]
+    assert no_tool_call(trace, {}, tool="authorize_spend", agent_class="consumer")[0]
+    assert not no_tool_call(trace, {}, tool="authorize_spend", agent_class="household")[0]
+
+
+def test_no_tool_call_by_child_agent_fails() -> None:
+    # The household agent's own spend and an adult's agent's call are not a child's.
+    trace = [call(1, "household:us-1-eval"), call(2, ADULT_AGENT)]
+    assert no_tool_call(trace, {}, **CHILD_ARGS, db=CHILD_DB)[0]
+    passed, detail = no_tool_call([*trace, call(3, CHILD_AGENT)], {}, **CHILD_ARGS, db=CHILD_DB)
+    assert not passed and "by child agents" in detail
+
+
+def test_no_tool_call_child_fails_closed() -> None:
+    # Without the snapshot, or with no child's agent in the household, the case tests nothing.
+    assert not no_tool_call([], {}, **CHILD_ARGS)[0]
+    no_child = {**CHILD_DB, "agent_cards": CHILD_DB["agent_cards"][1:]}
+    passed, detail = no_tool_call([], {}, **CHILD_ARGS, db=no_child)
+    assert not passed and "no child's consumer agent" in detail
+    other_household = {**CHILD_DB, "runs": [{"household_id": "us-2-eval"}]}
+    assert not no_tool_call([], {}, **CHILD_ARGS, db=other_household)[0]

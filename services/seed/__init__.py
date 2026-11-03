@@ -6,6 +6,9 @@ amended 2026-11-02).
 
 `seeded_limits` and `household_envs` read `households.yaml` the same way, so the reset's
 setup keys restore the seeded values and only ever touch eval households (evals.md §4).
+
+`mock_grant_rows` is the one builder of mock grants: the seed and the reset's re-run of the
+seed's eval part (identity-authz I27, step 9) both use it.
 """
 
 from collections.abc import Mapping
@@ -18,8 +21,13 @@ __all__ = [
     "DATA_DIR",
     "MOCK_STOCK_ENVS",
     "MOCK_STOCK_QTY",
+    "MockGrant",
+    "eval_mock_grant_rows",
     "household_envs",
+    "mock_grant_rows",
     "mock_stock_rows",
+    "region_defaults",
+    "seed_member_ids",
     "seeded_limits",
 ]
 
@@ -79,3 +87,66 @@ def seeded_limits(data_dir: Path = DATA_DIR) -> dict[str, dict[str, int | None]]
 def household_envs(data_dir: Path = DATA_DIR) -> dict[str, str]:
     """`{household_id: env}` for every seeded household."""
     return {hh["household_id"]: hh["env"] for hh in _load_households(data_dir)}
+
+
+def region_defaults(data_dir: Path = DATA_DIR) -> dict[str, str]:
+    """The seeded `us` region's `{region, zone_id, timezone, currency}` (the `defaults` of
+    `households.yaml`), which a household created by onboarding takes (identity-authz §5)."""
+    with (data_dir / "households.yaml").open() as f:
+        defaults: dict[str, str] = yaml.safe_load(f)["defaults"]
+    return {k: defaults[k] for k in ("region", "zone_id", "timezone", "currency")}
+
+
+def seed_member_ids(env: str, data_dir: Path = DATA_DIR) -> dict[str, list[str]]:
+    """`{household_id: [member_id]}` for the seeded households of `env`."""
+    return {
+        hh["household_id"]: [m["member_id"] for m in hh["members"]]
+        for hh in _load_households(data_dir)
+        if hh["env"] == env
+    }
+
+
+MockGrant = tuple[Any, str, str, Any, Any, str, list[str]]
+
+
+def mock_grant_rows(hh: Mapping[str, Any]) -> list[MockGrant]:
+    """`(grant_id, agent_id, agent_kind, user_id, consented_by, household_id, scopes)` of the
+    one mock grant per people agent of the seeded household `hh`.
+
+    The household agent's grant holder is the approver; a consumer agent's is its member,
+    consented by the approver for a child. The seed and `services.mocks.control.reset` both
+    use this builder, so the two never drift.
+    """
+    from services.common import ids
+    from services.identity.grants import CLASS_SCOPES
+
+    hid = hh["household_id"]
+    approver = next(m for m in hh["members"] if m.get("approver"))
+    admin_id = ids.seed_user_id(approver["member_id"])
+    people = [(f"household:{hid}", "household", admin_id, admin_id)]
+    for m in hh["members"]:
+        user_id = ids.seed_user_id(m["member_id"])
+        consented_by = admin_id if m["role"] == "child" else user_id
+        people.append((f"consumer:{m['member_id']}", "consumer", user_id, consented_by))
+    return [
+        (
+            ids.seed_grant_id(agent_id, user_id),
+            agent_id,
+            kind,
+            user_id,
+            consented_by,
+            hid,
+            list(CLASS_SCOPES[kind]),
+        )
+        for agent_id, kind, user_id, consented_by in people
+    ]
+
+
+def eval_mock_grant_rows(data_dir: Path = DATA_DIR) -> list[MockGrant]:
+    """`mock_grant_rows` of every seeded eval household with members."""
+    return [
+        row
+        for hh in _load_households(data_dir)
+        if hh["env"] == "eval" and hh["members"]
+        for row in mock_grant_rows(hh)
+    ]

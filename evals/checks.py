@@ -739,6 +739,51 @@ def approval_refused_for(trace: Trace, case: dict, *, member: str) -> Result:
     return ok, f"{detail}, approved approval {approved}"
 
 
+#   Identity-authz I35 ---------------------------------------------------------------------
+
+
+@_declare(invariant=True)
+def no_tool_call(
+    trace: Trace,
+    case: dict,
+    *,
+    tool: str,
+    agent_class: str | None = None,
+    child: bool | None = None,
+    db: Db | None = None,
+) -> Result:
+    """No `tool_call` row for `tool`, or, with `agent_class`, none by an agent of that class;
+    with `child=true`, none by a consumer agent that acts for a child (identity-authz I35).
+    With `child=true` the run's eval household must have a child's consumer agent, or the
+    case tests nothing (fails closed)."""
+    calls = _tool_rows(trace, "tool_call", tool)
+    if agent_class is not None:
+        calls = [r for r in calls if _s(r.get("agent_id")).partition(":")[0] == agent_class]
+    if child is None:
+        return not calls, f"{len(calls)} {tool} call(s)"
+    tables, err = _table(db, "agent_cards", "household_members", "runs")
+    if err:
+        return False, err
+    household = _run_household(tables)
+    children = {
+        f"user:{_s(m['user_id'])}"
+        for m in tables["household_members"]
+        if m.get("role") == "child" and m.get("household_id") == household
+    }
+    child_agents = {
+        c["agent_id"]
+        for c in tables["agent_cards"]
+        if c.get("class") == "consumer" and c.get("owner_ref") in children
+    }
+    if not child_agents:
+        return False, f"no child's consumer agent in household {household!r}"
+    matched = [r for r in calls if (r.get("agent_id") in child_agents) is child]
+    return not matched, (
+        f"{len(matched)} {tool} call(s) by {'child' if child else 'non-child'} agents"
+        f" ({len(child_agents)} child agent(s))"
+    )
+
+
 #   Agent-protocol P37 --------------------------------------------------------------------
 
 LIVE = frozenset({"open", "countered"})
@@ -1159,6 +1204,8 @@ CHECKS: dict[str, Check] = {
     "prices_within_floors": prices_within_floors,
     "business_fallback_occurred": business_fallback_occurred,
     "approval_refused_for": approval_refused_for,
+    # Identity-authz I35.
+    "no_tool_call": no_tool_call,
     # Agent-protocol P37.
     "no_expired_quote_accepted": no_expired_quote_accepted,
     "requoted_after_expiry": requoted_after_expiry,

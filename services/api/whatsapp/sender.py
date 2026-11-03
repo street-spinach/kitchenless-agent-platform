@@ -29,6 +29,7 @@ A member with no phone has nothing to send to, and the message is dropped with a
 import asyncio
 import datetime
 import logging
+import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
@@ -42,6 +43,7 @@ from services.api.whatsapp import templates
 from services.common.config import Settings
 from services.common.consumer import Inbound, StepFailed, StepResult
 from services.common.trace import TraceStore
+from services.identity import links
 
 __all__ = [
     "ATTEMPTS",
@@ -229,6 +231,12 @@ TEXTS: dict[str, str] = {
     "joined": "Welcome, {name}. You're in {household}. Tell me anything you don't like to eat.",
     # The /me pages (experience §8).
     "me_link": "Here's your page. The link works for 10 minutes: {link}",
+    # Identity-authz §12 (I26), §5: the reply to a phone that is not registered, the renew
+    # text (its `{link}` is issued at send time, `WhatsAppOut.link`) and the revoke notice.
+    # Experience X15 (EX-A15) rewords the last two and adds their Renew button.
+    "unknown_number": "This number isn't registered yet.",
+    "consent_renewal": "Your agent's permission has ended. Tap to renew: {link}",
+    "consent_revoked": "{agent} stopped. Orders not yet placed won't go ahead.{placed_line}",
     # Held items (experience §5).
     "held_cancelled_line": (
         "While you were away, the order for {amount} was cancelled because it wasn't "
@@ -414,6 +422,14 @@ class Sender:
                 await cur.execute(_DONE_SQL, (row.message_id,))
                 if await cur.fetchone() is not None:
                     return StepResult()  # a replayed step: its outcome is written
+            link = body.get("link")
+            if link is not None:
+                if not phone["inside"]:
+                    # A text with a link is sent only inside the window (identity-authz
+                    # I26): never held and never a template.
+                    await _record(conn, msg, user_id, SKIPPED, OUTSIDE_WINDOW)
+                    return StepResult()
+                body["params"] = {**body["params"], "link": await _issue_link(conn, user_id, link)}
             graph = graph_payload(phone["phone_e164"], body)
             if graph is None:
                 log.warning("whatsapp_out %s: %s", row.message_id, UNRENDERABLE)
@@ -465,6 +481,15 @@ class Sender:
             await _refused(conn, msg, user_id, refused)
             return
         await _record(conn, msg, user_id, TEMPLATE, None, graph_message_id)
+
+
+async def _issue_link(conn: AsyncConnection, user_id: str, link: dict[str, Any]) -> str:
+    """A fresh consent link for the message's person, issued now, so its token is never
+    stored in the message (identity-authz §6, I-G8)."""
+    person = uuid.UUID(user_id)
+    return await links.issue(
+        conn, "consent", person, person, link["household_id"], list(link["agent_ids"])
+    )
 
 
 async def _sim(

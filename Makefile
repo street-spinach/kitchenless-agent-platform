@@ -7,7 +7,7 @@ define allow_empty
 s=$$?; if [ $$s -eq 5 ]; then echo "No $(1) tests yet."; exit 0; fi; exit $$s
 endef
 
-.PHONY: up down lint test-unit test-contract fga-test smoke scenario eval-fast eval-safety eval-full seed seed-local app-deps app-lint app-test
+.PHONY: up down lint test-unit test-contract fga-test smoke scenario scenario-identity eval-fast eval-safety eval-full seed seed-local app-deps app-lint app-test
 
 up:
 	$(COMPOSE) up -d --build --remove-orphans --wait
@@ -36,6 +36,12 @@ smoke:
 
 scenario:
 	$(COMPOSE) run --rm testrunner pytest tests/scenario -q; $(call allow_empty,scenario)
+
+# identity-authz I43: from the host against `make up` (TOKEN_SOURCE=mock, DOMAIN=localhost),
+# with the stack's settings in the environment. Outside tests/scenario, so `make scenario`
+# and the deploy never run it, and it never creates grants in the live realm.
+scenario-identity:
+	uv run pytest tests/identity_scenario -q
 
 # evals/run.py defaults ORCHESTRATOR_URL to http://localhost:8000, where api serves
 # /hello/run (architecture item 73).

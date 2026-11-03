@@ -5,7 +5,10 @@
     `services.seed.mock_stock_rows("eval")` (§7 reset scope, amended 2026-11-02). It then
     undoes every `SETUP_KEYS` entry for all eval households, sets `last_inbound_at = now()`
     for eval phones (experience §14) and applies `setup` to `household_id` (evals.md §4,
-    E-A8). It refuses any other `env`.
+    E-A8). It refuses any other `env`. It also re-runs the seed's eval part (identity-authz
+    I27, build step 9): the eval households' mock grants are active again for 30 days, and
+    after the commit `fga.reconcile()` makes the OpenFGA tuples match Postgres, so grants
+    and tuples reset with the mocks.
 *   `inject_event(...)`: writes a `mock_events` row and returns its id. A `shortfall`
     event needs `params = {order_id, skus}`, with 1 to `SHORTFALL_MAX_LINES` SKUs, each a
     line of the order (agent-protocol §10). It is refused when the order's run pinned the
@@ -18,20 +21,30 @@ The route checks that belong to `/panel/events` (the order is `courier_booked` a
 shortfall, then `shortfall_detected`) are agent-protocol P31 and live in the route.
 """
 
+import asyncio
 import math
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
+import psycopg
 from psycopg import AsyncConnection
 from psycopg.types.json import Jsonb
 
 from services.common import directory, dislikes, ids, pantry, vendors
 from services.common.config import get_settings
 from services.common.modes import ALWAYS_MOCK, VENDORS
+from services.identity import grants
 from services.safety.scope import unscoped
-from services.seed import household_envs, mock_stock_rows, seeded_limits
+from services.seed import (
+    MockGrant,
+    eval_mock_grant_rows,
+    household_envs,
+    mock_stock_rows,
+    seed_member_ids,
+    seeded_limits,
+)
 
 __all__ = [
     "DEFAULT_EVAL_HOUSEHOLD",
@@ -320,13 +333,166 @@ async def _undo_pantry(
     return
 
 
+_ADD_CHILD_KEYS = frozenset({"display_name", "consented"})
+
+
+def _check_add_child(name: str, value: Mapping[Any, Any]) -> dict[str, Any]:
+    """`{display_name: non-empty str, consented: bool}` (identity-authz I35)."""
+    if set(value) != _ADD_CHILD_KEYS:
+        raise ControlRefused(f"setup key {name!r} must have exactly display_name and consented")
+    display_name, consented = value["display_name"], value["consented"]
+    if not isinstance(display_name, str) or not display_name.strip():
+        raise ControlRefused(f"setup key {name!r}: display_name must be a non-empty string")
+    if not isinstance(consented, bool):
+        raise ControlRefused(f"setup key {name!r}: consented must be true or false")
+    return {"display_name": display_name, "consented": consented}
+
+
+async def _apply_add_child(
+    conn: AsyncConnection, household_id: str, value: Mapping[str, Any]
+) -> None:
+    """`onboarding.create_child` by the household's approver and, if `consented`, an active
+    mock grant for the child's consumer agent, consented by that approver (I35)."""
+    from services.identity import onboarding
+
+    cur = await unscoped(conn, "control.reset").execute(
+        f"SELECT approver_user_id FROM approval_rules WHERE household_id = %s AND {_EVAL_ONLY}",
+        (household_id,),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        raise ControlRefused(f"add_child: {household_id} has no approver")
+    admin = row[0]
+    child = await onboarding.create_child(conn, admin, household_id, value["display_name"])
+    if not value["consented"]:
+        return
+    cur = await unscoped(conn, "control.reset").execute(
+        "SELECT agent_id FROM agent_cards WHERE class = 'consumer' AND owner_ref = %s",
+        (f"user:{child}",),
+    )
+    (agent_id,) = await cur.fetchone() or (None,)
+    if agent_id is None:
+        raise ControlRefused("add_child: the child has no consumer agent")
+    await _upsert_mock_grant(
+        conn,
+        (
+            ids.seed_grant_id(agent_id, child),
+            agent_id,
+            "consumer",
+            child,
+            admin,
+            household_id,
+            list(grants.CLASS_SCOPES["consumer"]),
+        ),
+    )
+
+
+# Members of an eval household who are not in the seed file (added by `add_child`).
+_EXTRA_MEMBERS_SQL = (
+    "SELECT user_id FROM household_members WHERE household_id = %s"
+    f" AND {_EVAL_ONLY} AND NOT (user_id = ANY(%s))"
+)
+# Children first; %(users)s are those members, %(cards)s the consumer cards they own.
+_UNDO_ADD_CHILD_SQL = (
+    "DELETE FROM consent_links"
+    " WHERE target_user_id = ANY(%(users)s) OR sent_to_user_id = ANY(%(users)s)",
+    "DELETE FROM agent_grants WHERE user_id = ANY(%(users)s) OR agent_id = ANY(%(cards)s)",
+    "DELETE FROM agent_clients WHERE agent_id = ANY(%(cards)s)",
+    "DELETE FROM agent_cards WHERE agent_id = ANY(%(cards)s)",
+    "DELETE FROM member_constraints WHERE user_id = ANY(%(users)s)",
+    "DELETE FROM channel_identities WHERE user_id = ANY(%(users)s)",
+    "DELETE FROM household_members WHERE household_id = %(household)s AND user_id = ANY(%(users)s)",
+    "DELETE FROM users WHERE user_id = ANY(%(users)s)"
+    " AND NOT EXISTS (SELECT 1 FROM household_members m WHERE m.user_id = users.user_id)",
+)
+
+
+async def _undo_add_child(
+    conn: AsyncConnection, household_id: str, seeded: Mapping[str, int | None]
+) -> None:
+    """Delete the eval household's members whose `member_id` is not in the seed file, with
+    their cards, clients, grants and links (evals.md §4)."""
+    q = unscoped(conn, "control.reset")
+    known = [ids.seed_user_id(m) for m in seed_member_ids("eval").get(household_id, [])]
+    cur = await q.execute(_EXTRA_MEMBERS_SQL, (household_id, known))
+    users = [row[0] for row in await cur.fetchall()]
+    if not users:
+        return
+    cur = await q.execute(
+        "SELECT agent_id FROM agent_cards WHERE owner_ref = ANY(%s)",
+        ([f"user:{u}" for u in users],),
+    )
+    cards = [row[0] for row in await cur.fetchall()]
+    params = {"household": household_id, "users": users, "cards": cards}
+    for sql in _UNDO_ADD_CHILD_SQL:
+        await q.execute(sql, params)
+
+
 SETUP_KEYS: Mapping[str, SetupKey] = {
     "budget_minor": SetupKey(int, _apply_budget, _undo_budget),
     "per_order_minor": SetupKey(int, _apply_per_order, _undo_per_order),
     "dislikes": SetupKey(dict, _apply_dislikes, _undo_dislikes, _check_dislikes),
     "take_turns": SetupKey(bool, _apply_take_turns, _undo_take_turns),
     "pantry": SetupKey(dict, _apply_pantry, _undo_pantry, _check_pantry),
+    "add_child": SetupKey(dict, _apply_add_child, _undo_add_child, _check_add_child),
 }
+
+
+# --- the seed's eval part (identity-authz I27, build step 9) ---------------------------------
+
+
+async def _upsert_mock_grant(conn: AsyncConnection, row: MockGrant) -> None:
+    """The seed's mock grant upsert (`grants.MOCK_UPSERT_SQL`). A grant whose agent (and
+    person) has another active grant, or whose card or people are not seeded, is left
+    alone."""
+    grant_id, agent_id, kind, user_id, consented_by, household_id, scopes = row
+    q = unscoped(conn, "control.reset")
+    holders = list(dict.fromkeys([user_id, consented_by]))
+    cur = await q.execute(
+        "SELECT (SELECT count(*) FROM users WHERE user_id = ANY(%s)) = %s"
+        " AND EXISTS (SELECT 1 FROM agent_cards WHERE agent_id = %s)",
+        (holders, len(holders), agent_id),
+    )
+    (exists,) = await cur.fetchone() or (False,)
+    if not exists:
+        return
+    cur = await q.execute(grants.OTHER_ACTIVE_SQL, (agent_id, grant_id, user_id))
+    if await cur.fetchone() is not None:
+        return
+    await q.execute(
+        grants.MOCK_UPSERT_SQL,
+        (
+            grant_id,
+            agent_id,
+            kind,
+            user_id,
+            consented_by,
+            household_id,
+            scopes,
+            grants.MOCK_CIPHERTEXT,
+            grants.GRANT_DAYS,
+        ),
+    )
+
+
+async def _renew_eval_grants(conn: AsyncConnection) -> None:
+    """The seed's mock grants of every eval household (`services.seed.mock_grant_rows`),
+    active again for 30 days, so a revoke or expiry in one case never reaches the next."""
+    for row in eval_mock_grant_rows():
+        await _upsert_mock_grant(conn, row)
+
+
+def _reconcile_fga_sync() -> int:
+    from services.identity import fga
+
+    with psycopg.connect(get_settings().database_url or "") as sync_conn:
+        return fga.reconcile(sync_conn)
+
+
+async def reconcile_fga() -> int:
+    """The seed's last step, `fga.reconcile()`, after the reset has committed: OpenFGA's
+    structural tuples match Postgres again (identity-authz I27)."""
+    return await asyncio.to_thread(_reconcile_fga_sync)
 
 
 def _validate_setup(setup: Mapping[str, Any] | None, household_id: str) -> dict[str, Any]:
@@ -391,11 +557,15 @@ async def reset(
         for key in SETUP_KEYS.values():
             for hid in eval_households:
                 await key.undo(conn, hid, limits[hid])
+        # The seed's eval part (identity-authz I27): the mock grants, before `setup`.
+        await _renew_eval_grants(conn)
         # Eval phones start inside the WhatsApp window again (experience §14, EX-I11),
         # before `setup` is applied.
         await unscoped(conn, "control.reset").execute(_RESTORE_WINDOW_SQL)
         for name, value in applied.items():
             await SETUP_KEYS[name].apply(conn, household_id, value)
+    # Then the tuples, as the seed ends: OpenFGA reads only committed rows.
+    await reconcile_fga()
     return deleted
 
 

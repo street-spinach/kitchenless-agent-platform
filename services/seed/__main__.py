@@ -29,7 +29,7 @@ from services.common import ids, pantry, vendors
 from services.common.directory import AgentCard
 from services.identity import grants
 from services.safety.scope import unscoped
-from services.seed import DATA_DIR, mock_stock_rows
+from services.seed import DATA_DIR, mock_grant_rows, mock_stock_rows
 
 ENVS = ("live", "eval", "all")
 CARD_VERSION_DEFAULT = "1.0.0"
@@ -50,19 +50,6 @@ MOCK_TOKEN_SOURCE = "mock"
 API_AGENT = "system:api"
 API_CLIENT = "svc.api"
 PEOPLE_CLASSES = {"consumer": "people", "household": "people"}
-# Mock grants hold no offline token: placeholder bytes, key version 0 (no key holds it).
-MOCK_GRANT_CIPHERTEXT = b"mock-grant"
-MOCK_GRANT_KEY_VERSION = 0
-
-_MOCK_GRANT_SQL = f"""
-INSERT INTO agent_grants (grant_id, agent_id, agent_kind, user_id, consented_by, household_id,
-                          scopes, refresh_ciphertext, key_version, expires_at)
-VALUES (%s, %s, %s, %s, %s, %s, %s, %s, {MOCK_GRANT_KEY_VERSION},
-        now() + make_interval(days => %s))
-ON CONFLICT (grant_id) DO UPDATE SET
-  scopes = EXCLUDED.scopes, status = 'active', expires_at = EXCLUDED.expires_at,
-  revoked_at = NULL, revoked_by = NULL, revoke_reason = NULL
-"""
 
 
 class SeedError(RuntimeError):
@@ -427,32 +414,17 @@ def _gets_mock_grants(hh: dict[str, Any], token_source: str) -> bool:
 
 
 def _seed_mock_grants(conn: psycopg.Connection, hh: dict[str, Any]) -> None:
-    """Upsert one active mock grant per people agent of `hh`, expiring 30 days from now.
-
-    The household agent's grant holder is the approver; a consumer agent's is its member,
-    consented by the approver for a child. A grant whose agent (and person) already has
-    another active grant, for example a real consent, is left alone.
+    """Upsert one active mock grant per people agent of `hh`, expiring 30 days from now
+    (`services.seed.mock_grant_rows`). A grant whose agent (and person) already has another
+    active grant, for example a real consent, is left alone.
     """
-    hid = hh["household_id"]
-    approver = next(m for m in hh["members"] if m.get("approver"))
-    admin_id = ids.seed_user_id(approver["member_id"])
-    rows = [(f"household:{hid}", "household", admin_id, admin_id)]
-    for m in hh["members"]:
-        user_id = ids.seed_user_id(m["member_id"])
-        consented_by = admin_id if m["role"] == "child" else user_id
-        rows.append((f"consumer:{m['member_id']}", "consumer", user_id, consented_by))
     q = unscoped(conn, "seed")
-    for agent_id, kind, user_id, consented_by in rows:
-        grant_id = ids.seed_grant_id(agent_id, user_id)
-        other = q.execute(
-            "SELECT 1 FROM agent_grants WHERE agent_id = %s AND status = 'active'"
-            " AND grant_id <> %s AND (agent_kind = 'household' OR user_id = %s)",
-            (agent_id, grant_id, user_id),
-        ).fetchone()
+    for grant_id, agent_id, kind, user_id, consented_by, hid, scopes in mock_grant_rows(hh):
+        other = q.execute(grants.OTHER_ACTIVE_SQL, (agent_id, grant_id, user_id)).fetchone()
         if other is not None:
             continue
         q.execute(
-            _MOCK_GRANT_SQL,
+            grants.MOCK_UPSERT_SQL,
             (
                 grant_id,
                 agent_id,
@@ -460,8 +432,8 @@ def _seed_mock_grants(conn: psycopg.Connection, hh: dict[str, Any]) -> None:
                 user_id,
                 consented_by,
                 hid,
-                list(grants.CLASS_SCOPES[kind]),
-                MOCK_GRANT_CIPHERTEXT,
+                scopes,
+                grants.MOCK_CIPHERTEXT,
                 grants.GRANT_DAYS,
             ),
         )

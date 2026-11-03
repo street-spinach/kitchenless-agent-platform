@@ -37,6 +37,8 @@ ALLOWLIST: dict[str, str] = {
     "services/identity/audit.py": "unscoped:audit.record",
     "services/identity/fga.py": "unscoped:fga.reconcile",
     "services/identity/links.py": "unscoped:links",
+    # Onboarding writes a new person's rows, before any household scope exists (I23).
+    "services/identity/onboarding.py": "unscoped:onboarding",
     "services/seed/__main__.py": "unscoped:seed",
     "services/common/runs.py": "unscoped:runs",
     "services/agents/sweeper.py": "unscoped:sweeper",

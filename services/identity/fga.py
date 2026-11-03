@@ -30,9 +30,12 @@ __all__ = [
     "Client",
     "FgaError",
     "Tuple",
+    "card_tuples",
     "check",
     "delete",
+    "ensure",
     "expected_tuples",
+    "member_tuple",
     "reconcile",
     "sync_agent",
     "sync_member",
@@ -202,6 +205,37 @@ def _member_tuples(rows: Iterable[tuple[Any, ...]]) -> set[Tuple]:
     return {(f"user:{user_id}", role, f"household:{hid}") for hid, user_id, role in rows}
 
 
+def member_tuple(household_id: str, user_id: Any, role: str) -> Tuple:
+    """The §7 tuple of one `household_members` row."""
+    return (f"user:{user_id}", role, f"household:{household_id}")
+
+
+def card_tuples(agent_id: str, cls: str, owner_ref: str) -> set[Tuple]:
+    """The §7 tuples of one people or business card, without the delivery coverage tuples
+    (those need the households of the card's zones)."""
+    kind, _, ref = owner_ref.partition(":")
+    if not ref:
+        return set()
+    agent = agent_object(agent_id)
+    if cls == "consumer" and kind == "user":
+        return {(agent, "acts_for", f"user:{ref}")}
+    if cls == "household" and kind == "household":
+        return {(agent, "acts_for", f"household:{ref}"), (agent, "can_spend", f"budget:{ref}")}
+    if kind == "org":
+        return {(agent, "member_of", f"org:{ref}")}
+    return set()
+
+
+def ensure(tuples: Iterable[Tuple]) -> None:
+    """Write those of `tuples` that are missing, in the store `check` uses. Sync: an async
+    caller runs it in a thread. Raises `AuthzUnavailable` on an outage."""
+    store_id, model_id = _ids()
+    missing = _missing(store_id, tuples)
+    client = _client()
+    for i in range(0, len(missing), WRITE_CHUNK):
+        client.write(store_id, model_id, missing[i : i + WRITE_CHUNK], [])
+
+
 def _agent_tuples(conn: psycopg.Connection, where: str, params: tuple[Any, ...]) -> set[Tuple]:
     out: set[Tuple] = set()
     cards = (
@@ -214,17 +248,10 @@ def _agent_tuples(conn: psycopg.Connection, where: str, params: tuple[Any, ...])
         .fetchall()
     )
     for agent_id, cls, owner_ref, region, zone_ids in cards:
-        kind, _, ref = owner_ref.partition(":")
-        if not ref:
+        if not owner_ref.partition(":")[2]:
             continue
         agent = agent_object(agent_id)
-        if cls == "consumer" and kind == "user":
-            out.add((agent, "acts_for", f"user:{ref}"))
-        elif cls == "household" and kind == "household":
-            out.add((agent, "acts_for", f"household:{ref}"))
-            out.add((agent, "can_spend", f"budget:{ref}"))
-        elif kind == "org":
-            out.add((agent, "member_of", f"org:{ref}"))
+        out |= card_tuples(agent_id, cls, owner_ref)
         if cls == "delivery" and zone_ids:
             covered = (
                 unscoped(conn, "fga.reconcile")
