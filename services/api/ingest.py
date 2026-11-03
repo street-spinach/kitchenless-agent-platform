@@ -37,6 +37,10 @@
 
 The member's text is kept in `runs.trigger.text`, where the consumer agent reads it.
 
+Held items (experience §5, EX-I20): on every known-person path, once the path's run exists
+and before its reply, `release_held` re-checks the person's held messages, drops stale ones
+and sends up to 3 fresh ones on that run.
+
 Identity (identity-authz §11, §12, I26): when `runs.start` refuses a household run because
 the household agent's grant is missing, revoked or expired, no household run starts.
 Instead a `chat` run with no household (exempt from the grant check, experience §3) carries
@@ -57,11 +61,13 @@ from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from services.api.whatsapp import templates
 from services.api.whatsapp.sender import GraphSender
 from services.common import ids, mcp_client, outbox, runs
 from services.common.config import get_settings
 from services.common.mcp_client import ToolRefused, call_tool_as
 from services.common.run_context import RunContext
+from services.common.trace import TraceStore
 from services.identity import grants
 from services.identity.errors import GrantError
 from services.safety.scope import unscoped
@@ -76,11 +82,15 @@ __all__ = [
     "SHORTFALL_PREFIX",
     "TAKE_TURNS_SAVED",
     "CONSENT_RENEWAL",
+    "HELD_CANCELLED_LINE",
+    "HELD_NODE",
+    "HELD_RELEASE_CAP",
     "UNKNOWN_NUMBER",
     "WHATSAPP",
     "Content",
     "ingest",
     "parse_shortfall_button",
+    "release_held",
     "send_unknown_number",
 ]
 
@@ -115,6 +125,15 @@ CONSENT_RENEWAL = "consent_renewal"
 # A run that only carries a code-built reply (experience §3): no household, so it is exempt
 # from the grant check, and `runs.retry_target` skips it.
 CODE_SOURCE = "code"
+# Held items (experience §5 "Release", EX-I20).
+HELD_RELEASE_CAP = 3
+HELD_CANCELLED_LINE = "held_cancelled_line"
+HELD_NODE = "held_release"
+RELEASED = "released"
+DROPPED = "dropped"
+STALE = "stale"
+# `TraceStore.write(..., conn=...)` never touches the pool.
+_TRACES = TraceStore(None)  # type: ignore[arg-type]
 
 SendUnknownNumber = Callable[[str], Awaitable[None]]
 
@@ -428,7 +447,8 @@ async def _start(
     """`(run, True)` for the run `runs.start` started. If it refused because the household
     agent's grant is missing, revoked or expired, `(run, False)` for the run that carried
     the renew reply instead (identity-authz §11, I26). `runs.start`'s own savepoint undid
-    the refused start."""
+    the refused start. Either way the person's held items are released on the run before
+    its reply (EX-I20)."""
     try:
         started = await runs.start(
             conn, household_id=household_id, kind=kind, trigger=trigger, run_id=run_id
@@ -436,6 +456,7 @@ async def _start(
     except GrantError as refused:
         log.info("household run refused: %s", refused.reason)
         return await _renew(conn, member, inbound, refused.reason, run_id), False
+    await release_held(conn, member.user_id, started, inbound)
     return started, True
 
 
@@ -474,6 +495,7 @@ async def _renew(
         trigger={"source": CODE_SOURCE, "user_id": member.user_id, "inbound_id": inbound},
         run_id=run_id,
     )
+    await release_held(conn, member.user_id, started, inbound)
     q = unscoped(conn, "ingest")
     cur = await q.execute(_RENEW_TO_SQL, (member.household_id, member.user_id))
     row = await cur.fetchone()
@@ -582,6 +604,7 @@ async def _approval_tap(
         log.info("approval button for an unknown approval ignored")
         return None
     run_id: uuid.UUID = approval["run_id"]
+    await release_held(conn, member.user_id, run_id, inbound)
     args = {
         "approval_id": str(approval_id),
         "decision": decision,
@@ -702,6 +725,7 @@ async def _shortfall_button(
         log.info("inbound shortfall button ignored: unknown shortfall")
         return None
     run_id: uuid.UUID = row[0]
+    await release_held(conn, member.user_id, run_id, inbound)
     ctx = RunContext(
         run_id=run_id,
         agent_id=API_AGENT,
@@ -740,3 +764,168 @@ async def _shortfall_button(
             },
         )
     return run_id
+
+
+# --- held items (experience §5 "Release", EX-I20) ---------------------------------------
+
+# The person's pending held rows, oldest first. Locked, so a concurrent message from the
+# same person waits and then finds them decided.
+_HELD_SQL = """
+SELECT held_id, message_id, body, ref_kind, ref_id FROM held_messages
+WHERE user_id = %s AND status = 'pending'
+ORDER BY created_at, held_id
+FOR UPDATE
+"""
+
+_DECIDE_HELD_SQL = """
+UPDATE held_messages SET status = %s, decided_at = now()
+WHERE held_id = %s AND status = 'pending'
+"""
+
+# An approval's status, and whether its pending `approval_expiry` timer is due more than
+# 5 minutes from now (§5 "Holdable kinds").
+_HELD_APPROVAL_SQL = """
+SELECT a.status,
+       EXISTS (SELECT 1 FROM timers t
+               WHERE t.kind = 'approval_expiry' AND t.status = 'pending'
+                 AND t.ref->>'approval_id' = a.approval_id::text
+                 AND t.due_at > now() + interval '5 minutes') AS due_later
+FROM approvals a WHERE a.approval_id = %s
+"""
+
+# An order less than 72 hours old.
+_HELD_ORDER_SQL = """
+SELECT 1 FROM orders WHERE order_id = %s AND created_at > now() - interval '72 hours'
+"""
+
+# A grant with no newer grant row for the same agent (not replaced since).
+_HELD_GRANT_SQL = """
+SELECT 1 FROM agent_grants g
+WHERE g.grant_id = %s
+  AND NOT EXISTS (SELECT 1 FROM agent_grants n
+                  WHERE n.agent_id = g.agent_id AND n.created_at > g.created_at)
+"""
+
+# The person's own decision: such an approval was not cancelled for want of an answer.
+_DECIDED_BY_PERSON = frozenset({"approved", "rejected"})
+
+
+async def release_held(
+    conn: AsyncConnection, user_id: uuid.UUID, run_id: uuid.UUID, inbound_id: uuid.UUID
+) -> None:
+    """Release the person's held items on the run `run_id` (experience §5, EX-I20).
+
+    Inside the caller's transaction: each `pending` row, oldest first, is checked again
+    (§5 "Holdable kinds"). A stale one is marked `dropped`; up to `HELD_RELEASE_CAP` fresh
+    ones are sent through the outbox as `system:api` with `ids.held_release_id(held_id)`
+    and marked `released`; the rest stay `pending`. If an approval was dropped, one
+    `held_cancelled_line` (`ids.held_cancelled_id(inbound_id)`) is sent too, with the
+    oldest dropped approval's amount; it does not count toward the cap. Each decided row
+    writes one `decision` trace row (`node: held_release`). A replay sends nothing again:
+    the rows are decided and the message ids are fixed."""
+    q = unscoped(conn, "held_release")
+    async with q.cursor(row_factory=dict_row) as cur:
+        await cur.execute(_HELD_SQL, (user_id,))
+        rows = await cur.fetchall()
+    released = 0
+    cancelled_amount: str | None = None
+    for row in rows:
+        fresh, cancelled = await _held_check(conn, user_id, row)
+        if not fresh:
+            await q.execute(_DECIDE_HELD_SQL, (DROPPED, row["held_id"]))
+            await _held_decision(conn, user_id, run_id, row, DROPPED, None)
+            if cancelled and cancelled_amount is None:
+                amount = (row["body"].get("params") or {}).get("amount")
+                cancelled_amount = amount if isinstance(amount, str) and amount else None
+            continue
+        if released >= HELD_RELEASE_CAP:
+            continue
+        message_id = ids.held_release_id(row["held_id"])
+        await outbox.send(
+            conn,
+            message_id=message_id,
+            run_id=run_id,
+            conversation_id=None,
+            causation_id=None,
+            from_agent=API_AGENT,
+            to_agent=WHATSAPP,
+            type="whatsapp_out",
+            body=row["body"],
+        )
+        await q.execute(_DECIDE_HELD_SQL, (RELEASED, row["held_id"]))
+        await _held_decision(conn, user_id, run_id, row, RELEASED, message_id)
+        released += 1
+    if cancelled_amount is not None:
+        await outbox.send(
+            conn,
+            message_id=ids.held_cancelled_id(inbound_id),
+            run_id=run_id,
+            conversation_id=None,
+            causation_id=None,
+            from_agent=API_AGENT,
+            to_agent=WHATSAPP,
+            type="whatsapp_out",
+            body={
+                "user_id": str(user_id),
+                "template": HELD_CANCELLED_LINE,
+                "params": {"amount": cancelled_amount},
+                "buttons": [],
+            },
+        )
+
+
+async def _held_check(
+    conn: AsyncConnection, user_id: uuid.UUID, row: dict[str, Any]
+) -> tuple[bool, bool]:
+    """`(fresh, cancelled)` for one held row. Anything that cannot be checked is stale
+    (fails closed). `cancelled` is true for a stale approval that the person did not
+    decide."""
+    body, kind = row["body"], row["ref_kind"]
+    if (
+        not isinstance(body, dict)
+        or body.get("user_id") != str(user_id)
+        or not templates.holdable(str(body.get("template", "")), kind)
+    ):
+        return False, False
+    try:
+        ref_id = uuid.UUID(str(row["ref_id"]))
+    except ValueError:
+        return False, kind == "approval"
+    q = unscoped(conn, "held_release")
+    if kind == "approval":
+        cur = await q.execute(_HELD_APPROVAL_SQL, (ref_id,))
+        approval = await cur.fetchone()
+        if approval is None:
+            return False, True
+        status, due_later = approval
+        fresh = status == "pending" and bool(due_later)
+        return fresh, not fresh and status not in _DECIDED_BY_PERSON
+    sql = _HELD_ORDER_SQL if kind == "order" else _HELD_GRANT_SQL
+    cur = await q.execute(sql, (ref_id,))
+    return await cur.fetchone() is not None, False
+
+
+async def _held_decision(
+    conn: AsyncConnection,
+    user_id: uuid.UUID,
+    run_id: uuid.UUID,
+    row: dict[str, Any],
+    choice: str,
+    message_id: uuid.UUID | None,
+) -> None:
+    """One `decision` trace row per decided held row (EX-I20)."""
+    await _TRACES.write(
+        run_id,
+        API_AGENT,
+        "decision",
+        {
+            "node": HELD_NODE,
+            "choice": choice,
+            "reason": STALE if choice == DROPPED else None,
+            "explanation": "",
+            "ref": str(row["message_id"]),
+        },
+        on_behalf_of=f"user:{user_id}",
+        message_id=message_id,
+        conn=conn,
+    )
