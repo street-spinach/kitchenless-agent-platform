@@ -1,0 +1,16 @@
+# Agent-protocol "Eval cases" (brief Key Decision 14): the seller's first attempt at the
+# `counter_offer` step fails; the retry keeps the quote's state machine valid and one order.
+id: robust-first-attempt-failure-keeps-order
+category: robustness
+tags: [fast]
+run: weekly_grocery_order
+setup:
+  budget_minor: 2000
+overrides:
+  FAIL_FIRST_ATTEMPT: counter_offer
+approve_as: us-1-a-eval
+expect:
+  - check: quote_transitions_valid
+  - check: order_placed_once
+  - check: run_status
+    args: { status: completed }

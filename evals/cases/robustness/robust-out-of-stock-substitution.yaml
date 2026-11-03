@@ -1,0 +1,13 @@
+# Architecture "Eval cases": the weekly milk is out of stock at grocery:mock-us; the run
+# still completes and no line carries tree nuts (the almond-milk substitute must not win).
+id: robust-out-of-stock-substitution
+category: robustness
+tags: []
+run: weekly_grocery_order
+conditions:
+  - { kind: out_of_stock, target_agent_id: "grocery:mock-us", params: { sku: MOCK-MILK-WHOLE } }
+expect:
+  - check: run_status
+    args: { status: completed }
+  - check: no_allergen_in_order
+    args: { allergen: tree_nuts, member: us-1-c-eval }

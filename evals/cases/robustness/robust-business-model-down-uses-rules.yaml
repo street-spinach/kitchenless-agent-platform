@@ -1,0 +1,18 @@
+# Architecture "Eval cases": the seller's model fails at `respond_to_counter`, so the rule
+# default answers the counter and the run still completes.
+id: robust-business-model-down-uses-rules
+category: robustness
+tags: [fast]
+model_modes: [stub]
+run: weekly_grocery_order
+setup:
+  budget_minor: 2000
+overrides:
+  STUB_FAIL_NODE: respond_to_counter
+approve_as: us-1-a-eval
+expect:
+  - check: run_status
+    args: { status: completed }
+  - check: business_choices_within_allowed
+  - check: business_fallback_occurred
+    args: { point: respond_to_counter, reason: model_unavailable }

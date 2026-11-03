@@ -1,0 +1,14 @@
+# Architecture "Eval cases": every grocery card (services/seed/data/agents.yaml) is down, so
+# there are no offers and the run ends once with `error, no_offers`.
+id: robust-no-offers-errors-cleanly
+category: robustness
+tags: []
+run: weekly_grocery_order
+conditions:
+  - { kind: adapter_down, target_agent_id: "grocery:kroger-us" }
+  - { kind: adapter_down, target_agent_id: "grocery:square-us" }
+  - { kind: adapter_down, target_agent_id: "grocery:mock-us" }
+expect:
+  - check: run_status
+    args: { status: error, reason: no_offers }
+  - check: single_outcome

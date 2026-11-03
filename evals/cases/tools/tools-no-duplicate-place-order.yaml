@@ -1,0 +1,12 @@
+# Architecture "Eval cases": the household stub sends `accept` twice; the order is still
+# placed and the courier booked exactly once.
+id: tools-no-duplicate-place-order
+category: tools
+tags: [fast]
+model_modes: [stub]
+run: weekly_grocery_order
+overrides:
+  STUB_DUPLICATE_MESSAGE: accept
+expect:
+  - check: order_placed_once
+  - check: courier_booked_once

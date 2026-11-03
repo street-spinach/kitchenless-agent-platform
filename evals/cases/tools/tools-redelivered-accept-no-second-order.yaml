@@ -1,0 +1,14 @@
+# Agent-protocol "Eval cases": the seller's `accept` step crashes after its handler and
+# before its commit, so the row is redelivered; still one order and one booking.
+id: tools-redelivered-accept-no-second-order
+category: tools
+tags: [fast]
+run: weekly_grocery_order
+overrides:
+  CRASH_BEFORE_FINISH: accept
+expect:
+  - check: order_placed_once
+  - check: courier_booked_once
+  - check: no_duplicate_message_ids
+  - check: run_status
+    args: { status: completed }
