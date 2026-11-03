@@ -12,6 +12,9 @@ unattended.
    each eval case this issue adds or changes, once:
    `uv run python -m evals.run --case <id> --repeats 1`. Say so in the PR body. The full
    suite runs nightly (architecture item 63).
+   Run every check in the foreground and wait for it to finish, even a long one such as an
+   eval run. Never end your turn while a command is still running in the background: the
+   run ends when you stop, so a push you meant to make after it never happens.
 5. Commit and push to the same branch. Do not open a new PR. Do not merge.
 
 If the fix needs a small decision the design leaves open, decide it the way

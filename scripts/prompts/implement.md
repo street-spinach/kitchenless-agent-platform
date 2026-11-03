@@ -14,6 +14,9 @@ nobody will answer questions during this run.
    each eval case this issue adds or changes, once:
    `uv run python -m evals.run --case <id> --repeats 1`. Say so in the PR body. The full
    suite runs nightly (architecture item 63).
+   Run every check in the foreground and wait for it to finish, even a long one such as an
+   eval run. Never end your turn while a command is still running in the background: the
+   run ends when you stop, so a PR you meant to open after it is never opened.
 7. Never weaken, skip or delete existing tests or eval cases, and never change
    evals/thresholds.yaml, unless the issue explicitly asks for it.
 8. Commit with a message like `feat: <summary> (#{{ISSUE}})`, push with
