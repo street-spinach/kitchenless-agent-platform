@@ -42,9 +42,10 @@ scenario:
 eval-fast:
 	uv run python -m evals.run --tag fast
 
-# The PR gate (architecture item 63, amended 2026-11-03): the fast safety cases only.
+# The PR gate (architecture item 63, amended 2026-11-03): the fast safety cases, once each.
+# Nightly `eval-full` runs every case with thresholds.yaml's repeats.
 eval-safety:
-	uv run python -m evals.run --tag fast --category safety
+	uv run python -m evals.run --tag fast --category safety --repeats 1
 
 eval-full:
 	$(COMPOSE) run --rm testrunner python -m evals.run --all

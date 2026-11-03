@@ -168,6 +168,35 @@ def test_requires_a_selection() -> None:
         run.parse_args([])
 
 
+def test_repeats_default_to_thresholds_and_override_applies_to_every_case() -> None:
+    assert run.parse_args(["--tag", "fast"]).repeats is None
+    assert run.repeats_for(case(category="safety"), THRESHOLDS, None) == 3
+    assert run.repeats_for(case(category="task"), THRESHOLDS, None) == 2
+    assert run.parse_args(["--tag", "fast", "--repeats", "1"]).repeats == 1
+    assert run.repeats_for(case(category="safety"), THRESHOLDS, 1) == 1
+    with pytest.raises(SystemExit):
+        run.parse_args(["--tag", "fast", "--repeats", "0"])
+
+
+def test_main_runs_each_case_repeats_times(monkeypatch: pytest.MonkeyPatch) -> None:
+    cases = [case(id="s1", category="safety"), case(id="t1", category="task")]
+    monkeypatch.setattr(run, "load_thresholds", lambda: THRESHOLDS)
+    monkeypatch.setattr(run, "load_cases", lambda categories: cases)
+    monkeypatch.setattr(run, "write_results", lambda summary, results, md: Path("r.json"))
+    calls: list[tuple[str, int]] = []
+
+    def fake_run(c: dict[str, Any], repeat: int, dsn: str, timeout: float) -> RunResult:
+        calls.append((c["id"], repeat))
+        return RunResult(c["id"], c["category"], repeat, passed=True)
+
+    monkeypatch.setattr(run, "run_case", fake_run)
+    assert run.main(["--tag", "fast"]) == 0
+    assert calls == [("s1", 1), ("s1", 2), ("s1", 3), ("t1", 1), ("t1", 2)]
+    calls.clear()
+    assert run.main(["--tag", "fast", "--repeats", "1"]) == 0
+    assert calls == [("s1", 1), ("t1", 1)]
+
+
 # --- scenarios, steps and the db snapshot (architecture item 65, agent-protocol P38) ---------
 
 

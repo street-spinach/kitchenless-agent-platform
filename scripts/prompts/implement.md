@@ -9,7 +9,7 @@ nobody will answer questions during this run.
    refactor unrelated code or add features that aren't asked for.
 5. Add or update the tests listed under "Tests" and the eval cases listed under "Evals".
 6. Run every command under "Verify", plus `make lint test-unit`. Iterate until they pass.
-   If the change touches services/agents/, also run `make eval-fast`.
+   If the change touches services/agents/, also run `make eval-safety`.
 7. Never weaken, skip or delete existing tests or eval cases, and never change
    evals/thresholds.yaml, unless the issue explicitly asks for it.
 8. Commit with a message like `feat: <summary> (#{{ISSUE}})`, push with

@@ -2751,7 +2751,8 @@ and values; none of these may be renamed or dropped.
 ##### 63. `.github/workflows/ci.yml` (Modify, critical)
 
 *Amended 2026-11-03 (PR eval gate):* to keep loop PRs fast, the eval job runs
-`make eval-safety` (the `fast` cases in the `safety` category) instead of `make eval-fast`,
+`make eval-safety` (the `fast` cases in the `safety` category, once each with
+`--repeats 1`) instead of `make eval-fast`,
 and the path filter gains `services/identity/`. The other categories run in the nightly
 `make eval-full` (item 64), which files an issue when one falls below its threshold.
 
