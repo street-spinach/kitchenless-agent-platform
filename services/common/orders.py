@@ -18,6 +18,7 @@ from psycopg import AsyncConnection, sql
 from psycopg.rows import dict_row
 
 from services.common.money import Money
+from services.safety.scope import unscoped
 
 MAIN_PATH = (
     "draft",
@@ -105,7 +106,9 @@ async def transition(
     query = sql.SQL("UPDATE orders SET {} WHERE order_id = %s AND state = ANY(%s)").format(
         sql.SQL(", ").join(sets)
     )
-    cur = await conn.execute(query, (new, *fields.values(), order_id, expected_states))
+    cur = await unscoped(conn, "orders").execute(
+        query, (new, *fields.values(), order_id, expected_states)
+    )
     return cur.rowcount == 1
 
 
@@ -138,7 +141,7 @@ async def remaining_weekly_budget(
     The budget week starts Monday 00:00 in the household's time zone (architecture §3).
     `now` defaults to the database clock.
     """
-    async with conn.cursor(row_factory=dict_row) as cur:
+    async with unscoped(conn, "orders").cursor(row_factory=dict_row) as cur:
         await cur.execute(
             """
             SELECT b.amount_minor, b.currency,
@@ -198,7 +201,7 @@ async def apply_amendment(
     the order moves to `failed`.
     """
     picks = {int(line): pick for line, pick in picks.items()}
-    async with conn.cursor(row_factory=dict_row) as cur:
+    async with unscoped(conn, "orders").cursor(row_factory=dict_row) as cur:
         await cur.execute("SELECT state FROM orders WHERE order_id = %s FOR UPDATE", (order_id,))
         order = await cur.fetchone()
         if order is None:

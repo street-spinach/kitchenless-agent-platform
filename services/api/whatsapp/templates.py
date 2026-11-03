@@ -25,6 +25,7 @@ from services.common.config import Settings
 from services.common.money import Money
 from services.common.money import format as money_format
 from services.mcp.household.server import format_reply_by
+from services.safety.scope import unscoped
 
 __all__ = [
     "HOLDABLE",
@@ -203,7 +204,7 @@ def _count(value: Any) -> str | None:
 
 
 async def _one(conn: AsyncConnection, sql: str, args: Sequence[Any]) -> dict[str, Any] | None:
-    async with conn.cursor(row_factory=dict_row) as cur:
+    async with unscoped(conn, "whatsapp_templates").cursor(row_factory=dict_row) as cur:
         await cur.execute(sql, args)
         return await cur.fetchone()
 

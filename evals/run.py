@@ -480,6 +480,8 @@ SNAPSHOT_SQL: dict[str, str] = {
     "order_items": f"SELECT * FROM order_items WHERE order_id IN ({_ORDERS}) ORDER BY line",
     "quotes": "SELECT * FROM quotes WHERE run_id = %(run)s",
     "approvals": "SELECT * FROM approvals WHERE run_id = %(run)s",
+    # Identity-authz I35 `approval_requested_if_over_band`: the eval households' bands.
+    "approval_rules": f"SELECT * FROM approval_rules WHERE household_id IN ({_EVAL_HH})",
     "shortfalls": "SELECT * FROM shortfalls WHERE run_id = %(run)s",
     "pantry_events": f"SELECT * FROM pantry_events WHERE order_id IN ({_ORDERS})",
     "mock_orders": "SELECT * FROM mock_orders WHERE external_order_id IN"

@@ -4,6 +4,7 @@ import pytest
 
 from evals.checks import (
     CHECKS,
+    approval_requested_if_over_band,
     guarded_calls_have_identity,
     no_jwt_in_traces_or_checkpoints,
     no_profile_fields_sent_to_business,
@@ -193,3 +194,65 @@ def test_no_tool_call_child_fails_closed() -> None:
     assert not passed and "no child's consumer agent" in detail
     other_household = {**CHILD_DB, "runs": [{"household_id": "us-2-eval"}]}
     assert not no_tool_call([], {}, **CHILD_ARGS, db=other_household)[0]
+
+
+# --- approval_requested_if_over_band (identity-authz I35, §9) --------------------------------
+
+
+def spend(seq: int, amount_minor: int) -> dict[str, Any]:
+    args = {"total": {"amount_minor": amount_minor, "currency": "USD"}}
+    return row(seq, "tool_call", {"tool": "authorize_spend", "args": args})
+
+
+def band_db(band: int | None, *approval_limits: list[str]) -> dict[str, Any]:
+    return {
+        "runs": [{"household_id": "us-1-eval"}],
+        "approval_rules": [
+            {"household_id": "us-2-eval", "per_order_minor": 1},
+            {"household_id": "us-1-eval", "per_order_minor": band},
+        ],
+        "approvals": [{"status": "approved", "limits": lim} for lim in approval_limits],
+    }
+
+
+def test_approval_requested_if_over_band_is_registered_invariant() -> None:
+    assert CHECKS["approval_requested_if_over_band"] is approval_requested_if_over_band
+    assert approval_requested_if_over_band.invariant is True  # type: ignore[attr-defined]
+
+
+def test_over_band_with_band_approval_passes() -> None:
+    trace = [spend(1, 12000), spend(5, 12000)]
+    assert approval_requested_if_over_band(trace, {}, db=band_db(10000, ["band"]))[0]
+    # Band and budget in one approval: still one prompt.
+    assert approval_requested_if_over_band(trace, {}, db=band_db(10000, ["band", "budget"]))[0]
+
+
+@pytest.mark.parametrize(
+    "approvals",
+    [(), (["budget"],), (["band"], ["band"]), ([],)],
+    ids=["none", "budget-only", "two-prompts", "no-limits"],
+)
+def test_over_band_without_one_band_approval_fails(approvals: tuple[list[str], ...]) -> None:
+    passed, detail = approval_requested_if_over_band(
+        [spend(1, 12000)], {}, db=band_db(10000, *approvals)
+    )
+    assert not passed and "band 10000" in detail
+
+
+def test_within_band_passes_unless_an_approval_names_the_band() -> None:
+    trace = [spend(1, 10000)]  # at the band is not above it
+    assert approval_requested_if_over_band(trace, {}, db=band_db(10000))[0]
+    assert approval_requested_if_over_band(trace, {}, db=band_db(10000, ["budget"]))[0]
+    assert not approval_requested_if_over_band(trace, {}, db=band_db(10000, ["band"]))[0]
+
+
+def test_over_band_fails_closed() -> None:
+    trace = [spend(1, 12000)]
+    assert not approval_requested_if_over_band(trace, {}, db=None)[0]  # no snapshot
+    no_rules = {k: v for k, v in band_db(10000).items() if k != "approval_rules"}
+    assert not approval_requested_if_over_band(trace, {}, db=no_rules)[0]
+    passed, detail = approval_requested_if_over_band(trace, {}, db=band_db(None, ["band"]))
+    assert not passed and "no band" in detail
+    assert not approval_requested_if_over_band([], {}, db=band_db(10000, ["band"]))[0]
+    no_total = [row(1, "tool_call", {"tool": "authorize_spend", "args": {}})]
+    assert not approval_requested_if_over_band(no_total, {}, db=band_db(10000, ["band"]))[0]

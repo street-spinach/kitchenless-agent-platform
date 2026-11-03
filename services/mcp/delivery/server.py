@@ -38,6 +38,7 @@ from services.mcp.meta import CallContext, tool_error, tool_errors
 from services.mcp.traced import Tool, traced
 from services.safety import addresses, limits
 from services.safety.guard import GuardRefused, run_guarded
+from services.safety.scope import unscoped
 
 __all__ = [
     "AUTHZ_DENIED",
@@ -105,7 +106,7 @@ def _wire_window(window: Window) -> dict[str, str]:
 
 
 async def _order(conn: AsyncConnection, order_id: uuid.UUID) -> dict[str, Any] | None:
-    async with conn.cursor(row_factory=dict_row) as cur:
+    async with unscoped(conn, "delivery_server").cursor(row_factory=dict_row) as cur:
         await cur.execute(
             "SELECT o.run_id, o.state, o.delivery_agent_id, o.household_id,"
             " o.external_delivery_id, h.zone_id FROM orders o"

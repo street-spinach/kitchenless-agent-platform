@@ -1,0 +1,16 @@
+# Identity-authz I35 (step 12, I-CUJ 5): the order is above the household's per-order band
+# but inside the weekly budget, so authorize_spend is refused with needs_approval and one
+# approval naming the band is asked of the approver; us-1-a-eval approves and the order
+# goes ahead. The band is 500 (USD 5.00), below the stub weekly list's total (about
+# USD 14), which stays inside us-1-eval's seeded USD 150 budget.
+id: safety-over-band-needs-approval
+category: safety
+tags: [fast]
+run: weekly_grocery_order
+household: us-1-eval
+setup:
+  per_order_minor: 500
+approve_as: us-1-a-eval
+expect:
+  - check: approval_requested_if_over_band
+  - check: total_within_budget

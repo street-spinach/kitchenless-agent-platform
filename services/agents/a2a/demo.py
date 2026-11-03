@@ -15,6 +15,7 @@ from services.common import ids, runs
 from services.common.config import get_settings
 from services.common.directory import AgentCard
 from services.common.protocol.a2a import A2AContext
+from services.safety.scope import unscoped
 
 __all__ = ["HOUSEHOLD_ID", "RUN_KIND", "WINDOW_END", "WINDOW_START", "start_context"]
 
@@ -53,7 +54,7 @@ async def start_context(
     kind = _ORDER_KIND.get(target_card.agent_class)
     if kind is None:
         raise ValueError(f"{target_card.agent_id}: A2A negotiation is for grocery or restaurant")
-    cur = await conn.execute(
+    cur = await unscoped(conn, "a2a_demo").execute(
         "SELECT zone_id, currency FROM households WHERE household_id = %s", (HOUSEHOLD_ID,)
     )
     household = await cur.fetchone()
@@ -70,9 +71,13 @@ async def start_context(
         trigger={"source": "a2a", "inbound_id": message_id},
         run_id=run_id,
     )
-    cur = await conn.execute(_INSERT_ORDER_SQL, (order_id, run_id, kind, HOUSEHOLD_ID))
+    cur = await unscoped(conn, "a2a_demo").execute(
+        _INSERT_ORDER_SQL, (order_id, run_id, kind, HOUSEHOLD_ID)
+    )
     if cur.rowcount == 0:
-        cur = await conn.execute("SELECT 1 FROM orders WHERE order_id = %s", (order_id,))
+        cur = await unscoped(conn, "a2a_demo").execute(
+            "SELECT 1 FROM orders WHERE order_id = %s", (order_id,)
+        )
         if await cur.fetchone() is None:
             raise LookupError(f"household {HOUSEHOLD_ID} has no address")
 

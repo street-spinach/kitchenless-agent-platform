@@ -42,6 +42,8 @@ class FakeConn:
     order_currency: str | None = "USD"
     run_kind: str | None = "weekly"
     requester_role: str | None = "admin"
+    # `approval_rules.per_order_minor` (identity-authz §9): no band by default.
+    per_order_minor: int | None = None
     queries: list[str] = field(default_factory=list)
 
     async def execute(self, query: str, params: Sequence[Any]) -> _Cursor:
@@ -57,6 +59,8 @@ class FakeConn:
                 for a in self.approvals
             )
             return _Cursor((1,) if covered else None)
+        if "SELECT per_order_minor FROM approval_rules" in query:
+            return _Cursor((self.per_order_minor,))
         if "FROM approval_rules" in query:
             return _Cursor(None if self.approver is None else (self.approver,))
         if "JOIN household_members" in query:
@@ -275,8 +279,10 @@ def test_child_requester_needs_approval(remaining: list[Money]) -> None:
     with pytest.raises(limits.NeedsApproval) as e:
         _authorize(conn, Money(4_200, "USD"))
     assert e.value.reason == "needs_approval"
-    # It runs after the budget check and before currency and `a2a_demo`.
-    assert ["approvals" in q for q in conn.queries] == [False, True]
+    # It runs after the approval-needed check (its band query; the budget is faked) and
+    # before currency and `a2a_demo`.
+    assert ["approvals" in q for q in conn.queries] == [False, False, True]
+    assert "per_order_minor" in conn.queries[0]
     with pytest.raises(limits.NeedsApproval):
         _authorize(FakeConn(requester_role="child", run_kind="a2a_demo"), Money(4_200, "USD"))
 

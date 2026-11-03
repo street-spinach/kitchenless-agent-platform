@@ -19,6 +19,7 @@ from services.common.protocol import catalog as cat
 from services.common.protocol.a2a import AgentMessageRow
 from services.common.protocol.catalog import CATALOG, PartyRule
 from services.common.protocol.schemas import ErrorCode
+from services.safety.scope import unscoped
 
 CODES = frozenset(
     {
@@ -102,7 +103,7 @@ def check_static(type: str, from_agent: str, to_agent: str, body: Any) -> BaseMo
 
 
 async def _one(conn: AsyncConnection, query: str, params: tuple[Any, ...]) -> dict | None:
-    async with conn.cursor(row_factory=dict_row) as cur:
+    async with unscoped(conn, "protocol_check").cursor(row_factory=dict_row) as cur:
         await cur.execute(query, params)
         return await cur.fetchone()
 

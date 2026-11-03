@@ -105,6 +105,7 @@ from services.common.money import Money
 from services.common.money import format as money_format
 from services.common.protocol.schemas import RequestItem
 from services.common.run_context import RunContext
+from services.safety.scope import unscoped
 
 __all__ = [
     "EXPLAIN_TIMEOUT_SECONDS",
@@ -1766,9 +1767,9 @@ async def seller_label(conn: Any, run_id: UUID, agent_id: str) -> str:
     from services.common import directory, vendors
 
     card = await directory.card(conn, agent_id)
-    cur = await conn.execute(_ORG_NAME_SQL, (card.owner_ref,))
+    cur = await unscoped(conn, "household_graph").execute(_ORG_NAME_SQL, (card.owner_ref,))
     org = await cur.fetchone()
-    cur = await conn.execute(_RUN_MODES_SQL, (run_id,))
+    cur = await unscoped(conn, "household_graph").execute(_RUN_MODES_SQL, (run_id,))
     run = await cur.fetchone()
     run_modes = run[0] if run and isinstance(run[0], dict) else {}
     org_name = org[0] if org else card.owner_ref
@@ -1788,7 +1789,7 @@ def _build_default() -> HouseholdGraph:
 
     async def load_run(run_id: UUID) -> RunInfo:
         async with pool.connection() as conn:
-            cur = await conn.execute(_RUN_SQL, (run_id,))
+            cur = await unscoped(conn, "household_graph").execute(_RUN_SQL, (run_id,))
             row = await cur.fetchone()
         if row is None:
             raise LookupError(f"run {run_id} does not exist")
@@ -1797,12 +1798,14 @@ def _build_default() -> HouseholdGraph:
 
     async def load_members(household_id: str) -> Members:
         async with pool.connection() as conn:
-            cur = await conn.execute(_MEMBERS_SQL, (household_id,))
+            cur = await unscoped(conn, "household_graph").execute(_MEMBERS_SQL, (household_id,))
             return {agent_id: user_id for agent_id, user_id in await cur.fetchall()}
 
     async def load_whatsapp_members(household_id: str) -> Members:
         async with pool.connection() as conn:
-            cur = await conn.execute(_WHATSAPP_MEMBERS_SQL, (household_id,))
+            cur = await unscoped(conn, "household_graph").execute(
+                _WHATSAPP_MEMBERS_SQL, (household_id,)
+            )
             return {agent_id: user_id for agent_id, user_id in await cur.fetchall()}
 
     async def find_sellers(cls: str, region: str, zone_id: str, currency: str) -> list[str]:
