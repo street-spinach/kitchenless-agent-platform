@@ -59,6 +59,15 @@ jobs:
         env:
           MODE: mock
 
+  # The owner app's lint and tests (experience EX-I24).
+  owner-app:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container: node:22
+    steps:
+      - uses: actions/checkout@v4
+      - run: make app-lint app-test
+
   guards:
     runs-on: ubuntu-latest
     timeout-minutes: 15

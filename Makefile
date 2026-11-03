@@ -7,7 +7,7 @@ define allow_empty
 s=$$?; if [ $$s -eq 5 ]; then echo "No $(1) tests yet."; exit 0; fi; exit $$s
 endef
 
-.PHONY: up down lint test-unit test-contract fga-test smoke scenario eval-fast eval-full seed seed-local
+.PHONY: up down lint test-unit test-contract fga-test smoke scenario eval-fast eval-full seed seed-local app-deps app-lint app-test
 
 up:
 	$(COMPOSE) up -d --build --remove-orphans --wait
@@ -51,3 +51,15 @@ seed:
 
 seed-local:
 	uv run python -m services.seed $(SEED_ARGS)
+
+# The owner app (experience EX-I24). CI runs these in node:22 (the owner-app job).
+OWNER_APP := apps/owner
+
+app-deps:
+	cd $(OWNER_APP) && npm ci --no-audit --no-fund
+
+app-lint: app-deps
+	cd $(OWNER_APP) && npx eslint . && npx tsc --noEmit
+
+app-test: app-deps
+	cd $(OWNER_APP) && npx jest --ci

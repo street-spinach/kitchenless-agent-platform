@@ -1,0 +1,18 @@
+{
+  "expo": {
+    "name": "Kitchenless Owner",
+    "slug": "kitchenless-owner",
+    "scheme": "kitchenless-owner",
+    "version": "0.1.0",
+    "platforms": ["web"],
+    "plugins": ["expo-router"],
+    "experiments": {
+      "baseUrl": "/owner",
+      "typedRoutes": false
+    },
+    "web": {
+      "bundler": "metro",
+      "output": "single"
+    }
+  }
+}
