@@ -24,11 +24,14 @@
 *   `GET /panel/evals` is the eval results page (evals.md §14, EG7): a real-mode headline,
     a labelled stub section and a per-case table linking each attempt to
     `/panel/runs/live?run_id=`. With no history rows or tables it says so.
+*   `GET /panel/experience?household=` (experience §12, EX-I22): decisions asked per adult
+    this week and last, the guard metrics, pending held items and the configured Meta
+    templates, as JSON or (for an HTML client) a three-line page. No actions.
 """
 
 import html
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -36,10 +39,12 @@ import yaml
 from psycopg import AsyncConnection, errors
 from psycopg.rows import dict_row
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import Route
 
+from services.api.whatsapp import templates
 from services.common import ids, outbox
+from services.common.config import get_settings
 from services.common.protocol import schemas
 from services.common.protocol.a2a import AgentMessageRow, QuoteRow, to_a2a_message
 from services.common.protocol.catalog import render_summary
@@ -48,6 +53,7 @@ from services.mocks import control
 __all__ = [
     "DETAIL_TYPES",
     "EVAL_CASES_DIR",
+    "GUARD_METRICS",
     "HOUSEHOLD_LANE",
     "LIVE_LIMIT",
     "LIVE_LIMIT_MAX",
@@ -588,6 +594,114 @@ async def evals_page(request: Request) -> HTMLResponse:
     )
 
 
+# --- experience metric (experience §12, EX-I22) ---------------------------------------------
+
+# Field order of `guards`, as in the `experience_weekly_guards` view.
+GUARD_METRICS = (
+    "approvals_expired",
+    "orders_ended",
+    "rejects",
+    "safety_refusals",
+    "revokes",
+    "held_dropped",
+    "sends_not_delivered",
+)
+
+# The household and its current week, in its own time zone (the views' `week` expression).
+_EXPERIENCE_HOUSEHOLD_SQL = """
+SELECT household_id, date_trunc('week', now() AT TIME ZONE timezone)::date AS week
+FROM households WHERE household_id = %s
+"""
+
+# Every adult of the household with their asks for `week` (0 when the view has no row).
+_EXPERIENCE_ASKS_SQL = """
+SELECT u.user_id, u.display_name, coalesce(a.asks, 0) AS asks
+FROM household_members hm
+JOIN users u ON u.user_id = hm.user_id
+LEFT JOIN experience_weekly_asks a
+  ON a.household_id = hm.household_id AND a.user_id = hm.user_id AND a.week = %(week)s
+WHERE hm.household_id = %(household)s AND hm.role IN ('admin', 'member')
+ORDER BY u.display_name, u.user_id
+"""
+
+_EXPERIENCE_GUARDS_SQL = f"""
+SELECT {", ".join(GUARD_METRICS)}
+FROM experience_weekly_guards WHERE household_id = %(household)s AND week = %(week)s
+"""
+
+_EXPERIENCE_HELD_SQL = """
+SELECT count(*) AS n
+FROM held_messages x JOIN household_members hm ON hm.user_id = x.user_id
+WHERE hm.household_id = %s AND x.status = 'pending'
+"""
+
+
+async def _experience_week(cur: Any, household: str, week: Any) -> dict[str, Any]:
+    args = {"household": household, "week": week}
+    await cur.execute(_EXPERIENCE_ASKS_SQL, args)
+    per_user = [
+        {"user_id": str(r["user_id"]), "display_name": r["display_name"], "asks": int(r["asks"])}
+        for r in await cur.fetchall()
+    ]
+    await cur.execute(_EXPERIENCE_GUARDS_SQL, args)
+    row = await cur.fetchone()
+    guards = {m: int(row[m]) if row else 0 for m in GUARD_METRICS}
+    return {"week": week.isoformat(), "per_user": per_user, "guards": guards}
+
+
+def _experience_page(data: dict[str, Any]) -> HTMLResponse:
+    """The three lines (EX-I22): asks per adult this week and last; guard totals this week;
+    pending held items and configured templates."""
+    this, last = data["weeks"]
+    last_asks = {u["user_id"]: u["asks"] for u in last["per_user"]}
+    asks = "; ".join(
+        f"{_e(u['display_name'])} {u['asks']} this week, {last_asks.get(u['user_id'], 0)} last week"
+        for u in this["per_user"]
+    )
+    guards = ", ".join(f"{m} {this['guards'][m]}" for m in GUARD_METRICS)
+    templates = ", ".join(_e(k) for k in data["templates_configured"]) or "none"
+    lines = (
+        f"<p>Asks per adult: {asks or 'no adults'}</p>",
+        f"<p>Guards this week ({_e(this['week'])}): {guards}</p>",
+        f"<p>Held items pending: {data['held_pending']}. Templates configured: {templates}</p>",
+    )
+    return HTMLResponse(
+        '<!doctype html><html><head><meta charset="utf-8"><title>Experience</title></head>'
+        f"<body><h1>Experience</h1>{''.join(lines)}</body></html>"
+    )
+
+
+async def experience(request: Request) -> Response:
+    """`GET /panel/experience?household=` (experience §12, EX-I22). JSON, or the three-line
+    page when the client asks for HTML. An unknown household is 404."""
+    household = request.query_params.get("household")
+    if not household:
+        return _error(400, "household is required")
+    async with request.app.state.connect() as conn, conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(_EXPERIENCE_HOUSEHOLD_SQL, (household,))
+        found = await cur.fetchone()
+        if found is None:
+            return _error(404, "unknown household")
+        this_week = found["week"]
+        weeks = [
+            await _experience_week(cur, household, this_week),
+            await _experience_week(cur, household, this_week - timedelta(days=7)),
+        ]
+        await cur.execute(_EXPERIENCE_HELD_SQL, (household,))
+        held = await cur.fetchone()
+    settings = get_settings()
+    data = {
+        "weeks": weeks,
+        "held_pending": int(held["n"]) if held else 0,
+        "templates_configured": [
+            key for key in templates.TEMPLATES if templates.meta_name(key, settings)
+        ],
+    }
+    if "text/html" in request.headers.get("accept", ""):
+        return _experience_page(data)
+    return JSONResponse(data)
+
+
 routes = [
     Route("/panel/reset", reset, methods=["POST"]),
     Route("/panel/events", events, methods=["POST"]),
@@ -596,4 +710,5 @@ routes = [
     Route("/panel/runs/live", runs_live, methods=["GET"]),
     Route("/panel/messages/{message_id}", message_detail, methods=["GET"]),
     Route("/panel/evals", evals_page, methods=["GET"]),
+    Route("/panel/experience", experience, methods=["GET"]),
 ]
