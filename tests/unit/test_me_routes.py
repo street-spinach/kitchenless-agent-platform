@@ -182,6 +182,39 @@ def test_link_get_and_head_do_not_consume(world: World, kc: FakeKeycloak) -> Non
 
 
 @db
+def test_link_next_redirects(world: World, kc: FakeKeycloak) -> None:
+    """A `me` link with `next` opens that page after sign-in; an edited `next` outside the
+    closed set opens `/me/agents` (experience EX-A15, amended for #299)."""
+    for sent, expect in (
+        ("pantry", "/me/pantry"),
+        ("history", "/me/history"),
+        (None, "/me/agents"),
+        ("evil", "/me/agents"),
+    ):
+        url = aw.run(
+            world.pg,
+            lambda conn: links.issue(
+                conn, "me", world.admin.user_id, world.admin.user_id, HOUSEHOLD, []
+            ),
+        )
+        path = urlsplit(url).path
+        if sent is not None:
+            path = f"{path}?next={sent}"
+        client = _client(world.pg)
+        page = client.get(path)
+        form_next = "" if sent in (None, "evil") else f"?next={sent}"
+        assert f"action='{urlsplit(url).path}{form_next}'" in page.text
+        assert client.post(path, follow_redirects=False).status_code == 303
+        resp = client.get(
+            "/me/callback",
+            params={"code": "c0", "state": kc.magic[-1]["state"]},
+            follow_redirects=False,
+        )
+        assert (resp.status_code, resp.headers["location"]) == (302, expect), sent
+        assert me.SESSION_COOKIE in resp.cookies
+
+
+@db
 def test_consent_happy_path_two_agents(world: World, kc: FakeKeycloak) -> None:
     client = _client(world.pg)
     resp = _sign_in(world, kc, client, [HOUSEHOLD_AGENT, ADMIN_AGENT])

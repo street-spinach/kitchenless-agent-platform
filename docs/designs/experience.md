@@ -361,7 +361,7 @@ Each row is applied by this design's approval PR (X1) as one note
 | EX-A12 | pantry PT-OD7, Future Improvements | The correction path is `/me/pantry` and `record_pantry_check` (§9), reached from the weekly summary. The gate (PT-OD4) is unchanged. | EX-OD6 |
 | EX-A13 | adapters Non-Goals (:151) | The owner app shows connection status read-only; no OAuth. | EX-OD11 |
 | EX-A14 | evals §4–5 | New cases (§14) and setup keys `last_inbound_hours_ago`, `setup_incomplete`, `join_code`, each undone by the next reset. | XG2, XG3, XG7, XG8, XG11, XG12 |
-| EX-A15 | identity-authz §6, §12, I26 | The renew text becomes `consent_renewal` and the revoke notice becomes `consent_revoked` (§6 wording, a Renew button `me:renew`, Meta templates outside the window, holdable as `grant`), replacing "outside it, the panel shows re-consent needed". The approval prompt is neutral (amount and reply-by time, EX-A8): `test_approval_prompt_names_both_limits` becomes `test_approval_prompt_has_amount_and_reply_by`. `links.issue` gains `next: Literal["household", "pantry", "history", "agents"] \| None`, stored on the link and used by the callback's redirect (default `/me/agents` as today). | EX-OD4, §7 |
+| EX-A15 | identity-authz §6, §12, I26 | The renew text becomes `consent_renewal` and the revoke notice becomes `consent_revoked` (§6 wording, a Renew button `me:renew`, Meta templates outside the window, holdable as `grant`), replacing "outside it, the panel shows re-consent needed". The approval prompt is neutral (amount and reply-by time, EX-A8): `test_approval_prompt_names_both_limits` becomes `test_approval_prompt_has_amount_and_reply_by`. `links.issue` gains `next: Literal["household", "pantry", "history", "agents"] \| None`, stored on the link and used by the callback's redirect (default `/me/agents` as today); *amended 2026-11-04 (#299):* carried in the Link's URL, not stored (EX-I33). | EX-OD4, §7 |
 | EX-A16 | architecture §4 (`runs`) | `runs.retry_target` never returns a run with `household_id IS NULL` or `trigger.source` in (`code`, `join`, `tap`, `me`, `reminder`). | §3 |
 | EX-A17 | pantry §4, item for `get_pantry` | `enabled` is computed by one pure function `pantry.is_enabled(env: str) -> bool` in `services/common/pantry.py`; `get_pantry`, the reminder pass and `GET /me/pantry` all call it. The rule (PT-OD4) is unchanged. | §8, §10 |
 
@@ -1590,7 +1590,14 @@ X2, X3, X5, X6, X19.
 *   **Proposed Changes**: `links.issue(..., next: Literal["household", "pantry", "history",
     "agents"] | None = None)`, stored on the link row's existing detail; the callback
     redirects to `/me/<next>`, or `/me/agents` when unset (EX-A15).
-*   **Tests**: `tests/unit/test_links.py::test_next_redirect`, `::test_next_closed_set`.
+    *Amended 2026-11-04 (#299):* `consent_links` has no detail column, so `next` is not
+    stored on the row. `issue` adds it to the Link's URL as `?next=<page>`; the landing
+    page keeps it on its form, the POST puts it in the signed sign-in state, and the
+    callback redirects with `links.next_path`, which allows only the four pages and falls
+    back to `/me/agents` for anything else. No migration. Editing the query can only pick
+    another of the person's own four pages.
+*   **Tests**: `tests/unit/test_links.py::test_next_redirect`, `::test_next_closed_set`;
+    `tests/unit/test_me_routes.py::test_link_next_redirects`.
 
 #### EX-I34. `services/api/ingest.py` (Modify, commands and page taps)
 

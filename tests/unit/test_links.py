@@ -177,3 +177,46 @@ def test_link_used_audited(pg: str) -> None:
         admin.user_id,
     )
     assert used["detail"] == {"purpose": "consent", "agent_ids": [f"household:{HOUSEHOLD}"]}
+
+
+@db
+def test_next_redirect(pg: str) -> None:
+    """`next` rides on the link's URL (EX-A15, amended for #299) and names the page the
+    callback opens; with none, `/me/agents` as before."""
+    admin = _admin(pg)
+    for page in links.NEXT_PAGES:
+        url = aw.run(
+            pg,
+            lambda conn, page=page: links.issue(
+                conn, "me", admin.user_id, admin.user_id, HOUSEHOLD, [], next=page
+            ),
+        )
+        assert url.startswith("https://kitchenless.test/me/l/")
+        assert url.endswith(f"?next={page}")
+        assert links.next_path(page) == f"/me/{page}"
+    plain = _issue(pg, admin.user_id, admin.user_id, purpose="me", agent_ids=[])
+    assert "?" not in plain
+    assert links.next_path(None) == "/me/agents"
+    # The URL token is the stored hash's token, without the query.
+    token = _token(url).partition("?")[0]
+    assert _use(pg, token).purpose == "me"
+    issued = [r["detail"] for r in _audit(pg) if r["kind"] == "link_issued"]
+    assert [d.get("next") for d in issued] == [*links.NEXT_PAGES, None]
+
+
+@db
+def test_next_closed_set(pg: str) -> None:
+    admin = _admin(pg)
+    for bad in ("settings", "../agents", "https://evil.test", "", "Household"):
+        with pytest.raises(ValueError):
+            aw.run(
+                pg,
+                lambda conn, bad=bad: links.issue(
+                    conn, "me", admin.user_id, admin.user_id, HOUSEHOLD, [], next=bad
+                ),
+            )
+        # A value edited into a URL falls back to the default page, never elsewhere.
+        assert links.next_path(bad) == "/me/agents"
+    for odd in (None, 1, ["pantry"], "//evil.test", "pantry/../../x"):
+        assert links.next_path(odd) == "/me/agents"
+    assert aw.query(pg, "SELECT 1 FROM consent_links") == []
