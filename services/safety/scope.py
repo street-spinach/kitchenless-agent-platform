@@ -13,6 +13,15 @@
 
 Every read or write of a table in `HOUSEHOLD_TABLES` goes through one of the two
 (`test_scoped_tables_only_via_helper`).
+
+The owner app's queries (experience.md EX-I46) use the organisation counterpart:
+
+*   `OrgScope(org_id)`, built by the owner API after its `user owner org:<id>` check.
+*   `org_scoped(conn, scope)` returns a `Scoped` whose SQL must contain `%(org)s`, which the
+    helper binds. SQL that names `quotes` or `orders` must also contain `ORG_SELLER_FILTER`,
+    so it only sees rows whose seller agent belongs to the organisation.
+*   `ORG_TABLES` may be read in `routes/app.py` and `owner_views.py` only through
+    `org_scoped` (`test_org_tables_only_via_helper`).
 """
 
 import re
@@ -25,13 +34,18 @@ from psycopg import AsyncConnection, AsyncCursor
 __all__ = [
     "HOUSEHOLD_PARAM",
     "HOUSEHOLD_TABLES",
+    "ORG_PARAM",
+    "ORG_SELLER_FILTER",
+    "ORG_TABLES",
     "UNSCOPED_REASONS",
     "HouseholdScope",
     "NoHousehold",
+    "OrgScope",
     "Scoped",
     "Unscoped",
     "from_ctx",
     "from_session",
+    "org_scoped",
     "scoped",
     "unscoped",
 ]
@@ -66,6 +80,19 @@ _HOUSEHOLD_PLACEHOLDER = "%(household)s"
 # A positional placeholder: `%s` not escaped as `%%s`.
 _POSITIONAL = re.compile(r"(?<!%)%s")
 
+# EX-I46: the tables the owner app reads, always bound to one organisation.
+ORG_TABLES = ("quotes", "orders", "adapter_modes", "agent_traces")
+ORG_PARAM = "org"
+_ORG_PLACEHOLDER = "%(org)s"
+# Required in any SQL that names `quotes` or `orders` (whitespace-insensitive).
+ORG_SELLER_FILTER = (
+    "seller_agent_id IN (SELECT agent_id FROM agent_cards WHERE owner_ref = 'org:' || %(org)s)"
+)
+_ORG_SELLER_TABLES = re.compile(
+    r"\b(?:FROM|JOIN|INTO|UPDATE|TABLE)\s+(?:ONLY\s+)?(?:quotes|orders)\b", re.IGNORECASE
+)
+_SPACE = re.compile(r"\s+")
+
 # Every reason `unscoped` was called with in this process (for diagnostics only; the
 # static test reads the source).
 UNSCOPED_REASONS: set[str] = set()
@@ -79,6 +106,13 @@ class NoHousehold(ValueError):
 class HouseholdScope:
     household_id: str
     source: Literal["run", "session"]
+
+
+@dataclass(frozen=True)
+class OrgScope:
+    """One organisation, after the caller passed `user owner org:<org_id>`."""
+
+    org_id: str
 
 
 class _RunContext(Protocol):
@@ -105,7 +139,9 @@ def from_session(session: _Session) -> HouseholdScope:
     return HouseholdScope(session.household_id, "session")
 
 
-def _bind(scope: HouseholdScope, sql: str, params: Mapping[str, Any]) -> dict[str, Any]:
+def _bind(scope: HouseholdScope | OrgScope, sql: str, params: Mapping[str, Any]) -> dict[str, Any]:
+    if isinstance(scope, OrgScope):
+        return _bind_org(scope, sql, params)
     if _HOUSEHOLD_PLACEHOLDER not in sql:
         raise ValueError("scoped SQL must contain %(household)s")
     if _POSITIONAL.search(sql):
@@ -115,10 +151,25 @@ def _bind(scope: HouseholdScope, sql: str, params: Mapping[str, Any]) -> dict[st
     return {**params, HOUSEHOLD_PARAM: scope.household_id}
 
 
-class Scoped:
-    """Queries bound to one household. Async connections only (agent calls and pages)."""
+def _bind_org(scope: OrgScope, sql: str, params: Mapping[str, Any]) -> dict[str, Any]:
+    if _ORG_PLACEHOLDER not in sql:
+        raise ValueError("org-scoped SQL must contain %(org)s")
+    if _POSITIONAL.search(sql):
+        raise ValueError("org-scoped SQL takes named parameters only")
+    if ORG_PARAM in params or HOUSEHOLD_PARAM in params:
+        raise ValueError("the organisation is bound by the scope, never passed")
+    if _ORG_SELLER_TABLES.search(sql) and _SPACE.sub(" ", ORG_SELLER_FILTER) not in _SPACE.sub(
+        " ", sql
+    ):
+        raise ValueError("SQL on quotes or orders must restrict to the org's seller agents")
+    return {**params, ORG_PARAM: scope.org_id}
 
-    def __init__(self, conn: AsyncConnection, scope: HouseholdScope) -> None:
+
+class Scoped:
+    """Queries bound to one household or one organisation. Async connections only (agent
+    calls, pages and the owner API)."""
+
+    def __init__(self, conn: AsyncConnection, scope: HouseholdScope | OrgScope) -> None:
         self._conn = conn
         self.scope = scope
 
@@ -133,6 +184,12 @@ class Scoped:
 def scoped(conn: AsyncConnection, scope: HouseholdScope) -> Scoped:
     if not isinstance(scope, HouseholdScope):
         raise TypeError("scoped() needs a HouseholdScope")
+    return Scoped(conn, scope)
+
+
+def org_scoped(conn: AsyncConnection, scope: OrgScope) -> Scoped:
+    if not isinstance(scope, OrgScope) or not scope.org_id:
+        raise TypeError("org_scoped() needs an OrgScope with an org id")
     return Scoped(conn, scope)
 
 
