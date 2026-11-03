@@ -8,6 +8,10 @@ unattended.
    commit message. Never weaken, skip or delete tests or eval cases, and never edit
    evals/thresholds.yaml.
 4. Re-run the issue's Verify commands and `make lint test-unit` locally until they pass.
+   Exception: where a Verify step is `make eval-fast`, run `make eval-safety` instead, plus
+   each eval case this issue adds or changes, once:
+   `uv run python -m evals.run --case <id> --repeats 1`. Say so in the PR body. The full
+   suite runs nightly (architecture item 63).
 5. Commit and push to the same branch. Do not open a new PR. Do not merge.
 
 If the fix needs a small decision the design leaves open, decide it the way
