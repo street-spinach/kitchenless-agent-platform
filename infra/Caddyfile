@@ -34,9 +34,17 @@
 		}
 		reverse_proxy api:8000
 	}
-	# Keycloak, served under /auth (KC_HTTP_RELATIVE_PATH in docker-compose.yml).
-	handle /auth* {
+	# Keycloak, served under /auth (identity-authz I17): only the kitchenless realm and the
+	# static resources its pages load. The admin console, the master realm and every other
+	# /auth path are 404 (tests/smoke test_keycloak_admin_not_public).
+	handle /auth/realms/kitchenless/* {
 		reverse_proxy keycloak:8080
+	}
+	handle /auth/resources/* {
+		reverse_proxy keycloak:8080
+	}
+	handle /auth/* {
+		respond 404
 	}
 	# Anything else is not routed. In particular /internal/*, /runs*, /mcp* and the agents
 	# service's /a2a endpoint stay private (tests/smoke test_internal_routes_not_public).

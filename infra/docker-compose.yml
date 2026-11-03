@@ -104,22 +104,38 @@ services:
       retries: 20
 
   keycloak:
-    image: quay.io/keycloak/keycloak:26.0
+    # identity-authz I15/I16b: the custom image (magic-link, realm file), started optimized.
+    # The VM sets KEYCLOAK_IMAGE to the GHCR tag CI built (I42, §15); locally and in CI,
+    # Compose builds it. Its tag is separate from APP_TAG, so an app rollback never changes it.
+    build:
+      context: ..
+      dockerfile: infra/keycloak/Dockerfile
+    image: ${KEYCLOAK_IMAGE:-kitchenless-keycloak:local}
     restart: unless-stopped
-    command: ["start-dev"]
-    # architecture §11. The heap and the 26.8 image are identity-authz work (#122).
+    command: ["start", "--optimized", "--import-realm"]
+    # architecture §11.
     mem_limit: 640m
     environment:
+      KC_HOSTNAME: https://${DOMAIN:-localhost}/auth
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+      KC_HTTP_ENABLED: "true"
+      KC_PROXY_HEADERS: xforwarded
       KC_DB: postgres
       KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
       KC_DB_USERNAME: ${POSTGRES_USER}
       KC_DB_PASSWORD: ${POSTGRES_PASSWORD}
+      KC_DB_POOL_MAX_SIZE: "10"
       KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN}
       KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
-      KC_HTTP_RELATIVE_PATH: /auth
-      KC_PROXY_HEADERS: xforwarded
-      KC_HEALTH_ENABLED: "true"
-      JAVA_OPTS_KC_HEAP: "-Xms256m -Xmx512m"
+      JAVA_OPTS_KC_HEAP: "-Xms256m -Xmx384m"
+      # Read by the realm import (services/identity/realm/kitchenless.json).
+      KC_ONBOARDING_SECRET: ${KC_ONBOARDING_SECRET:-}
+      OWNER_DEMO_PASSWORD: ${OWNER_DEMO_PASSWORD:-}
+      AGENT_SIGNING_CERT: ${AGENT_SIGNING_CERT:-}
+      DOMAIN: ${DOMAIN:-localhost}
+      SEED_US1_PHONE_1: ${SEED_US1_PHONE_1:-}
+      SEED_US1_PHONE_2: ${SEED_US1_PHONE_2:-}
+      SEED_US1_PHONE_3: ${SEED_US1_PHONE_3:-}
     depends_on:
       postgres: { condition: service_healthy }
     ports:
@@ -243,6 +259,8 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
       migrate: { condition: service_completed_successfully }
+      # Mock mode never calls Keycloak, so started is enough (identity-authz I16b).
+      keycloak: { condition: service_started }
     ports:
       - "127.0.0.1:8000:8000"
     healthcheck: *app-health
@@ -291,6 +309,8 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
       migrate: { condition: service_completed_successfully }
+      # Mock mode never calls Keycloak, so started is enough (identity-authz I16b).
+      keycloak: { condition: service_started }
     ports:
       - "127.0.0.1:8003:8003"
     healthcheck: *app-health
