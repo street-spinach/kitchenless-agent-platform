@@ -304,6 +304,54 @@ def test_reset_eval_after_shortfall_succeeds(world: dict[str, Any]) -> None:
     assert _reset(pg, "eval")["runs"] == 0
 
 
+def _add_experience_rows(conn: psycopg.Connection, run: dict[str, Any], household: str) -> None:
+    """A WhatsApp send, a held message and a meal reaction for the run (migration 0015)."""
+    [user_id] = conn.execute(
+        "SELECT user_id FROM household_members WHERE household_id = %s LIMIT 1", (household,)
+    ).fetchone() or (None,)
+    sent, held = uuid.uuid4(), uuid.uuid4()
+    for message_id in (sent, held):
+        conn.execute(
+            "INSERT INTO agent_messages (message_id, run_id, from_agent, to_agent, to_host, type,"
+            " body) VALUES (%s, %s, 'system:api', %s, 'agents', 'test', '{}')",
+            (message_id, run["run_id"], GROCERY),
+        )
+    conn.execute(
+        "INSERT INTO whatsapp_sends (message_id, user_id, outcome) VALUES (%s, %s, 'sent')",
+        (sent, user_id),
+    )
+    conn.execute(
+        "INSERT INTO held_messages (message_id, user_id, body, ref_kind, ref_id)"
+        " VALUES (%s, %s, '{}', 'order', 'x')",
+        (held, user_id),
+    )
+    conn.execute(
+        "INSERT INTO meal_reactions (order_id, user_id, value) VALUES (%s, %s, 1)",
+        (run["order_id"], user_id),
+    )
+
+
+@pytest.mark.db
+def test_reset_eval_after_whatsapp_sends_succeeds(world: dict[str, Any]) -> None:
+    # A weekly-order run leaves whatsapp_sends rows that reference its agent_messages; the
+    # reset failed with a foreign-key violation, so `make scenario` could not reset first.
+    pg = world["pg"]
+    with psycopg.connect(pg) as conn:
+        _add_experience_rows(conn, world["eval"], EVAL)
+        _add_experience_rows(conn, world["live"], LIVE)
+
+    deleted = _reset(pg, "eval")
+
+    assert (deleted["whatsapp_sends"], deleted["held_messages"], deleted["meal_reactions"]) == (
+        1,
+        1,
+        1,
+    )
+    with psycopg.connect(pg) as conn:
+        for table in ("whatsapp_sends", "held_messages", "meal_reactions"):
+            assert _count(conn, f"SELECT count(*) FROM {table}") == 1, table  # noqa: S608
+
+
 def _inject(pg: str, **kwargs: Any) -> int:
     return _run(pg, lambda conn: control.inject_event(conn, **kwargs))
 

@@ -65,6 +65,22 @@ WHERE h.env = 'eval'
 
 # Children first (§7, amended 2026-11-02). %(runs)s is the eval run ids.
 _RESET_SQL: tuple[tuple[str, str], ...] = (
+    # Children of agent_messages and orders from migration 0015 (experience).
+    (
+        "whatsapp_sends",
+        "DELETE FROM whatsapp_sends WHERE message_id IN"
+        " (SELECT message_id FROM agent_messages WHERE run_id = ANY(%(runs)s))",
+    ),
+    (
+        "held_messages",
+        "DELETE FROM held_messages WHERE message_id IN"
+        " (SELECT message_id FROM agent_messages WHERE run_id = ANY(%(runs)s))",
+    ),
+    (
+        "meal_reactions",
+        "DELETE FROM meal_reactions WHERE order_id IN"
+        " (SELECT order_id FROM orders WHERE run_id = ANY(%(runs)s))",
+    ),
     ("agent_messages", "DELETE FROM agent_messages WHERE run_id = ANY(%(runs)s)"),
     ("idempotency_keys", "DELETE FROM idempotency_keys WHERE run_id = ANY(%(runs)s)"),
     ("timers", "DELETE FROM timers WHERE run_id = ANY(%(runs)s)"),
