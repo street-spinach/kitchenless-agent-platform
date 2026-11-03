@@ -2,8 +2,8 @@
 
 All ids are deterministic: they are derived from values passed in and never from random or
 time-based parts, so a replayed step produces the same ids. The exceptions are the only
-random ids: `new_run_id`, `new_eval_run_id`, `new_join_code`, `new_grant_id` and
-`new_token_id` (see their docstrings).
+random ids: `new_run_id`, `new_eval_run_id`, `new_join_code`, `new_grant_id`,
+`new_household_id` and `new_token_id` (see their docstrings).
 """
 
 import base64
@@ -321,6 +321,56 @@ def new_grant_id() -> UUID:
     later consent is a new grant that replaces it, never a replay of the same one.
     """
     return uuid4()
+
+
+# Onboarding (identity-authz §3, §5 and I23). Changing this value changes every derived id;
+# never edit it.
+NS_ONBOARD = UUID("0f6b1c1e-5d4a-4b8e-9a37-6c2e8d41f7b5")
+_BASE32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"  # RFC 4648
+
+
+def person_user_id(phone_e164: str) -> UUID:
+    """`users.user_id` of a person registered by `onboarding.create_person`, from their
+    phone, so a retried onboarding finds the same person."""
+    return uuid5(NS_ONBOARD, f"person|{_require('phone_e164', phone_e164)}")
+
+
+def child_user_id(household_id: str, n: int) -> UUID:
+    """`users.user_id` of the `n`-th person onboarded into `household_id` when that person
+    is a child (`onboarding.create_child`); a child has no phone to derive it from."""
+    return uuid5(NS_ONBOARD, f"child|{_require('household_id', household_id)}|{_int_id('n', n)}")
+
+
+def onboarded_consumer_agent_id(household_id: str, n: int) -> str:
+    """The consumer agent of the `n`-th person onboarded into a household:
+    `consumer:<household_id>.<n>` (identity-authz §5)."""
+    if _int_id("n", n) < 1:
+        raise ValueError(f"n must be >= 1, got {n!r}")
+    return f"consumer:{_require('household_id', household_id)}.{n}"
+
+
+def child_username(household_id: str, n: int) -> str:
+    """The Keycloak username of an onboarded child: `child.<household_id>.<n>` (§3; Keycloak
+    refuses `:` in usernames)."""
+    if _int_id("n", n) < 1:
+        raise ValueError(f"n must be >= 1, got {n!r}")
+    return f"child.{_require('household_id', household_id)}.{n}"
+
+
+def household_address_ref(household_id: str) -> UUID:
+    """`address_ref` of the one address of a household created by onboarding."""
+    return uuid5(NS_ONBOARD, f"address|{_require('household_id', household_id)}")
+
+
+def new_household_id() -> str:
+    """A fresh `household_id` for a new household's first admin: `hh-<8 base32>`
+    (identity-authz §5).
+
+    One of the random ids in this module. `create_person` looks up the admin's phone first
+    and reuses the household it already joined, so a retried onboarding never reaches it
+    twice for one person.
+    """
+    return "hh-" + "".join(secrets.choice(_BASE32) for _ in range(8)).lower()
 
 
 def new_token_id() -> str:

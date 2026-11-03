@@ -13,6 +13,7 @@ from psycopg.types.json import Jsonb
 
 from services.common import ids
 from services.common.config import Settings
+from services.identity import fga
 from services.mocks import control
 from services.seed import MOCK_STOCK_QTY, mock_stock_rows, seeded_limits
 from services.seed import __main__ as seed_mod
@@ -54,6 +55,21 @@ def _settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
     settings = Settings.from_env(env)
     monkeypatch.setattr(control, "get_settings", lambda: settings)
     return settings
+
+
+@pytest.fixture(autouse=True)
+def reconciled(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Records the reset's post-commit `fga.reconcile()` (identity-authz I27), which needs
+    OpenFGA, and the tuples onboarding writes."""
+    calls: list[str] = []
+
+    async def reconcile() -> int:
+        calls.append("reconcile")
+        return 0
+
+    monkeypatch.setattr(control, "reconcile_fga", reconcile)
+    monkeypatch.setattr(fga, "ensure", lambda tuples: calls.extend(map(str, tuples)))
+    return calls
 
 
 def _run[T](pg: str, fn: Callable[[psycopg.AsyncConnection], Awaitable[T]]) -> T:
@@ -850,3 +866,142 @@ def test_reset_restores_window(world: dict[str, Any]) -> None:
     # Live phones are never touched by the eval reset.
     assert live_rows[LIVE_PHONE] == old
     assert all(at is None for phone, at in live_rows.items() if phone != LIVE_PHONE)
+
+
+# --- the seed's eval part and `add_child` (identity-authz I27, I35; build step 9) ----------
+
+_GRANT_SQL = "SELECT status, expires_at > now() + interval '29 days' FROM agent_grants"
+
+
+@pytest.mark.db
+def test_reset_renews_eval_grants_then_reconciles(
+    world: dict[str, Any], reconciled: list[str]
+) -> None:
+    pg = world["pg"]
+    eval_household = f"household:{EVAL}"
+    with psycopg.connect(pg) as conn:
+        conn.execute(
+            "UPDATE agent_grants SET status = 'revoked', revoke_reason = 'user'"
+            " WHERE agent_id IN (%s, 'consumer:us-1-b-eval')",
+            (eval_household,),
+        )
+        conn.execute(
+            "UPDATE agent_grants SET expires_at = now() - interval '1 day'"
+            " WHERE agent_id = 'consumer:us-1-a-eval'"
+        )
+        conn.execute(
+            "UPDATE agent_grants SET status = 'revoked', revoke_reason = 'user'"
+            " WHERE agent_id = 'consumer:us-2-b'"
+        )
+
+    _reset(pg, "eval")
+
+    with psycopg.connect(pg) as conn:
+        for agent in (eval_household, "consumer:us-1-b-eval", "consumer:us-1-a-eval"):
+            assert conn.execute(_GRANT_SQL + " WHERE agent_id = %s", (agent,)).fetchall() == [
+                ("active", True)
+            ], agent
+        # A live household's grant is never touched by the eval reset.
+        [(status, _)] = conn.execute(_GRANT_SQL + " WHERE agent_id = 'consumer:us-2-b'").fetchall()
+        assert status == "revoked"
+    assert reconciled == ["reconcile"]
+
+
+def _children(conn: psycopg.Connection) -> list[tuple[Any, ...]]:
+    return conn.execute(
+        "SELECT u.user_id, u.display_name, u.keycloak_sub FROM household_members m"
+        " JOIN users u ON u.user_id = m.user_id"
+        " WHERE m.household_id = %s AND m.role = 'child' AND u.display_name = 'Sam'",
+        (EVAL,),
+    ).fetchall()
+
+
+@pytest.mark.db
+def test_add_child_setup_then_undone(world: dict[str, Any], reconciled: list[str]) -> None:
+    pg = world["pg"]
+    admin = ids.seed_user_id("us-1-a-eval")
+    _reset_setup(pg, {"add_child": {"display_name": "Sam", "consented": True}})
+
+    child = ids.child_user_id(EVAL, 1)
+    agent = ids.onboarded_consumer_agent_id(EVAL, 1)
+    with psycopg.connect(pg) as conn:
+        # An eval household gets no Keycloak user: the sub is the user id (I-D24).
+        assert _children(conn) == [(child, "Sam", str(child))]
+        assert conn.execute(
+            "SELECT owner_ref FROM agent_cards WHERE agent_id = %s", (agent,)
+        ).fetchall() == [(f"user:{child}",)]
+        assert conn.execute(
+            "SELECT client_id, kc_client_uuid, kind FROM agent_clients WHERE agent_id = %s",
+            (agent,),
+        ).fetchall() == [(ids.keycloak_client_id(agent), None, "people")]
+        assert conn.execute(
+            "SELECT user_id, consented_by, status, scopes FROM agent_grants WHERE agent_id = %s",
+            (agent,),
+        ).fetchall() == [
+            (
+                child,
+                admin,
+                "active",
+                ["constraints:read", "constraints:write", "pantry:read", "meals:plan"],
+            )
+        ]
+        assert (
+            _count(conn, "SELECT count(*) FROM channel_identities WHERE user_id = %s", child) == 0
+        )
+        kinds = conn.execute(
+            "SELECT kind, actor_user_id FROM audit_events"
+            " WHERE subject_user_id = %s OR agent_id = %s",
+            (child, agent),
+        ).fetchall()
+    assert ("user_onboarded", admin) in kinds and ("agent_client_created", None) in kinds
+    # The child's structural tuples: a child of the household, and the agent acts for them.
+    assert str((f"user:{child}", "child", f"household:{EVAL}")) in reconciled
+    assert str((fga.agent_object(agent), "acts_for", f"user:{child}")) in reconciled
+
+    # Applying the same setup again finds the same child.
+    _reset_setup(pg, {"add_child": {"display_name": "Sam", "consented": True}})
+    with psycopg.connect(pg) as conn:
+        assert [row[0] for row in _children(conn)] == [child]
+
+    # The next reset without the key removes the child and everything it owns.
+    _reset(pg, "eval")
+    with psycopg.connect(pg) as conn:
+        assert _children(conn) == []
+        for sql in (
+            "SELECT count(*) FROM users WHERE user_id = %s",
+            "SELECT count(*) FROM agent_grants WHERE user_id = %s",
+        ):
+            assert _count(conn, sql, child) == 0
+        for table in ("agent_cards", "agent_clients"):
+            assert _count(conn, f"SELECT count(*) FROM {table} WHERE agent_id = %s", agent) == 0
+        # The seeded child is kept.
+        seeded_child = ids.seed_user_id("us-1-c-eval")
+        assert _count(conn, "SELECT count(*) FROM users WHERE user_id = %s", seeded_child) == 1
+
+
+@pytest.mark.db
+def test_add_child_without_consent_has_no_grant(world: dict[str, Any]) -> None:
+    pg = world["pg"]
+    _reset_setup(pg, {"add_child": {"display_name": "Sam", "consented": False}})
+    agent = ids.onboarded_consumer_agent_id(EVAL, 1)
+    with psycopg.connect(pg) as conn:
+        assert len(_children(conn)) == 1
+        assert _count(conn, "SELECT count(*) FROM agent_grants WHERE agent_id = %s", agent) == 0
+
+
+@pytest.mark.db
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"display_name": "Sam"},
+        {"display_name": "", "consented": True},
+        {"display_name": "Sam", "consented": "yes"},
+        {"display_name": "Sam", "consented": True, "phone": "+15550100109"},
+        ["Sam"],
+    ],
+)
+def test_add_child_bad_value_refused(world: dict[str, Any], value: Any) -> None:
+    with pytest.raises(control.ControlRefused):
+        _reset_setup(world["pg"], {"add_child": value})
+    with psycopg.connect(world["pg"]) as conn:
+        assert _children(conn) == []

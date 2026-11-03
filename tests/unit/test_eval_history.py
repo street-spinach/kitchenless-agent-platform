@@ -16,6 +16,17 @@ pytestmark = pytest.mark.db
 US1_PHONES = ["+15550100201", "+15550100202", "+15550100203"]
 
 
+@pytest.fixture(autouse=True)
+def _no_openfga(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The reset's post-commit `fga.reconcile()` (identity-authz I27) needs OpenFGA;
+    `test_panel_reset.py` tests that it is called."""
+
+    async def reconcile() -> int:
+        return 0
+
+    monkeypatch.setattr(control, "reconcile_fga", reconcile)
+
+
 def _write_history(conn: psycopg.Connection, agent_run_ids: list[uuid.UUID]) -> uuid.UUID:
     eval_run_id = ids.new_eval_run_id()
     conn.execute(

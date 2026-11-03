@@ -7,8 +7,10 @@
     the phone's `channel_identities.last_inbound_at` to the row's `received_at`, before any
     routing, for every content kind (experience §5, EX-I10).
 2.  Look up the phone in `channel_identities`, then the member's household and consumer
-    agent. An unknown phone gets no run. Its "not registered" reply belongs to
-    identity-authz I26 (#124).
+    agent. An unknown phone gets no run: once the inbound row is committed, it gets the
+    `unknown_number` reply, "This number isn't registered yet." (identity-authz §5, I26),
+    sent straight through the Graph API, since a message without a run has no outbox row.
+    The sim route refuses unknown phones, so only the real webhook gets here.
 3.  Buttons.
     *   A payload starting `sf:` (agent-protocol §10 and P29, #70) is parsed as
         `sf:<shortfall_id>:<line>:<sku | drop>` and calls the household tool
@@ -34,6 +36,15 @@
 6.  Anything else: `runs.start(...)` and send `user_message` to the member's consumer agent.
 
 The member's text is kept in `runs.trigger.text`, where the consumer agent reads it.
+
+Identity (identity-authz §11, §12, I26): when `runs.start` refuses a household run because
+the household agent's grant is missing, revoked or expired, no household run starts.
+Instead a `chat` run with no household (exempt from the grant check, experience §3) carries
+the renew text `consent_renewal` with a fresh consent link for the household agent, and ends
+`completed` at once. It goes to the person who wrote if they are an admin, otherwise to the
+household's approver, and only while that person is inside WhatsApp's 24-hour window; the
+link is issued by the sender at send time (`WhatsAppOut.link`), so its token is never
+stored in a message.
 """
 
 import logging
@@ -46,9 +57,12 @@ from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from services.api.whatsapp.sender import WINDOW, GraphSender
 from services.common import ids, mcp_client, outbox, runs
+from services.common.config import get_settings
 from services.common.mcp_client import ToolRefused, call_tool_as
 from services.common.run_context import RunContext
+from services.identity.errors import GrantError
 from services.safety.scope import unscoped
 
 __all__ = [
@@ -60,10 +74,13 @@ __all__ = [
     "SET_TAKE_TURNS",
     "SHORTFALL_PREFIX",
     "TAKE_TURNS_SAVED",
+    "CONSENT_RENEWAL",
+    "UNKNOWN_NUMBER",
     "WHATSAPP",
     "Content",
     "ingest",
     "parse_shortfall_button",
+    "send_unknown_number",
 ]
 
 log = logging.getLogger(__name__)
@@ -91,6 +108,31 @@ ALREADY_DECIDED = "already_decided"
 SET_TAKE_TURNS = "set_take_turns"
 TAKE_TURNS_SAVED = "take_turns_saved"
 TAKE_TURNS_NOT_APPROVER = "take_turns_not_approver"
+# Identity-authz §5, §12 and I26.
+UNKNOWN_NUMBER = "unknown_number"
+CONSENT_RENEWAL = "consent_renewal"
+# A run that only carries a code-built reply (experience §3): no household, so it is exempt
+# from the grant check, and `runs.retry_target` skips it.
+CODE_SOURCE = "code"
+
+SendUnknownNumber = Callable[[str], Awaitable[None]]
+
+
+async def send_unknown_number(phone: str) -> None:
+    """The `unknown_number` reply, sent straight through the Graph API (no run, so no outbox
+    row). The person has just written, so they are inside the window. Best effort: a failed
+    send is logged and not retried, and nothing else happens (fails closed)."""
+    body = {"template": UNKNOWN_NUMBER, "params": {}, "buttons": []}
+    try:
+        settings = get_settings()
+        sender = GraphSender(
+            settings.whatsapp_token or "",
+            settings.whatsapp_phone_number_id or "",
+            delays=(0.0, 0.0),
+        )
+        await sender(phone, body)
+    except Exception as exc:  # best effort: the inbound row is already committed
+        log.warning("unknown_number reply not sent: %s", type(exc).__name__)
 
 
 @dataclass(frozen=True)
@@ -206,6 +248,13 @@ async def _send_user_message(
     )
 
 
+class _Unregistered:
+    """`_ingest`'s result for a new message from a phone that is not registered."""
+
+
+_UNREGISTERED = _Unregistered()
+
+
 async def ingest(
     conn: AsyncConnection,
     channel: str,
@@ -217,14 +266,36 @@ async def ingest(
     overrides: dict[str, Any] | None = None,
     run_id: uuid.UUID | None = None,
     call_tool: CallTool = mcp_client.call_tool_as,
+    reply_unknown: SendUnknownNumber = send_unknown_number,
 ) -> uuid.UUID | None:
     """Handle one inbound message in one transaction; return the run it started, if any
     (for an approval button, the approval's run).
 
     `kind`, `overrides` and `run_id` are passed by `POST /runs`; a WhatsApp message starts a
     `chat` run and the consumer agent classifies it. `call_tool` reaches `/mcp/household`
-    for an approval button.
+    for an approval button. `reply_unknown` sends the `unknown_number` reply to a phone
+    that is not registered, after the inbound row is committed (a duplicate gets none).
     """
+    result = await _ingest(
+        conn, channel, external_id, phone, content, kind, overrides, run_id, call_tool
+    )
+    if isinstance(result, _Unregistered):
+        await reply_unknown(phone)
+        return None
+    return result
+
+
+async def _ingest(
+    conn: AsyncConnection,
+    channel: str,
+    external_id: str,
+    phone: str,
+    content: Content,
+    kind: str,
+    overrides: dict[str, Any] | None,
+    run_id: uuid.UUID | None,
+    call_tool: CallTool,
+) -> uuid.UUID | _Unregistered | None:
     async with conn.transaction():
         cur = await unscoped(conn, "ingest").execute(_INSERT_INBOUND_SQL, (channel, external_id))
         inserted = await cur.fetchone()
@@ -238,7 +309,7 @@ async def ingest(
         member = await _member(conn, phone)
         if member is None:
             log.info("inbound %s message from an unregistered phone", channel)
-            return None
+            return _UNREGISTERED
 
         inbound = ids.inbound_id(channel, external_id)
         trigger: dict[str, Any] = {
@@ -269,10 +340,12 @@ async def ingest(
                 return approval_run
             # A new `chat` run, since the order's run has ended. It is committed below,
             # before the tool call, so that the guard's step 0 sees it running.
-            started = await runs.start(
-                conn, household_id=member.household_id, kind=CHAT, trigger=trigger
+            started, ok = await _start(
+                conn, member, inbound, household_id=member.household_id, kind=CHAT, trigger=trigger
             )
             await unscoped(conn, "ingest").execute(_SET_RUN_SQL, (started, channel, external_id))
+            if not ok:
+                return started
         else:
             if overrides:
                 trigger["overrides"] = overrides
@@ -341,6 +414,100 @@ async def _take_turns_tap(
         await runs.finish(conn, run_id, API_AGENT, "completed", SET_TAKE_TURNS)
 
 
+async def _start(
+    conn: AsyncConnection,
+    member: _Member,
+    inbound: uuid.UUID,
+    *,
+    household_id: str | None,
+    kind: str,
+    trigger: dict[str, Any],
+    run_id: uuid.UUID | None = None,
+) -> tuple[uuid.UUID, bool]:
+    """`(run, True)` for the run `runs.start` started. If it refused because the household
+    agent's grant is missing, revoked or expired, `(run, False)` for the run that carried
+    the renew reply instead (identity-authz §11, I26). `runs.start`'s own savepoint undid
+    the refused start."""
+    try:
+        started = await runs.start(
+            conn, household_id=household_id, kind=kind, trigger=trigger, run_id=run_id
+        )
+    except GrantError as refused:
+        log.info("household run refused: %s", refused.reason)
+        return await _renew(conn, member, inbound, refused.reason, run_id), False
+    return started, True
+
+
+# Who is asked to renew the household agent's grant: the person who wrote if they are an
+# admin, otherwise the household's approver (an admin).
+_RENEW_TO_SQL = """
+SELECT CASE WHEN m.role = 'admin' THEN m.user_id ELSE r.approver_user_id END
+FROM household_members m
+LEFT JOIN approval_rules r ON r.household_id = m.household_id
+WHERE m.household_id = %s AND m.user_id = %s
+"""
+
+# Inside the window (experience §5): `last_inbound_at` later than now minus 23 h 45 min, on
+# the phone the sender uses. No phone, or NULL, is outside (fails closed).
+_INSIDE_SQL = """
+SELECT coalesce(last_inbound_at > now() - %s::interval, false) FROM channel_identities
+WHERE user_id = %s ORDER BY created_at, phone_e164 LIMIT 1
+"""
+
+
+async def _renew(
+    conn: AsyncConnection,
+    member: _Member,
+    inbound: uuid.UUID,
+    reason: str,
+    run_id: uuid.UUID | None,
+) -> uuid.UUID:
+    """The renew text (identity-authz §12) with a fresh consent link for the household
+    agent, in a `chat` run with no household that ends `completed` with the grant `reason`.
+    Sent only inside the recipient's WhatsApp window; outside it nothing is sent."""
+    started = await runs.start(
+        conn,
+        household_id=None,
+        kind=CHAT,
+        trigger={"source": CODE_SOURCE, "user_id": member.user_id, "inbound_id": inbound},
+        run_id=run_id,
+    )
+    q = unscoped(conn, "ingest")
+    cur = await q.execute(_RENEW_TO_SQL, (member.household_id, member.user_id))
+    row = await cur.fetchone()
+    to_user = row[0] if row is not None else None
+    inside = False
+    if to_user is not None:
+        cur = await q.execute(_INSIDE_SQL, (WINDOW, to_user))
+        inside = bool((await cur.fetchone() or (False,))[0])
+    if inside:
+        link = {
+            "household_id": member.household_id,
+            "agent_ids": [f"household:{member.household_id}"],
+        }
+        await outbox.send(
+            conn,
+            message_id=ids.message_id(inbound, 0),
+            run_id=started,
+            conversation_id=None,
+            causation_id=None,
+            from_agent=API_AGENT,
+            to_agent=WHATSAPP,
+            type="whatsapp_out",
+            body={
+                "user_id": str(to_user),
+                "template": CONSENT_RENEWAL,
+                "params": {},
+                "buttons": [],
+                "link": link,
+            },
+        )
+    else:
+        log.info("renew text not sent: the recipient is outside the WhatsApp window")
+    await runs.finish(conn, started, API_AGENT, "completed", reason)
+    return started
+
+
 async def _start_text(
     conn: AsyncConnection,
     member: _Member,
@@ -363,10 +530,11 @@ async def _start_text(
             trigger["text"] = old_trigger.get("text", "")
             original = _uuid_or(old_trigger.get("inbound_id"), inbound)
 
-    started = await runs.start(
-        conn, household_id=household_id, kind=kind, trigger=trigger, run_id=run_id
+    started, ok = await _start(
+        conn, member, inbound, household_id=household_id, kind=kind, trigger=trigger, run_id=run_id
     )
-    await _send_user_message(conn, started, member, inbound, original)
+    if ok:
+        await _send_user_message(conn, started, member, inbound, original)
     return started
 
 
@@ -491,7 +659,11 @@ async def _reply(
 async def _media_reply(
     conn: AsyncConnection, member: _Member, inbound: uuid.UUID, trigger: dict[str, Any]
 ) -> uuid.UUID:
-    started = await runs.start(conn, household_id=member.household_id, kind=CHAT, trigger=trigger)
+    started, ok = await _start(
+        conn, member, inbound, household_id=member.household_id, kind=CHAT, trigger=trigger
+    )
+    if not ok:
+        return started
     await outbox.send(
         conn,
         message_id=ids.message_id(inbound, 0),

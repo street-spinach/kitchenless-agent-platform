@@ -302,6 +302,15 @@ class Ref(_Part):
     id: str
 
 
+class LinkRequest(_Part):
+    """A consent link for the message's person, issued by the sender at send time and
+    passed to the text as `{link}`, so the link token is never stored in a message
+    (identity-authz §6, I26; I-G8)."""
+
+    household_id: str
+    agent_ids: list[str]
+
+
 class WhatsAppOut(_Body):
     user_id: UUID
     template: str
@@ -309,6 +318,8 @@ class WhatsAppOut(_Body):
     buttons: list[Button]
     # Experience EX-I6: additive with a default, so no `schema_version` bump.
     ref: Ref | None = None
+    # Identity-authz I26: additive with a default, so no `schema_version` bump.
+    link: LinkRequest | None = None
 
 
 # Experience §9 step 2: what Spark returns for an onboarding message. Codes outside the

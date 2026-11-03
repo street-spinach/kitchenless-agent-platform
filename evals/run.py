@@ -496,6 +496,9 @@ SNAPSHOT_SQL: dict[str, str] = {
     "channel_identities": f"SELECT * FROM channel_identities WHERE user_id IN ({_EVAL_USERS})",
     "member_constraints": f"SELECT * FROM member_constraints WHERE user_id IN ({_EVAL_USERS})",
     "household_addresses": f"SELECT * FROM household_addresses WHERE household_id IN ({_EVAL_HH})",
+    # Identity-authz I35 `no_tool_call`: which person each eval consumer agent acts for.
+    "agent_cards": "SELECT agent_id, class, owner_ref FROM agent_cards WHERE class = 'consumer'"
+    f" AND owner_ref IN (SELECT 'user:' || user_id::text FROM ({_EVAL_USERS}) eval_users)",
     # `spent_other_minor`: this week's placed-or-later orders of other runs, so the remaining
     # budget is `amount_minor - spent_other_minor` (orders.remaining_weekly_budget).
     "budgets": "SELECT b.*, COALESCE((SELECT sum(o.total_minor) FROM orders o"

@@ -72,6 +72,17 @@ def _settings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(control, "get_settings", lambda: settings)
 
 
+@pytest.fixture(autouse=True)
+def _no_openfga(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The reset's post-commit `fga.reconcile()` (identity-authz I27) needs OpenFGA;
+    `test_panel_reset.py` tests that it is called."""
+
+    async def reconcile() -> int:
+        return 0
+
+    monkeypatch.setattr(control, "reconcile_fga", reconcile)
+
+
 @pytest.fixture
 def world(pg: str) -> str:
     w.seed(pg)
