@@ -278,6 +278,31 @@ def test_authorize_spend_sets_seller(
     assert refusals == [household.QUOTE_MISMATCH, household.QUOTE_MISMATCH]
 
 
+def test_approval_prompt_has_ref(pg: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Experience EX-I17: the approver's prompt names the approval it is about.
+    run_id = _seed(pg)
+    overrides = Jsonb({household.APPROVAL_TTL_OVERRIDE: 600})
+    _exec(pg, "UPDATE runs SET trigger = trigger || jsonb_build_object('overrides', %s)", overrides)
+    _exec(
+        pg,
+        "INSERT INTO agent_cards (agent_id, class, owner_ref, region, host_process)"
+        " VALUES (%s, 'channel', 'system', 'us', 'api')",
+        household.WHATSAPP,
+    )
+    order_id = _order(pg, run_id, "negotiating")
+    result = _with_pool(
+        pg,
+        monkeypatch,
+        lambda: household.request_approval(
+            _ctx(run_id), order_id=order_id, amount={"amount_minor": 7600, "currency": "USD"}
+        ),
+    )
+    approval_id = result["approval_id"]
+    [prompt] = _query(pg, "SELECT message_id, body FROM agent_messages WHERE type = 'whatsapp_out'")
+    assert prompt["message_id"] == ids.approval_prompt_id(uuid.UUID(approval_id))
+    assert prompt["body"]["ref"] == {"kind": "approval", "id": approval_id}
+
+
 def test_set_order_state_limited_states(pg: str, monkeypatch: pytest.MonkeyPatch) -> None:
     run_id = _seed(pg)
     order_id = _order(pg, run_id, "negotiating")

@@ -1416,3 +1416,31 @@ def test_dinner_order_never_skips(monkeypatch: pytest.MonkeyPatch) -> None:
     assert _quote_items(result) == ["milk"]
     assert _pantry_rows(w) == []
     assert w.saved()["pantry_skipped"] == []
+
+
+# Experience EX-I17: `ref` on the summary and the take-turns offer --------------------
+
+
+def test_summary_has_ref() -> None:
+    w = World()
+    w.accepted()
+    w.order_update("order_confirm", "placed", "grocery:square-us")
+    done = w.order_update("order_status", "delivered", "system:api")
+    [summary] = done.messages
+    assert summary.body["template"] == hg.SUMMARY_TEMPLATE
+    assert summary.body["ref"] == {"kind": "order", "id": w.order_id}
+    SCHEMAS["whatsapp_out"].model_validate(summary.body)
+
+
+def test_take_turns_offer_has_ref(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The two-member dinner world lives with the other take-turns tests.
+    from tests.unit import test_take_turns as tt
+
+    monkeypatch.setattr(stubs, "LISTS", {"grocery": tt.LIST, "dinner": tt.LIST})
+    w = tt.DinnerWorld()
+    done = w.deliver(["mushrooms"], [])
+    summary, offer = done.messages
+    assert offer.body["template"] == hg.TAKE_TURNS_OFFER_TEMPLATE
+    assert offer.body["ref"] == {"kind": "order", "id": w.order_id}
+    assert summary.body["ref"] == {"kind": "order", "id": w.order_id}
+    SCHEMAS["whatsapp_out"].model_validate(offer.body)

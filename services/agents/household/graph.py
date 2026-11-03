@@ -1376,6 +1376,7 @@ def build_graph(
                 "template": SUMMARY_TEMPLATE,
                 "params": {"text": _summary(delivered, state)},
                 "buttons": [],
+                "ref": {"kind": "order", "id": state["order_id"]},
             }
             _add(state, out, WHATSAPP, "whatsapp_out", body)
         # Take-turns (agents §10, AG7): household dinners only, never solo or weekly.
@@ -1398,6 +1399,7 @@ def build_graph(
                         "title": STOP_TAKING_TURNS_TITLE if on else TAKE_TURNS_TITLE,
                     }
                 ],
+                "ref": {"kind": "order", "id": state["order_id"]},
             }
             _add(state, out, WHATSAPP, "whatsapp_out", offer)
             await trace_decision(state, "finish", "take_turns_offered", f"on={str(on).lower()}")
