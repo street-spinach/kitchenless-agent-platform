@@ -879,6 +879,7 @@ def build_graph(
                 "template": NOTHING_NEEDED,
                 "params": {"items": ", ".join(state.get("pantry_skipped") or [])},
                 "buttons": [],
+                "ref": {"kind": "order", "id": state["order_id"]},
             }
             _add(state, out, WHATSAPP, "whatsapp_out", body)
         return {

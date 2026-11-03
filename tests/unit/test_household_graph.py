@@ -1313,6 +1313,7 @@ def test_build_list_all_skipped_nothing_needed() -> None:
         "template": "nothing_needed",
         "params": {"items": "milk, eggs, bread, bananas, rice"},
         "buttons": [],
+        "ref": {"kind": "order", "id": w.order_id},
     }
     assert result.finish == RunFinish("completed", "nothing_needed")
     assert result.timers == []
@@ -1444,3 +1445,15 @@ def test_take_turns_offer_has_ref(monkeypatch: pytest.MonkeyPatch) -> None:
     assert offer.body["ref"] == {"kind": "order", "id": w.order_id}
     assert summary.body["ref"] == {"kind": "order", "id": w.order_id}
     SCHEMAS["whatsapp_out"].model_validate(offer.body)
+
+
+# Experience EX-I18: `ref` on `nothing_needed` -----------------------------------------
+
+
+def test_nothing_needed_has_ref() -> None:
+    w = World()
+    w.household.pantry = _all_at_home()
+    [text] = _built(w).messages
+    assert text.body["template"] == hg.NOTHING_NEEDED
+    assert text.body["ref"] == {"kind": "order", "id": w.order_id}
+    SCHEMAS["whatsapp_out"].model_validate(text.body)
