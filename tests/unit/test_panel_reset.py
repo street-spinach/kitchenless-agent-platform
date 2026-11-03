@@ -771,3 +771,34 @@ def test_pantry_setup_undone_by_reset(world: dict[str, Any]) -> None:
         assert _pantry_rows(conn) == []
         assert _count(conn, eval_sql) == 0
         assert _count(conn, live_sql, LIVE) == live_before
+
+
+@pytest.mark.db
+def test_reset_restores_window(world: dict[str, Any]) -> None:
+    pg = world["pg"]
+    old = datetime.now(UTC) - timedelta(days=3)
+    with psycopg.connect(pg) as conn:
+        conn.execute("UPDATE channel_identities SET last_inbound_at = NULL")
+        conn.execute(
+            "UPDATE channel_identities SET last_inbound_at = %s WHERE phone_e164 = %s",
+            (old, LIVE_PHONE),
+        )
+
+    _reset(pg, "eval")
+
+    eval_phones_sql = (
+        "SELECT ci.phone_e164, ci.last_inbound_at FROM channel_identities ci"
+        " JOIN household_members hm ON hm.user_id = ci.user_id"
+        " JOIN households h ON h.household_id = hm.household_id WHERE h.env = %s"
+    )
+    with psycopg.connect(pg) as conn:
+        eval_rows = conn.execute(eval_phones_sql, ("eval",)).fetchall()
+        live_rows = dict(conn.execute(eval_phones_sql, ("live",)).fetchall())
+        now = conn.execute("SELECT now()").fetchone()
+    assert now is not None
+    assert EVAL_PHONE in {phone for phone, _ in eval_rows}
+    for phone, at in eval_rows:
+        assert at is not None and at > now[0] - timedelta(minutes=1), phone
+    # Live phones are never touched by the eval reset.
+    assert live_rows[LIVE_PHONE] == old
+    assert all(at is None for phone, at in live_rows.items() if phone != LIVE_PHONE)

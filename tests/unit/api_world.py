@@ -9,6 +9,7 @@ from typing import Any
 import psycopg
 import pytest
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 from starlette.testclient import TestClient
 
 from services.api import main as api
@@ -52,9 +53,10 @@ def seed(pg: str) -> None:
                 "INSERT INTO household_members (household_id, user_id, role) VALUES (%s, %s, %s)",
                 (hid, user_id, role),
             )
+            # Fixture phones start inside the WhatsApp window (experience EX-I11).
             conn.execute(
-                "INSERT INTO channel_identities (phone_e164, user_id, channel_mode)"
-                " VALUES (%s, %s, %s)",
+                "INSERT INTO channel_identities (phone_e164, user_id, channel_mode,"
+                " last_inbound_at) VALUES (%s, %s, %s, now())",
                 (phone, user_id, mode),
             )
             _card(conn, consumer, "consumer", f"user:{user_id}", "agents")
@@ -68,6 +70,27 @@ def _card(conn: psycopg.Connection, agent_id: str, cls: str, owner: str, host: s
         " VALUES (%s, %s, %s, 'us', %s)",
         (agent_id, cls, owner, host),
     )
+
+
+def sent_message(
+    pg: str, from_agent: str, to_agent: str, type: str, body: dict[str, Any]
+) -> tuple[uuid.UUID, uuid.UUID]:
+    """Insert a `runs` row and an `agent_messages` row for a message the test sends, so
+    foreign keys to them (such as `whatsapp_sends.message_id`) hold. Returns
+    `(message_id, run_id)`."""
+    message_id, run_id = uuid.uuid4(), uuid.uuid4()
+    with psycopg.connect(pg) as conn:
+        conn.execute(
+            "INSERT INTO runs (run_id, kind, trigger, modes) VALUES (%s, 'chat', %s, %s)",
+            (run_id, Jsonb({"source": "test"}), Jsonb({})),
+        )
+        conn.execute(
+            "INSERT INTO agent_messages"
+            " (message_id, run_id, from_agent, to_agent, to_host, type, body, status)"
+            " VALUES (%s, %s, %s, %s, 'api', %s, %s, 'processing')",
+            (message_id, run_id, from_agent, to_agent, type, Jsonb(body)),
+        )
+    return message_id, run_id
 
 
 def patch_settings(monkeypatch: pytest.MonkeyPatch) -> None:

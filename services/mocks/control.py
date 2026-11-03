@@ -3,8 +3,9 @@
 *   `reset(conn, env, setup=None, household_id="us-1-eval")`: deletes the rows of `eval`
     runs and the `eval` mock state in one transaction, children first, then re-inserts
     `services.seed.mock_stock_rows("eval")` (§7 reset scope, amended 2026-11-02). It then
-    undoes every `SETUP_KEYS` entry for all eval households and applies `setup` to
-    `household_id` (evals.md §4, E-A8). It refuses any other `env`.
+    undoes every `SETUP_KEYS` entry for all eval households, sets `last_inbound_at = now()`
+    for eval phones (experience §14) and applies `setup` to `household_id` (evals.md §4,
+    E-A8). It refuses any other `env`.
 *   `inject_event(...)`: writes a `mock_events` row and returns its id. A `shortfall`
     event needs `params = {order_id, skus}`, with 1 to `SHORTFALL_MAX_LINES` SKUs, each a
     line of the order (agent-protocol §10). It is refused when the order's run pinned the
@@ -332,6 +333,13 @@ def _validate_setup(setup: Mapping[str, Any] | None, household_id: str) -> dict[
     return checked
 
 
+_RESTORE_WINDOW_SQL = """
+UPDATE channel_identities SET last_inbound_at = now() WHERE user_id IN
+  (SELECT hm.user_id FROM household_members hm JOIN households h
+   ON h.household_id = hm.household_id WHERE h.env = 'eval')
+"""
+
+
 async def reset(
     conn: AsyncConnection,
     env: str,
@@ -366,6 +374,9 @@ async def reset(
         for key in SETUP_KEYS.values():
             for hid in eval_households:
                 await key.undo(conn, hid, limits[hid])
+        # Eval phones start inside the WhatsApp window again (experience §14, EX-I11),
+        # before `setup` is applied.
+        await conn.execute(_RESTORE_WINDOW_SQL)
         for name, value in applied.items():
             await SETUP_KEYS[name].apply(conn, household_id, value)
     return deleted

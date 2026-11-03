@@ -27,11 +27,12 @@ def world(pg: str) -> str:
     return pg
 
 
-def _whatsapp_out(user_id: uuid.UUID) -> Inbound:
+def _whatsapp_out(pg: str, user_id: uuid.UUID) -> Inbound:
     body = {"user_id": str(user_id), "template": "retry_prompt", "params": {}, "buttons": []}
+    message_id, run_id = w.sent_message(pg, "system:runs", w.WHATSAPP, "whatsapp_out", body)
     row = AgentMessageRow(
-        message_id=uuid.uuid4(),
-        run_id=uuid.uuid4(),
+        message_id=message_id,
+        run_id=run_id,
         conversation_id=None,
         causation_id=None,
         from_agent="system:runs",
@@ -59,7 +60,7 @@ def test_sim_outbound_never_calls_graph_api(world: str) -> None:
         graph_calls.append((phone, body))
 
     sender = Sender(w.connect_to(world), send_real=graph)
-    msg = _whatsapp_out(w.MEMBER)
+    msg = _whatsapp_out(world, w.MEMBER)
     asyncio.run(sender(msg))
     asyncio.run(sender(msg))  # a replayed step inserts nothing again
 
@@ -85,8 +86,9 @@ def test_real_phone_goes_to_real_sender_and_fails_closed_until_built(world: str)
     async def graph(phone: str, body: dict[str, Any]) -> None:
         calls.append(phone)
 
-    asyncio.run(Sender(w.connect_to(world), send_real=graph)(_whatsapp_out(w.LIVE_ADMIN)))
+    sent = _whatsapp_out(world, w.LIVE_ADMIN)
+    asyncio.run(Sender(w.connect_to(world), send_real=graph)(sent))
     assert calls == [w.REAL_PHONE]
     with pytest.raises(RealSendUnavailable):
-        asyncio.run(Sender(w.connect_to(world))(_whatsapp_out(w.LIVE_ADMIN)))
+        asyncio.run(Sender(w.connect_to(world))(_whatsapp_out(world, w.LIVE_ADMIN)))
     assert w.query(world, "SELECT * FROM sim_outbound") == []

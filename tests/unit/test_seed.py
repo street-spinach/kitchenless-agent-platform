@@ -27,7 +27,8 @@ TABLES = {
     "menu_items": "agent_id, sku",
     "mock_stock": "env, agent_id, sku",
 }
-VARYING = {"created_at", "updated_at", "search"}
+# `last_inbound_at` is set to now() on every seed (experience EX-I11).
+VARYING = {"created_at", "updated_at", "search", "last_inbound_at"}
 # Fictional, so the test never needs a real number.
 US1_PHONES = ["+15550109901", "+15550109902", "+15550109903"]
 
@@ -339,3 +340,19 @@ def test_seed_writes_eval_peanut_allergy_only(pg: str) -> None:
     assert "peanuts" not in set().union(
         *(v for u, v in by_user.items() if u not in {ids.seed_user_id("us-1-b-eval")})
     )
+
+
+@pytest.mark.db
+def test_phones_start_inside_window(pg: str) -> None:
+    # Every seeded phone, sim and real, starts inside the WhatsApp window (experience EX-A4).
+    with psycopg.connect(pg) as conn:
+        _seed(conn)
+        conn.execute("UPDATE channel_identities SET last_inbound_at = NULL")
+        _seed(conn)  # a re-seed restores it
+        rows = conn.execute(
+            "SELECT phone_e164, last_inbound_at > now() - interval '1 minute'"
+            " FROM channel_identities"
+        ).fetchall()
+    assert rows
+    assert {phone for phone, inside in rows if not inside} == set()
+    assert set(US1_PHONES) <= {phone for phone, _ in rows}
