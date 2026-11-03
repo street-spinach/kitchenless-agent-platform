@@ -1148,7 +1148,7 @@ household `get_constraints`), step 13 (#128: I32 `/app/rules`, owner tokens, I33
 | X4. Migration 0015 | EX-I4 | X1; pantry P2 (#254) | yes | `test_migrations.py` passes, applies twice |
 | X5. Ids, schemas, settings | EX-I5, EX-I6, EX-I7 | X1 | no | `test_ids.py`, `test_schemas.py`, `test_config.py` pass |
 | X6. Retry target filter | EX-I8 | X1 | no | `test_runs.py` passes |
-| X7. Scope rows | EX-I9 | X4; identity-authz step 5 (#115) | yes | `test_scope.py`, `test_guard_identity.py::test_tool_scope_table` pass |
+| X7. Scope rows | EX-I9 | X4; identity-authz step 5 (#115) | yes | `test_scope.py` passes |
 | X8. Window state and sim phones | EX-I10, EX-I11 | X4 | no | `test_ingest.py::test_last_inbound_*`, `test_seed.py`, `test_panel_reset.py` pass; `make eval-fast` passes |
 | X9. Window sends and refusals | EX-I12 | X3, X5, X8 | no | `test_whatsapp_window.py`, `test_sim_channel.py` pass; `make eval-fast` passes |
 | X10. Meta templates | EX-I13, EX-I14 | X9 | no | `test_template_send.py` passes |
@@ -1161,19 +1161,19 @@ household `get_constraints`), step 13 (#128: I32 `/app/rules`, owner tokens, I33
 | X17. Metric view tests and panel | EX-I21, EX-I22 | X9 | no | `test_experience_metric.py`, `test_panel_experience.py` pass |
 | X18. Visibility | EX-I23 | X1; identity-authz step 5 (#115) | yes (`services/safety/`) | `test_visibility.py` passes |
 | X19. Expo CI | EX-I24 | X1 | yes (`.github/`, `Makefile`) | `make app-lint app-test` pass in CI |
-| X20. Setup state and proposals | EX-I25, EX-I26 | X5, X7 | no | `test_household_setup_tools.py::test_propose_*`, `test_codes.py` pass |
-| X21. Apply setup | EX-I27 | X20; identity-authz step 9 (#124) | no | `test_household_setup_tools.py::test_apply_*` pass |
+| X20. Setup state and proposals | EX-I25, EX-I26 | X5, X7 | yes (`tokens.py`, #281) | `test_household_setup_tools.py::test_propose_*`, `test_codes.py` pass |
+| X21. Apply setup | EX-I27 | X20; identity-authz step 9 (#124) | yes (`tokens.py`, #281) | `test_household_setup_tools.py::test_apply_*` pass |
 | X22. Setup graph | EX-I28, EX-I29 | X2, X20 | no | `test_consumer_graph.py::test_onboard_*` pass; `make eval-fast` passes |
 | X23. Setup taps | EX-I30 | X6, X21 | no | `test_ingest.py::test_setup_tap_*` pass |
-| X24. Joining | EX-I31, EX-I32 | X6, X21; identity-authz step 12 (#127) | no | `test_join_codes.py`, `test_open_join_code_allergens_merged`, `test_ingest.py::test_join_*` pass |
+| X24. Joining | EX-I31, EX-I32 | X6, X21; identity-authz step 12 (#127) | yes (`tokens.py`, #281) | `test_join_codes.py`, `test_open_join_code_allergens_merged`, `test_ingest.py::test_join_*` pass |
 | X25. Link landing page | EX-I33 | X1; identity-authz step 8 (#123) | yes (`services/identity/`) | `test_links.py::test_next_*` pass |
 | X26. Text commands and page taps | EX-I34 | X2, X6, X25 | no | `test_ingest.py::test_my_page_*`, `::test_reminders_off_on`, `::test_page_button_sends_link` pass |
 | X27. Page templates and stylesheet | EX-I35 | X1; identity-authz step 8 (#123) | no | `test_me_templates.py` passes |
 | X28. `/me/household` and history | EX-I36 | X4, X18, X27; identity-authz step 12 (#127) | no | `test_me_household.py::test_household_page_*`, `::test_csrf_required` pass |
-| X29. Household page tools | EX-I37 | X7, X28 | no | `test_take_turns_switch`, `test_reaction_*` pass |
+| X29. Household page tools | EX-I37 | X7, X28 | yes (`tokens.py`, #281) | `test_take_turns_switch`, `test_reaction_*` pass |
 | X30. Templates submitted (operator) | runbook | X10 | n/a | Approved names in the VM's `infra/.env`; EX-Q1 answered on the issue |
 | X31. Pantry gate function | EX-I38 | X1; pantry P4 (#256) | no | `test_pantry.py::test_is_enabled`, existing `get_pantry` tests pass |
-| X32. Pantry correction | EX-I39, EX-I40 | X7, X28, X31 | no | `test_pantry_correction.py`, `test_me_household.py::test_pantry_*` pass |
+| X32. Pantry correction | EX-I39, EX-I40 | X7, X28, X31 | yes (`tokens.py`, #281) | `test_pantry_correction.py`, `test_me_household.py::test_pantry_*` pass |
 | X33. Reminders | EX-I41, EX-I42 | X2, X6, X10, X11, X31 | no | `test_reminders.py`, `test_sweeper.py::test_reminder_pass_once_per_minute` pass |
 | X34. Owner design system | EX-I43 | X19 | no | Component render tests pass |
 | X35. Owner sign-in and realm | EX-I44 | X34; identity-authz step 13 (#128) | yes (realm) | `auth.test.ts`, `test_realm_file.py` pass |
@@ -1324,12 +1324,13 @@ X2, X3, X5, X6, X19.
 
 #### EX-I9. `services/identity/tokens.py`, `services/safety/scope.py` (Modify; critical), `tests/unit/test_scope.py`, `tests/unit/test_guard_identity.py` (Modify)
 
-*   **Proposed Changes**: the EX-A11 rows: `TOOL_SCOPES` entries for `get_setup_state`,
-    `propose_setup`, `apply_setup`, `complete_join`, `set_household_take_turns`,
-    `react_to_meal`, `record_pantry_check`; the six new tables in `HOUSEHOLD_TABLES`; the
-    allowlist reasons `join_lookup`, `held_release`, `setup_phone_check`, `reminder_pass`.
-*   **Tests**: `test_scope.py::test_scoped_tables_only_via_helper` with the new tables;
-    `test_guard_identity.py::test_tool_scope_table` with the new rows.
+*   **Proposed Changes**: the six new tables in `HOUSEHOLD_TABLES`; the allowlist reasons
+    `join_lookup`, `held_release`, `setup_phone_check`, `reminder_pass`.
+    *Amended 2026-11-03 (#281):* the EX-A11 `TOOL_SCOPES` rows no longer land here. Each
+    row lands with the step that builds its tool (EX-I26, EX-I27, EX-I31, EX-I37, EX-I39),
+    because `test_tokens.py::test_tool_scopes_cover_guarded_tools` requires `TOOL_SCOPES`
+    to equal the guarded tools that exist, and those tools come after this step.
+*   **Tests**: `test_scope.py::test_scoped_tables_only_via_helper` with the new tables.
 
 #### EX-I10. `services/api/ingest.py` (Modify), `tests/unit/test_ingest.py` (Modify)
 
@@ -1509,7 +1510,10 @@ X2, X3, X5, X6, X19.
         caller acts for an admin (limits check on `household_members.role`); §9 step 4
         validation; insert with `ids.proposal_id(ctx.run_id)` and `ON CONFLICT DO
         NOTHING`; earlier `pending` proposals become `superseded`.
-*   **Tests**: `tests/unit/test_household_setup_tools.py` (Create):
+    *   The EX-A11 `TOOL_SCOPES` rows for `get_setup_state` and `propose_setup` in
+        `services/identity/tokens.py` (critical; moved here from EX-I9, #281).
+*   **Tests**: `test_guard_identity.py::test_tool_scope_table` with the two rows;
+    `tests/unit/test_household_setup_tools.py` (Create):
     `test_propose_member_refused`, `test_propose_replay_one_row`,
     `test_propose_supersedes_pending`, `test_propose_phone_taken`,
     `test_propose_unknown_code_unmatched`, `test_setup_state`.
@@ -1520,8 +1524,10 @@ X2, X3, X5, X6, X19.
     "remove", "keep"], removal: int | None, child_user_ids: dict[str, UUID], user_id: UUID) -> {status,
     saved, removals_pending: list[int]}`: `system:api` only; `user_id` (the tapper, from
     the run trigger, as `decide_approval` takes it) is checked by limits to be an admin; §9 writes in one transaction; a repeated answer to
-    the same removal returns `already_decided`.
-*   **Tests**: `test_household_setup_tools.py`: `test_apply_nothing_saved_without_yes`,
+    the same removal returns `already_decided`. The EX-A11 `TOOL_SCOPES` row for
+    `apply_setup` in `services/identity/tokens.py` (critical; moved here from EX-I9, #281).
+*   **Tests**: `test_guard_identity.py::test_tool_scope_table` with the row;
+    `test_household_setup_tools.py`: `test_apply_nothing_saved_without_yes`,
     `test_apply_member_refused`, `test_apply_expired_refused`, `test_apply_idempotent`,
     `test_apply_remove_by_index`, `test_apply_budget_in_household_currency`.
 
@@ -1563,7 +1569,10 @@ X2, X3, X5, X6, X19.
     marks the code used. `get_household_allergens` and the household form of
     `get_constraints` (identity-authz step 12) union the codes of the household's open join
     codes; `_member_allergens` adds one entry per open code under the key `join:<code>`.
-*   **Tests**: `tests/unit/test_household_tools.py::test_open_join_code_allergens_merged`,
+    The EX-A11 `TOOL_SCOPES` row for `complete_join` in `services/identity/tokens.py`
+    (critical; moved here from EX-I9, #281).
+*   **Tests**: `test_guard_identity.py::test_tool_scope_table` with the row;
+    `tests/unit/test_household_tools.py::test_open_join_code_allergens_merged`,
     `::test_used_code_not_merged_twice`; `tests/unit/test_join_codes.py` (Create):
     `test_complete_join_moves_codes`, `test_wrong_phone_refused`, `test_expired_code_refused`.
 
@@ -1619,8 +1628,10 @@ X2, X3, X5, X6, X19.
     (`system:api`; `user_id` checked by limits as a member of the run's household; the
     order is the household's and `delivered`; upsert by person). Routes `POST
     /me/household/take-turns` and `POST /me/meals/{order_id}/reaction` start the §3 `/me`
-    run and pass the session person as `user_id`.
-*   **Tests**: `test_me_household.py`: `test_take_turns_switch`,
+    run and pass the session person as `user_id`. The EX-A11 `TOOL_SCOPES` rows for both
+    tools in `services/identity/tokens.py` (critical; moved here from EX-I9, #281).
+*   **Tests**: `test_guard_identity.py::test_tool_scope_table` with the two rows;
+    `test_me_household.py`: `test_take_turns_switch`,
     `test_switch_read_only_for_non_approver`, `test_reaction_once_per_person`,
     `test_reaction_on_other_household_refused`.
 
@@ -1637,8 +1648,11 @@ X2, X3, X5, X6, X19.
     "out"], user_id: UUID)` (`system:api`; `user_id` is an adult of the run's household; the
     item is in the vocabulary): inserts `pantry_events (household_id, item, pantry_item,
     unit, delta, kind, source, run_id, actor_user_id)` with `item` and `pantry_item` both
-    the vocabulary name, `unit = 'each'`, `delta = 0`, `source = 'me_page'`.
-*   **Tests**: `tests/unit/test_pantry_correction.py` (Create): `test_ran_out_writes_out`,
+    the vocabulary name, `unit = 'each'`, `delta = 0`, `source = 'me_page'`. The EX-A11
+    `TOOL_SCOPES` row for `record_pantry_check` in `services/identity/tokens.py` (critical;
+    moved here from EX-I9, #281).
+*   **Tests**: `test_guard_identity.py::test_tool_scope_table` with the row;
+    `tests/unit/test_pantry_correction.py` (Create): `test_ran_out_writes_out`,
     `test_child_cannot_correct`, `test_unknown_item_refused`, `test_next_order_keeps_out_item`.
 
 #### EX-I40. `services/api/routes/me.py` (Modify)
