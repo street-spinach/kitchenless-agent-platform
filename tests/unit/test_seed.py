@@ -185,7 +185,7 @@ def test_catalog_pantry_items_in_vocabulary() -> None:
         "MOCK-BANANAS-2LB": "bananas", "SQ-BANANAS-2LB": "bananas",
         "MOCK-APPLES-3LB": "apples",
         "MOCK-CHICKEN-BREAST": "chicken breast",
-        "MOCK-RICE-2LB": "rice",
+        "MOCK-RICE-2LB": "rice", "SQ-RICE-2LB": "rice",
         "MOCK-GRANOLA-NUT": "granola",
         "SQ-PASTA-1LB": "pasta",
         "SQ-ALMONDS-1LB": "almonds",

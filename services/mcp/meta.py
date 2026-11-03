@@ -125,9 +125,17 @@ class CallContext:
 
         async with db.get_pool().connection() as conn:
             try:
-                card = await directory.card(conn, agent_id)
+                owner_ref = (await directory.card(conn, agent_id)).owner_ref
             except directory.UnknownAgent:
-                raise GuardRefused(META_REFUSED) from None
+                # Service rows such as `system:api` have no card (identity-authz §3); they
+                # are known through `agent_clients` and act on no one's behalf.
+                cur = await conn.execute(
+                    "SELECT 1 FROM agent_clients WHERE agent_id = %s AND kind = 'service'",
+                    (agent_id,),
+                )
+                if await cur.fetchone() is None:
+                    raise GuardRefused(META_REFUSED) from None
+                owner_ref = "system"
             cur = await conn.execute(
                 "SELECT COALESCE(h.env, 'live'), r.modes, r.household_id FROM runs r"
                 " LEFT JOIN households h ON h.household_id = r.household_id"
@@ -146,7 +154,7 @@ class CallContext:
             token=current_token(),
             env=env,
             modes=dict(modes),
-            on_behalf_of=None if card.owner_ref == "system" else card.owner_ref,
+            on_behalf_of=None if owner_ref == "system" else owner_ref,
             household_id=household_id,
         )
 
