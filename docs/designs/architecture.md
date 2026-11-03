@@ -1177,7 +1177,7 @@ G6 measures the **peak** during a full weekly-order run: `docker stats` sampled 
 |---|---|---|---|
 | Every PR (`ci.yml` `test` job) | Lint, unit tests (with a Postgres service), contract tests | None (`stub`) | Mock (`MODE_FORCE_MOCK=1`) |
 | Every PR (`guards` job and `merge-policy`) | The test-count guard and the critical-path label check (ENGINEERING_PROCESS §11) | None | n/a |
-| PR touching agents, MCP, safety, identity, common, api, seed, migrations or evals | `make eval-safety` (fast safety cases; amended 2026-11-03) on the `ci` Compose profile | `stub` | Mock |
+| PR touching `services/safety/`, `services/identity/` or `evals/cases/safety/` | `make eval-safety` (fast safety cases; amended 2026-11-03) on the `ci` Compose profile | `stub` | Mock |
 | Merge to main | Build and push the image; deploy; seed; smoke; scenario | `stub` | Mock |
 | Nightly on the VM | `make eval-full` on `eval` households | `real`, within `RUN_TOKEN_CEILING` | Mock, plus real sandboxes where configured |
 | Rehearsal (manual) | The demo script | `real` | Real where configured |
@@ -2751,8 +2751,9 @@ and values; none of these may be renamed or dropped.
 ##### 63. `.github/workflows/ci.yml` (Modify, critical)
 
 *Amended 2026-11-03 (PR eval gate):* to keep loop PRs fast, the eval job runs
-`make eval-safety` (the `fast` cases in the `safety` category) instead of `make eval-fast`,
-and the path filter gains `services/identity/`. The other categories run in the nightly
+`make eval-safety` (the `fast` cases in the `safety` category, once each with
+`--repeats 1`) instead of `make eval-fast`, and only when a PR touches safety code:
+`services/safety/`, `services/identity/` or `evals/cases/safety/`. The other categories run in the nightly
 `make eval-full` (item 64), which files an issue when one falls below its threshold.
 
 *Amended 2026-11-02 (evals, #142):* the eval job uses this item's eight-path filter, sets `MODEL_MODE=stub`, passes no `MUSE_API_KEY` or other model key, seeds the eval households before `make eval-fast`, and uploads the results as an artifact and job summary (evals.md E-A2).
@@ -2763,7 +2764,7 @@ and the path filter gains `services/identity/`. The other categories run in the 
         so `db`-marked unit tests run. It sets `MODE_FORCE_MOCK=1` and `MODEL_MODE=stub`.
     *   The `MUSE_API_KEY` secret is no longer passed to any job.
     *   The eval trigger regex becomes
-        `'^(services/agents/|services/mcp/|services/safety/|services/identity/|services/common/|services/api/|services/seed/|migrations/|evals/)'`.
+        `'^(services/safety/|services/identity/|evals/cases/safety/)'`.
     *   The eval job starts the `ci` profile, runs `make seed SEED_ARGS="--env eval"`, then
         `make eval-safety` (amended 2026-11-03; was `make eval-fast`).
 

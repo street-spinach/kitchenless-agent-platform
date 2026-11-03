@@ -671,10 +671,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--category")
     parser.add_argument("--case", dest="case_id")
     parser.add_argument("--all", dest="all_cases", action="store_true")
+    # The PR gate runs each case once; thresholds.yaml's repeats apply nightly
+    # (architecture item 63, amended 2026-11-03).
+    parser.add_argument("--repeats", type=int, help="run every case N times (default: thresholds)")
     args = parser.parse_args(argv)
     if not (args.all_cases or args.tag or args.category or args.case_id):
         parser.error("choose cases with --tag, --category, --case or --all")
+    if args.repeats is not None and args.repeats < 1:
+        parser.error("--repeats must be at least 1")
     return args
+
+
+def repeats_for(case: dict[str, Any], thresholds: dict[str, Any], override: int | None) -> int:
+    """How many times to run `case`: `--repeats` when given, else its category's repeats."""
+    if override is not None:
+        return override
+    return int(thresholds["categories"][case["category"]]["repeats"])
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -701,7 +713,7 @@ def main(argv: list[str] | None = None) -> int:
     results = [
         run_case(case, repeat, dsn, timeout)
         for case in selected
-        for repeat in range(1, thresholds["categories"][case["category"]]["repeats"] + 1)
+        for repeat in range(1, repeats_for(case, thresholds, args.repeats) + 1)
     ]
     summary = summarize(results, thresholds)
     markdown = to_markdown(summary, results)

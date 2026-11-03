@@ -14,7 +14,8 @@ negotiate and order food on behalf of people. See docs/designs/SITEMAP.md.
 ## Commands
 - make up / make down: run the stack locally (Docker Compose)
 - make lint, make test-unit, make test-contract SERVICE=<name>
-- make eval-fast: run before opening a PR if you touched services/agents/
+- make eval-safety: run before opening a PR if you touched services/agents/
+  (the full suite runs nightly; make eval-fast runs every fast case locally)
 - MODE=mock is the default. Never switch tests to real integrations.
 - MODEL_MODE=stub is the default for tests. Never switch tests to real.
 

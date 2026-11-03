@@ -15,17 +15,11 @@ ROOT = Path(__file__).resolve().parents[2]
 CI_YML = ROOT / ".github" / "workflows" / "ci.yml"
 ARCHITECTURE = ROOT / "docs" / "designs" / "architecture.md"
 
-# Architecture item 63's nine paths, in its order (services/identity/ added 2026-11-03).
+# Architecture item 63's eval paths, in its order (amended 2026-11-03: safety code only).
 ITEM_63_PATHS = [
-    "services/agents/",
-    "services/mcp/",
     "services/safety/",
     "services/identity/",
-    "services/common/",
-    "services/api/",
-    "services/seed/",
-    "migrations/",
-    "evals/",
+    "evals/cases/safety/",
 ]
 ITEM_63_REGEX = "^(" + "|".join(ITEM_63_PATHS) + ")"
 
