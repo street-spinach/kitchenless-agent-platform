@@ -11,6 +11,8 @@
     `owner_rule_changed` audit row. The rule raises the handlers' floors (I33).
 *   `GET /app/orders?summary=0|1` and `GET /app/notices?limit=N` (experience.md §11,
     EX-I47) read through `scope.org_scoped` in `owner_views.py`. They name no household.
+*   `GET /app/insights` (this ISO week; the labelled sample when `INSIGHTS_SAMPLE=1`) and
+    `GET /app/connection` (EX-I48), the same way.
 
 Other `/app/*` paths stay reserved (`reserved.py`) until the experience design builds them.
 """
@@ -26,6 +28,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from services.api import owner_views
+from services.common.config import get_settings
 from services.identity import audit, fga, tokens
 from services.identity.errors import AuthzUnavailable, IdentityUnavailable, TokenRefused
 from services.safety import scope
@@ -183,8 +186,32 @@ async def notices(request: Request) -> Response:
         return JSONResponse({"notices": await owner_views.notices(conn, org, int(raw))})
 
 
+async def insights(request: Request) -> Response:
+    org = await _org(request)
+    if isinstance(org, Response):
+        return org
+    now = datetime.now(UTC)
+    if get_settings().insights_sample:
+        return JSONResponse(owner_views.sample_insights(now))
+    async with request.app.state.connect() as conn:
+        return JSONResponse(await owner_views.insights(conn, org, now))
+
+
+async def connection(request: Request) -> Response:
+    org = await _org(request)
+    if isinstance(org, Response):
+        return org
+    async with request.app.state.connect() as conn:
+        status = await owner_views.connection(conn, org)
+    if status is None:
+        return JSONResponse({"error": "no_agents"}, status_code=404)
+    return JSONResponse(status)
+
+
 routes = [
     Route("/app/rules", rules, methods=["GET", "POST"]),
     Route("/app/orders", orders, methods=["GET"]),
     Route("/app/notices", notices, methods=["GET"]),
+    Route("/app/insights", insights, methods=["GET"]),
+    Route("/app/connection", connection, methods=["GET"]),
 ]
