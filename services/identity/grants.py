@@ -10,9 +10,10 @@
     household grant. Its writes are in the caller's transaction: a caller that refuses
     on `GrantExpired` commits first, so the mark is kept.
 *   `revoke` is §11 step 1: one row update and `consent_revoked`, in one transaction.
-*   `after_revoke` is §11 step 2: after the commit, one best-effort Keycloak per-client
-    consent revoke; a failure writes `keycloak_revoke_failed` and is not retried. The
-    revoke notice (step 3) lands with the WhatsApp texts (I26, build step 9).
+*   `after_revoke` is §11 steps 2 and 3: after the commit, one best-effort Keycloak
+    per-client consent revoke (a failure writes `keycloak_revoke_failed` and is not
+    retried), then the revoke notice `consent_revoked` with a Renew button and
+    `ref = {grant, <grant_id>}` (experience §6, EX-I19).
 *   `mark_refused` handles Keycloak's `invalid_grant` (§12 failures).
 *   `client_assertion` is the `private_key_jwt` assertion for the token endpoint.
 """
@@ -40,6 +41,7 @@ from services.safety.scope import unscoped
 __all__ = [
     "CLASS_SCOPES",
     "GRANT_DAYS",
+    "RENEW_BUTTON",
     "Grant",
     "GrantExpired",
     "GrantMissing",
@@ -308,9 +310,11 @@ async def revoke(
 
 
 async def after_revoke(conn: AsyncConnection, grant_id: UUID) -> bool:
-    """§11 step 2, after `revoke` has committed: remove the grant holder's stored consent
-    for the agent's client in Keycloak, once. Any failure writes `keycloak_revoke_failed`
-    (the `consent_revoked` row is never updated) and returns False."""
+    """§11 steps 2 and 3, after `revoke` has committed: remove the grant holder's stored
+    consent for the agent's client in Keycloak, once, then send the revoke notice
+    `consent_revoked`. A Keycloak failure writes `keycloak_revoke_failed` (the
+    `consent_revoked` row is never updated) and returns False; the notice is sent either
+    way."""
     from services.identity import keycloak_admin  # it imports this module
 
     cur = await unscoped(conn, "grants").execute(
@@ -322,6 +326,7 @@ async def after_revoke(conn: AsyncConnection, grant_id: UUID) -> bool:
     if row is None:
         raise ValueError("after_revoke needs a revoked grant")
     agent_id, user_id, household_id, keycloak_sub = row
+    done = True
     try:
         if not keycloak_sub:
             raise RuntimeError("the grant holder has no Keycloak user id")
@@ -337,8 +342,90 @@ async def after_revoke(conn: AsyncConnection, grant_id: UUID) -> bool:
             grant_id=grant_id,
             detail={"error": type(exc).__name__},
         )
-        return False
-    return True
+        done = False
+    await _revoke_notice(conn, grant_id)
+    return done
+
+
+# --- the revoke notice (§11 step 3, §12; experience §6, EX-I19) -----------------------------
+
+# `api` writes the notice (architecture §3) to the WhatsApp channel.
+NOTICE_FROM = "system:api"
+NOTICE_TO = "channel:whatsapp"
+RENEW_TITLE = "Renew"
+# The Renew button (experience §6, §7): `me:renew`, the same payload inside and outside the
+# window.
+RENEW_BUTTON: dict[str, str] = {"payload": ids.page_button("renew"), "title": RENEW_TITLE}
+# The notice's subject (experience §5): a fixed phrase, never a member's or agent's name.
+_NOTICE_AGENT = {"household": "The household agent", "consumer": "Your agent"}
+PLACED_LINE = " Your order from {store} was already placed and will still arrive."
+
+# Who gets the notice: the grant holder, or for a child the guardian who consented
+# (identity-authz §11 "Expiry").
+_NOTICE_TO_SQL = """
+SELECT g.agent_kind, g.household_id,
+       CASE WHEN m.role = 'child' THEN g.consented_by ELSE g.user_id END
+FROM agent_grants g
+LEFT JOIN household_members m ON m.household_id = g.household_id AND m.user_id = g.user_id
+WHERE g.grant_id = %s
+"""
+
+# The household's latest order that was placed and has not yet arrived (I-CUJ 3: it
+# finishes), with its seller's `organizations.name`.
+_PLACED_SQL = """
+SELECT org.name
+FROM orders o
+JOIN agent_cards c ON c.agent_id = o.seller_agent_id
+JOIN organizations org ON c.owner_ref = 'org:' || org.org_id
+WHERE o.household_id = %s AND o.state IN ('placed', 'courier_booked', 'in_delivery')
+ORDER BY o.created_at DESC, o.order_id LIMIT 1
+"""
+
+
+async def _revoke_notice(conn: AsyncConnection, grant_id: UUID) -> None:
+    """`consent_revoked` with `agent`, `placed_line`, the Renew button and
+    `ref = {grant, <grant_id>}`, in a `chat` run with no household that ends `completed`
+    at once. The sender sends it inside the window, as its Meta template outside, or holds
+    it (experience §5)."""
+    from services.common import outbox, runs  # `runs` imports this module
+
+    q = unscoped(conn, "grants")
+    cur = await q.execute(_NOTICE_TO_SQL, (grant_id,))
+    row = await cur.fetchone()
+    if row is None or row[2] is None:
+        return
+    agent_kind, household_id, to_user = row
+    placed_line = ""
+    if agent_kind == "household":
+        cur = await q.execute(_PLACED_SQL, (household_id,))
+        placed = await cur.fetchone()
+        if placed is not None:
+            placed_line = PLACED_LINE.format(store=placed[0])
+    async with conn.transaction():
+        run_id = await runs.start(
+            conn,
+            household_id=None,
+            kind="chat",
+            trigger={"source": "code", "user_id": to_user, "grant_id": grant_id},
+        )
+        await outbox.send(
+            conn,
+            message_id=ids.message_id(grant_id, 0),
+            run_id=run_id,
+            conversation_id=None,
+            causation_id=None,
+            from_agent=NOTICE_FROM,
+            to_agent=NOTICE_TO,
+            type="whatsapp_out",
+            body={
+                "user_id": str(to_user),
+                "template": "consent_revoked",
+                "params": {"agent": _NOTICE_AGENT[agent_kind], "placed_line": placed_line},
+                "buttons": [RENEW_BUTTON],
+                "ref": {"kind": "grant", "id": str(grant_id)},
+            },
+        )
+        await runs.finish(conn, run_id, NOTICE_FROM, "completed", "grant_revoked")
 
 
 async def mark_refused(conn: AsyncConnection, grant_id: UUID) -> None:

@@ -40,11 +40,11 @@ The member's text is kept in `runs.trigger.text`, where the consumer agent reads
 Identity (identity-authz §11, §12, I26): when `runs.start` refuses a household run because
 the household agent's grant is missing, revoked or expired, no household run starts.
 Instead a `chat` run with no household (exempt from the grant check, experience §3) carries
-the renew text `consent_renewal` with a fresh consent link for the household agent, and ends
-`completed` at once. It goes to the person who wrote if they are an admin, otherwise to the
-household's approver, and only while that person is inside WhatsApp's 24-hour window; the
-link is issued by the sender at send time (`WhatsAppOut.link`), so its token is never
-stored in a message.
+the renew text `consent_renewal` with a Renew button (`me:renew`) and
+`ref = {grant, <grant_id>}`, and ends `completed` at once. It goes to the person who wrote
+if they are an admin, otherwise to the household's approver, inside or outside WhatsApp's
+24-hour window: the sender sends it, sends its Meta template or holds it (experience §5,
+EX-I19).
 """
 
 import logging
@@ -57,11 +57,12 @@ from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from services.api.whatsapp.sender import WINDOW, GraphSender
+from services.api.whatsapp.sender import GraphSender
 from services.common import ids, mcp_client, outbox, runs
 from services.common.config import get_settings
 from services.common.mcp_client import ToolRefused, call_tool_as
 from services.common.run_context import RunContext
+from services.identity import grants
 from services.identity.errors import GrantError
 from services.safety.scope import unscoped
 
@@ -447,11 +448,9 @@ LEFT JOIN approval_rules r ON r.household_id = m.household_id
 WHERE m.household_id = %s AND m.user_id = %s
 """
 
-# Inside the window (experience §5): `last_inbound_at` later than now minus 23 h 45 min, on
-# the phone the sender uses. No phone, or NULL, is outside (fails closed).
-_INSIDE_SQL = """
-SELECT coalesce(last_inbound_at > now() - %s::interval, false) FROM channel_identities
-WHERE user_id = %s ORDER BY created_at, phone_e164 LIMIT 1
+# The household agent's grant the refusal is about: its latest row. `grant_missing` has none.
+_LATEST_GRANT_SQL = """
+SELECT grant_id FROM agent_grants WHERE agent_id = %s ORDER BY created_at DESC LIMIT 1
 """
 
 
@@ -462,9 +461,12 @@ async def _renew(
     reason: str,
     run_id: uuid.UUID | None,
 ) -> uuid.UUID:
-    """The renew text (identity-authz §12) with a fresh consent link for the household
-    agent, in a `chat` run with no household that ends `completed` with the grant `reason`.
-    Sent only inside the recipient's WhatsApp window; outside it nothing is sent."""
+    """The renew text `consent_renewal` (identity-authz §12, experience §6) with the Renew
+    button `me:renew` and `ref = {grant, <grant_id>}`, in a `chat` run with no household
+    that ends `completed` with the grant `reason`. Written inside or outside the
+    recipient's window: the sender sends it, sends its Meta template or holds it
+    (experience §5, EX-I19). `grant_missing` has no grant, so no `ref`: outside the window
+    with no template it is skipped, not held."""
     started = await runs.start(
         conn,
         household_id=None,
@@ -476,15 +478,17 @@ async def _renew(
     cur = await q.execute(_RENEW_TO_SQL, (member.household_id, member.user_id))
     row = await cur.fetchone()
     to_user = row[0] if row is not None else None
-    inside = False
     if to_user is not None:
-        cur = await q.execute(_INSIDE_SQL, (WINDOW, to_user))
-        inside = bool((await cur.fetchone() or (False,))[0])
-    if inside:
-        link = {
-            "household_id": member.household_id,
-            "agent_ids": [f"household:{member.household_id}"],
+        cur = await q.execute(_LATEST_GRANT_SQL, (f"household:{member.household_id}",))
+        grant = await cur.fetchone()
+        body: dict[str, Any] = {
+            "user_id": str(to_user),
+            "template": CONSENT_RENEWAL,
+            "params": {},
+            "buttons": [grants.RENEW_BUTTON],
         }
+        if grant is not None:
+            body["ref"] = {"kind": "grant", "id": str(grant[0])}
         await outbox.send(
             conn,
             message_id=ids.message_id(inbound, 0),
@@ -494,16 +498,10 @@ async def _renew(
             from_agent=API_AGENT,
             to_agent=WHATSAPP,
             type="whatsapp_out",
-            body={
-                "user_id": str(to_user),
-                "template": CONSENT_RENEWAL,
-                "params": {},
-                "buttons": [],
-                "link": link,
-            },
+            body=body,
         )
     else:
-        log.info("renew text not sent: the recipient is outside the WhatsApp window")
+        log.info("renew text not sent: no admin to send it to")
     await runs.finish(conn, started, API_AGENT, "completed", reason)
     return started
 

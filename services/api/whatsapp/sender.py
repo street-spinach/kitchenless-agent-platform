@@ -233,11 +233,16 @@ TEXTS: dict[str, str] = {
     # The /me pages (experience §8).
     "me_link": "Here's your page. The link works for 10 minutes: {link}",
     # Identity-authz §12 (I26), §5: the reply to a phone that is not registered, the renew
-    # text (its `{link}` is issued at send time, `WhatsAppOut.link`) and the revoke notice.
-    # Experience X15 (EX-A15) rewords the last two and adds their Renew button.
+    # text and the revoke notice. The last two carry a Renew button (`me:renew`) and
+    # `ref = {grant, <grant_id>}` (experience §6, EX-A15, EX-I19).
     "unknown_number": "This number isn't registered yet.",
-    "consent_renewal": "Your agent's permission has ended. Tap to renew: {link}",
-    "consent_revoked": "{agent} stopped. Orders not yet placed won't go ahead.{placed_line}",
+    "consent_renewal": (
+        "Your agents' access has ended. Tap Renew and I'll send you a sign-in link."
+    ),
+    "consent_revoked": (
+        "{agent} stopped. Orders not yet placed won't go ahead.{placed_line} "
+        "Tap Renew and I'll send you a sign-in link."
+    ),
     # Held items (experience §5).
     "held_cancelled_line": (
         "While you were away, the order for {amount} was cancelled because it wasn't "
