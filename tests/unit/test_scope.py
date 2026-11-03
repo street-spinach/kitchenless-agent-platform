@@ -69,6 +69,8 @@ ALLOWLIST: dict[str, str] = {
     "services/mcp/seller.py": "unscoped:seller_server",
     "services/safety/addresses.py": "unscoped:addresses",
     "services/safety/limits.py": "unscoped:limits",
+    # EX-I23: the viewer's role, approver flag and adult count through `scope.scoped`.
+    "services/safety/visibility.py": SCOPED,
 }
 
 # EX-I46: the owner API's files. Their SQL on `ORG_TABLES` goes through `scope.org_scoped`.
