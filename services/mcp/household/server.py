@@ -469,6 +469,7 @@ async def _start_approval_wait(
                 {"payload": ids.approval_button(approval_id, "approved"), "title": "Approve"},
                 {"payload": ids.approval_button(approval_id, "rejected"), "title": "Reject"},
             ],
+            "ref": {"kind": "approval", "id": str(approval_id)},
         },
     )
 
