@@ -49,6 +49,7 @@ from services.common.protocol import schemas
 from services.common.protocol.a2a import AgentMessageRow, QuoteRow, to_a2a_message
 from services.common.protocol.catalog import render_summary
 from services.mocks import control
+from services.safety.scope import unscoped
 
 __all__ = [
     "DETAIL_TYPES",
@@ -190,7 +191,7 @@ async def _shortfall_event(
     if order_id is None:
         return _error(400, "shortfall params.order_id must be a uuid")
     async with request.app.state.connect() as conn, conn.transaction():
-        async with conn.cursor(row_factory=dict_row) as cur:
+        async with unscoped(conn, "panel").cursor(row_factory=dict_row) as cur:
             await cur.execute(_SHORTFALL_ORDER_SQL, (order_id,))
             order = await cur.fetchone()
         if order is None:
@@ -199,7 +200,7 @@ async def _shortfall_event(
             return _error(400, f"order {order_id} is not in env {env!r}")
         if order["state"] != "courier_booked":
             return _error(409, f"order {order_id} is {order['state']}, not courier_booked")
-        cur = await conn.execute(_SHORTFALL_EXISTS_SQL, {"order_id": order_id})
+        cur = await unscoped(conn, "panel").execute(_SHORTFALL_EXISTS_SQL, {"order_id": order_id})
         if await cur.fetchone() is not None:
             return _error(409, f"order {order_id} already has a shortfall")
         if target != order["seller_agent_id"]:
@@ -318,7 +319,10 @@ async def runs_live(request: Request) -> JSONResponse:
         return _error(400, "limit must be an integer")
     if not 1 <= limit <= LIVE_LIMIT_MAX:
         return _error(400, f"limit must be 1 to {LIVE_LIMIT_MAX}")
-    async with request.app.state.connect() as conn, conn.cursor(row_factory=dict_row) as cur:
+    async with (
+        request.app.state.connect() as conn,
+        unscoped(conn, "panel").cursor(row_factory=dict_row) as cur,
+    ):
         await cur.execute(_LIVE_SQL, {"run_id": run_id, "limit": limit})
         rows = await cur.fetchall()
     runs: dict[str, dict[str, list[dict[str, Any]]]] = {}
@@ -351,7 +355,7 @@ async def _quote(conn: AsyncConnection, body: dict[str, Any]) -> QuoteRow | None
     quote_id = _uuid(body.get("quote_id")) if body.get("quote_id") else None
     if quote_id is None:
         return None
-    async with conn.cursor(row_factory=dict_row) as cur:
+    async with unscoped(conn, "panel").cursor(row_factory=dict_row) as cur:
         await cur.execute(_QUOTE_SQL, (quote_id,))
         row = await cur.fetchone()
     return None if row is None else QuoteRow(**row)
@@ -362,7 +366,7 @@ async def message_detail(request: Request) -> JSONResponse:
     if message_id is None:
         return _error(404, "unknown message")
     async with request.app.state.connect() as conn:
-        async with conn.cursor(row_factory=dict_row) as cur:
+        async with unscoped(conn, "panel").cursor(row_factory=dict_row) as cur:
             await cur.execute(_MESSAGE_SQL, (message_id,))
             msg = await cur.fetchone()
         if msg is None:
@@ -578,7 +582,7 @@ async def evals_page(request: Request) -> HTMLResponse:
     """`GET /panel/evals` (evals.md §14): HTML, no JavaScript."""
     async with request.app.state.connect() as conn:
         try:
-            async with conn.cursor(row_factory=dict_row) as cur:
+            async with unscoped(conn, "panel").cursor(row_factory=dict_row) as cur:
                 await cur.execute(_EVAL_ROWS_SQL, {"days": EVAL_WINDOW_DAYS})
                 rows = await cur.fetchall()
                 await cur.execute(_EVAL_STALE_SQL, {"hours": EVAL_STALE_HOURS})
@@ -677,7 +681,10 @@ async def experience(request: Request) -> Response:
     household = request.query_params.get("household")
     if not household:
         return _error(400, "household is required")
-    async with request.app.state.connect() as conn, conn.cursor(row_factory=dict_row) as cur:
+    async with (
+        request.app.state.connect() as conn,
+        unscoped(conn, "panel").cursor(row_factory=dict_row) as cur,
+    ):
         await cur.execute(_EXPERIENCE_HOUSEHOLD_SQL, (household,))
         found = await cur.fetchone()
         if found is None:

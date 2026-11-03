@@ -17,6 +17,7 @@ from psycopg.rows import dict_row
 from services.common import db
 from services.common.trace import TraceStore
 from services.safety.guard import GuardContext, GuardRefused
+from services.safety.scope import unscoped
 
 __all__ = ["PURPOSE", "Address", "resolve"]
 
@@ -46,7 +47,7 @@ async def resolve(
     Refuses with `authz_denied` unless `orders.delivery_agent_id = ctx.agent_id` and
     `orders.address_ref = address_ref`. Writes the `data_share` trace row in `conn`.
     """
-    async with conn.cursor(row_factory=dict_row) as cur:
+    async with unscoped(conn, "addresses").cursor(row_factory=dict_row) as cur:
         await cur.execute(
             "SELECT o.delivery_agent_id, o.address_ref AS order_address_ref,"
             " a.address_ref, a.line1, a.line2, a.city, a.region, a.postal_code, a.country,"

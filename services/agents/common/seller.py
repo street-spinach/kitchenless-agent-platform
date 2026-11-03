@@ -84,6 +84,7 @@ from services.common.consumer import (
 from services.common.directory import AgentCard
 from services.common.mcp_client import ToolRefused
 from services.common.run_context import RunContext
+from services.safety.scope import unscoped
 
 __all__ = [
     "A2A_DEMO_BUYER",
@@ -1053,7 +1054,10 @@ class PgSellerStore:
     async def _one(self, sql: str, params: tuple[Any, ...]) -> dict[str, Any] | None:
         from psycopg.rows import dict_row
 
-        async with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        async with (
+            self._pool.connection() as conn,
+            unscoped(conn, "seller_agent").cursor(row_factory=dict_row) as cur,
+        ):
             await cur.execute(sql, params)
             return await cur.fetchone()
 
@@ -1074,7 +1078,10 @@ class PgSellerStore:
     async def courier_quotes(self, order_id: UUID, store: str) -> list[CourierQuote]:
         from psycopg.rows import dict_row
 
-        async with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        async with (
+            self._pool.connection() as conn,
+            unscoped(conn, "seller_agent").cursor(row_factory=dict_row) as cur,
+        ):
             await cur.execute(
                 "SELECT q.quote_id, q.conversation_id, q.seller_agent_id, q.total_minor,"
                 " q.currency, q.expires_at, q.status, q.items->'window' AS window"
@@ -1097,7 +1104,10 @@ class PgSellerStore:
     async def rules(self, agent_id: str) -> dict[str, Any]:
         from psycopg.rows import dict_row
 
-        async with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        async with (
+            self._pool.connection() as conn,
+            unscoped(conn, "seller_agent").cursor(row_factory=dict_row) as cur,
+        ):
             await cur.execute(
                 "SELECT kind, value FROM business_rules WHERE agent_id = %s ORDER BY kind",
                 (agent_id,),
@@ -1114,7 +1124,10 @@ class PgSellerStore:
     async def order_lines(self, order_id: UUID) -> list[dict[str, Any]]:
         from psycopg.rows import dict_row
 
-        async with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        async with (
+            self._pool.connection() as conn,
+            unscoped(conn, "seller_agent").cursor(row_factory=dict_row) as cur,
+        ):
             await cur.execute(
                 "SELECT line, sku, name, qty, unit_minor, substituted_for FROM order_items"
                 " WHERE order_id = %s ORDER BY line",

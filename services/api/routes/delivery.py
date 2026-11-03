@@ -23,6 +23,7 @@ from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 
 from services.common import ids, orders, outbox, runs
+from services.safety.scope import unscoped
 
 __all__ = [
     "API_AGENT",
@@ -68,7 +69,7 @@ RETURNING shortfall_id
 
 async def _close_shortfall(conn: AsyncConnection, order: dict[str, Any]) -> None:
     """Close the order's pending shortfall, if any, and send `shortfall_closed`."""
-    cur = await conn.execute(_CLOSE_SHORTFALL_SQL, (order["order_id"],))
+    cur = await unscoped(conn, "delivery_route").execute(_CLOSE_SHORTFALL_SQL, (order["order_id"],))
     row = await cur.fetchone()
     if row is None:
         return
@@ -128,7 +129,7 @@ async def apply_delivery_status(
         raise UnknownStatus(f"unknown courier status {status!r}")
     target = orders.COURIER_STATUS_MAP[status]
     async with conn.transaction():
-        async with conn.cursor(row_factory=dict_row) as cur:
+        async with unscoped(conn, "delivery_route").cursor(row_factory=dict_row) as cur:
             await cur.execute(_ORDER_SQL, (external_delivery_id,))
             order = await cur.fetchone()
         if order is None:

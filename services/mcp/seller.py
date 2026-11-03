@@ -46,6 +46,7 @@ from services.mcp.meta import CallContext, tool_error, tool_errors
 from services.mcp.traced import Tool, traced
 from services.safety import limits
 from services.safety.guard import GuardRefused, run_guarded
+from services.safety.scope import unscoped
 
 __all__ = [
     "AUTHZ_DENIED",
@@ -308,7 +309,7 @@ class SellerTools:
                 household_agent_id=f"household:{order['household_id']}",
                 picks=given,
             )
-            cur = await conn.execute(
+            cur = await unscoped(conn, "seller_server").execute(
                 "SELECT lines, status FROM shortfalls WHERE shortfall_id = %s", (shortfall_id,)
             )
             lines, status = await cur.fetchone() or (None, None)
@@ -368,7 +369,7 @@ class SellerTools:
                 raise RuntimeError(f"order {order_id} left courier_booked during amend_order")
             if applied.items_hash != result["items_hash"]:
                 raise RuntimeError(f"order {order_id} changed during amend_order")
-            cur = await conn.execute(
+            cur = await unscoped(conn, "seller_server").execute(
                 "UPDATE shortfalls SET status = 'applied'"
                 " WHERE shortfall_id = %s AND status = 'closed'",
                 (shortfall_id,),
@@ -405,7 +406,7 @@ def _wire_line(row: Mapping[str, Any]) -> dict[str, Any]:
 
 async def _order(conn: AsyncConnection, order_id: uuid.UUID) -> dict[str, Any]:
     """The order, its household's zone and its lines; refused when it does not exist."""
-    async with conn.cursor(row_factory=dict_row) as cur:
+    async with unscoped(conn, "seller_server").cursor(row_factory=dict_row) as cur:
         await cur.execute(
             "SELECT o.run_id, o.household_id, o.state, o.seller_agent_id, o.delivery_agent_id,"
             " o.external_order_id, o.items_hash, o.currency, h.zone_id FROM orders o"

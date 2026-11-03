@@ -37,6 +37,7 @@ from services.common.directory import AgentCard
 from services.common.mcp_client import ToolRefused
 from services.common.protocol.schemas import Window
 from services.common.run_context import RunContext
+from services.safety.scope import unscoped
 
 __all__ = [
     "AREA",
@@ -358,7 +359,10 @@ class PgCourierStore:
     async def _one(self, sql: str, params: tuple[Any, ...]) -> dict[str, Any] | None:
         from psycopg.rows import dict_row
 
-        async with self._pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        async with (
+            self._pool.connection() as conn,
+            unscoped(conn, "delivery_handler").cursor(row_factory=dict_row) as cur,
+        ):
             await cur.execute(sql, params)
             return await cur.fetchone()
 

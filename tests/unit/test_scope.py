@@ -5,8 +5,8 @@ for SQL that names a household-owned table. A file that has some must be in `ALL
 
 *   `unscoped:<reason>`: a caller §8 classifies as having no household context. The file
     must route its queries through `unscoped(conn, "<reason>")`.
-*   `not moved`: a caller not yet moved to `scope.scoped` (identity-authz I39, step 12).
-    This list only shrinks; by step 12 it holds no `not moved` entries.
+*   `not moved` was the entry of a caller not yet moved; since identity-authz step 12
+    (I39, #127) it is refused, so every entry is `unscoped:<reason>` or `scoped`.
 *   `scoped`: a file whose household SQL all goes through `scope.scoped`. Every string
     in it that names a household table must bind `%(household)s`, and it never calls
     `unscoped`.
@@ -28,7 +28,6 @@ from services.safety.guard import GuardRefused
 from tests.unit import identity_world as w
 
 ROOTS = ("services", "evals")
-NOT_MOVED = "not moved"
 SCOPED = "scoped"
 
 ALLOWLIST: dict[str, str] = {
@@ -48,25 +47,28 @@ ALLOWLIST: dict[str, str] = {
     "services/api/routes/me.py": SCOPED,
     # The eval runner reads one run's rows by run_id (agent-protocol P38), eval only.
     "evals/run.py": "unscoped:evals.run",
-    # Not yet moved to `scope.scoped` (I39, step 12).
-    "services/agents/a2a/demo.py": NOT_MOVED,
-    "services/agents/common/seller.py": NOT_MOVED,
-    "services/agents/consumer/graph.py": NOT_MOVED,
-    "services/agents/delivery/handler.py": NOT_MOVED,
-    "services/agents/household/graph.py": NOT_MOVED,
-    "services/api/routes/delivery.py": NOT_MOVED,
-    "services/api/routes/panel.py": NOT_MOVED,
-    "services/api/routes/runs.py": NOT_MOVED,
-    "services/api/whatsapp/sender.py": NOT_MOVED,
-    "services/api/whatsapp/status.py": NOT_MOVED,
-    "services/api/whatsapp/templates.py": NOT_MOVED,
-    "services/common/orders.py": NOT_MOVED,
-    "services/common/protocol/check.py": NOT_MOVED,
-    "services/mcp/delivery/server.py": NOT_MOVED,
-    "services/mcp/household/server.py": NOT_MOVED,
-    "services/mcp/seller.py": NOT_MOVED,
-    "services/safety/addresses.py": NOT_MOVED,
-    "services/safety/limits.py": NOT_MOVED,
+    # I39 step 12: the last callers moved off the "not moved" list. Shared helpers and
+    # callers keyed by an order, run, message or person id, with no `HouseholdScope` at
+    # hand, are `unscoped(conn, reason)`; the household MCP server binds every household
+    # query to the run's household through `scope.scoped`.
+    "services/agents/a2a/demo.py": "unscoped:a2a_demo",
+    "services/agents/common/seller.py": "unscoped:seller_agent",
+    "services/agents/consumer/graph.py": "unscoped:consumer_graph",
+    "services/agents/delivery/handler.py": "unscoped:delivery_handler",
+    "services/agents/household/graph.py": "unscoped:household_graph",
+    "services/api/routes/delivery.py": "unscoped:delivery_route",
+    "services/api/routes/panel.py": "unscoped:panel",
+    "services/api/routes/runs.py": "unscoped:runs_route",
+    "services/api/whatsapp/sender.py": "unscoped:whatsapp_sender",
+    "services/api/whatsapp/status.py": "unscoped:whatsapp_status",
+    "services/api/whatsapp/templates.py": "unscoped:whatsapp_templates",
+    "services/common/orders.py": "unscoped:orders",
+    "services/common/protocol/check.py": "unscoped:protocol_check",
+    "services/mcp/delivery/server.py": "unscoped:delivery_server",
+    "services/mcp/household/server.py": SCOPED,
+    "services/mcp/seller.py": "unscoped:seller_server",
+    "services/safety/addresses.py": "unscoped:addresses",
+    "services/safety/limits.py": "unscoped:limits",
 }
 
 # SQL built from a table-name variable cannot be checked, so it fails the scan unless
@@ -74,7 +76,7 @@ ALLOWLIST: dict[str, str] = {
 # and the protocol check's, which are allowlisted above).
 TABLE_VARIABLE_ALLOWLIST: dict[str, str] = {
     "services/seed/__main__.py": "_upsert over every seeded table (unscoped:seed)",
-    "services/common/protocol/check.py": "row lookups by table (not moved)",
+    "services/common/protocol/check.py": "row lookups by table (unscoped:protocol_check)",
     "services/mcp/square_seller.py": "catalog_items or menu_items",
     "services/mocks/stores.py": "catalog_items or menu_items",
 }
@@ -160,7 +162,8 @@ def test_scoped_tables_only_via_helper() -> None:
             ]
             assert unbound == [], (path, unbound)
         else:
-            assert entry == NOT_MOVED, (path, entry)
+            # Step 12 (#127): no `not moved` entry, or any other kind, is left.
+            raise AssertionError((path, entry))
 
 
 def test_unscoped_reasons_are_allowlisted() -> None:

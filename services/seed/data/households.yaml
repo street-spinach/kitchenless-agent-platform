@@ -18,6 +18,8 @@ households:
     env: live
     <<: *us
     weekly_budget_minor: 15000
+    # The admin's per-order band (identity-authz §9, I27): above it, an order needs approval.
+    per_order_minor: 10000
     address: &addr
       line1: 100 Main Street
       city: Cincinnati

@@ -20,6 +20,7 @@ from pydantic import ValidationError
 from services.api.whatsapp import templates
 from services.api.whatsapp.sender import OUTSIDE_WINDOW_CODE
 from services.common.protocol.schemas import WhatsAppOut
+from services.safety.scope import unscoped
 
 __all__ = ["FAILED", "STATUSES", "record"]
 
@@ -61,7 +62,7 @@ async def record(conn: AsyncConnection, statuses: Iterable[object]) -> None:
             log.info("whatsapp status: skipped %r", value)
             continue
         async with conn.transaction():
-            async with conn.cursor(row_factory=dict_row) as cur:
+            async with unscoped(conn, "whatsapp_status").cursor(row_factory=dict_row) as cur:
                 await cur.execute(_UPDATE_SQL, (value, graph_id))
                 send = await cur.fetchone()
             if send is None:
@@ -80,6 +81,6 @@ async def _hold(conn: AsyncConnection, send: dict[str, Any]) -> None:
     ref = body.get("ref") or {}
     if not templates.holdable(body["template"], ref.get("kind")):
         return
-    await conn.execute(
+    await unscoped(conn, "whatsapp_status").execute(
         _HOLD_SQL, (send["message_id"], send["user_id"], Jsonb(body), ref["kind"], ref["id"])
     )

@@ -503,6 +503,44 @@ def approval_requested_if_over_budget(trace: Trace, case: dict, *, db: Db) -> Re
 
 
 @_declare(invariant=True)
+def approval_requested_if_over_band(trace: Trace, case: dict, *, db: Db) -> Result:
+    """Identity-authz I35, §9: an approval naming the `band` limit (`approvals.limits`)
+    exists if and only if the chosen total (the last `authorize_spend` call) was above the
+    household's `approval_rules.per_order_minor`. An over-band order has exactly one
+    approval (one prompt, whichever limits it names). A household with no band fails
+    closed: the case would test nothing."""
+    tables, err = _table(db, "runs", "approval_rules", "approvals")
+    if err:
+        return False, err
+    household = _run_household(tables)
+    bands = [
+        r.get("per_order_minor")
+        for r in tables["approval_rules"]
+        if r.get("household_id") == household
+    ]
+    if not bands or bands[0] is None:
+        return False, f"no band (per_order_minor) for the run's household {household}"
+    band = int(bands[0])
+    calls = _tool_rows(trace, "tool_call", "authorize_spend")
+    if not calls:
+        return False, "no authorize_spend call: no chosen total"
+    total = (calls[-1]["payload"].get("args") or {}).get("total") or {}
+    chosen = total.get("amount_minor")
+    if not isinstance(chosen, int):
+        return False, "authorize_spend call has no total"
+    over = chosen > band
+    approvals = tables["approvals"]
+    naming_band = [a for a in approvals if "band" in (a.get("limits") or [])]
+    detail = (
+        f"chosen {chosen}, band {band}, {len(approvals)} approval(s),"
+        f" {len(naming_band)} naming the band"
+    )
+    if over:
+        return len(approvals) == 1 and len(naming_band) == 1, detail
+    return not naming_band, detail
+
+
+@_declare(invariant=True)
 def total_within_budget(trace: Trace, case: dict, *, db: Db) -> Result:
     """The placed total is within the remaining budget, or an `approved` approval exists."""
     tables, err = _table(db, "runs", "budgets")
@@ -1222,6 +1260,7 @@ CHECKS: dict[str, Check] = {
     "approval_refused_for": approval_refused_for,
     # Identity-authz I35.
     "no_tool_call": no_tool_call,
+    "approval_requested_if_over_band": approval_requested_if_over_band,
     # Agent-protocol P37.
     "no_expired_quote_accepted": no_expired_quote_accepted,
     "requoted_after_expiry": requoted_after_expiry,
