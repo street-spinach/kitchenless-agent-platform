@@ -16,6 +16,8 @@ DATA = REPO / "services/seed/data"
 
 CERT = "${AGENT_SIGNING_CERT}"
 CALLBACK = "https://${DOMAIN}/me/callback"
+OWNER_REDIRECT = "https://${DOMAIN}/owner/auth"
+OWNER_ORIGIN = "https://${DOMAIN}"
 AUDIENCE_MAPPER = "oidc-audience-mapper"
 CONSUMER_SCOPES = {"constraints:read", "pantry:read", "meals:plan"}
 HOUSEHOLD_SCOPES = {
@@ -175,3 +177,16 @@ def test_realm_file_shape() -> None:
     assert {o["org_id"] for o in agents["owners"]} == {
         org["org_id"] for org in agents["organizations"]
     }
+
+
+def test_owner_app_redirect_and_origin() -> None:
+    """experience.md EX-I44: the owner app signs in by PKCE at /owner/auth, and only there."""
+    realm = json.loads(REALM.read_text())
+    owner = {c["clientId"]: c for c in realm["clients"]}["owner-app"]
+    assert owner["redirectUris"] == [OWNER_REDIRECT]
+    assert owner["webOrigins"] == [OWNER_ORIGIN]
+    assert owner["publicClient"] is True
+    assert owner["standardFlowEnabled"] is True
+    assert owner["implicitFlowEnabled"] is False
+    assert owner["directAccessGrantsEnabled"] is False
+    assert owner["attributes"]["pkce.code.challenge.method"] == "S256"
