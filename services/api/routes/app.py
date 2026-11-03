@@ -9,11 +9,14 @@
 *   `POST /app/rules` with `{max_discount_pct: int 0-100}` writes a `business_rules` row of
     kind `max_discount_pct` for each of the org's grocery and restaurant cards, and one
     `owner_rule_changed` audit row. The rule raises the handlers' floors (I33).
+*   `GET /app/orders?summary=0|1` and `GET /app/notices?limit=N` (experience.md §11,
+    EX-I47) read through `scope.org_scoped` in `owner_views.py`. They name no household.
 
 Other `/app/*` paths stay reserved (`reserved.py`) until the experience design builds them.
 """
 
 import asyncio
+from datetime import UTC, datetime
 from typing import Any
 
 from psycopg import AsyncConnection
@@ -22,14 +25,17 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
+from services.api import owner_views
 from services.identity import audit, fga, tokens
 from services.identity.errors import AuthzUnavailable, IdentityUnavailable, TokenRefused
+from services.safety import scope
 
-__all__ = ["RULE_KIND", "routes"]
+__all__ = ["NOTICES_DEFAULT", "RULE_KIND", "routes"]
 
 RULE_KIND = "max_discount_pct"
 SELLER_CLASSES = ("grocery", "restaurant")
 _BEARER = "bearer "
+NOTICES_DEFAULT = 20
 
 
 def _bearer(request: Request) -> str:
@@ -65,13 +71,43 @@ async def _current(conn: AsyncConnection, agents: list[str]) -> int | None:
     return None if row is None or row[0] is None else int(row[0])
 
 
-async def rules(request: Request) -> Response:
+def _owner_sub(request: Request) -> str | Response:
+    """The owner's subject from the bearer token, or the 401/503 response."""
     try:
-        sub = tokens.validate_owner(_bearer(request))
+        return tokens.validate_owner(_bearer(request))
     except TokenRefused as e:
         return JSONResponse({"error": e.reason}, status_code=401)
     except IdentityUnavailable:
         return JSONResponse({"error": "identity_unavailable"}, status_code=503)
+
+
+async def _owner_check(sub: str, org_id: str) -> Response | None:
+    """§10: `user owner org:<o>` before anything else; an outage is never a pass."""
+    try:
+        allowed, _ = await asyncio.to_thread(fga.check, f"user:{sub}", "owner", f"org:{org_id}")
+    except AuthzUnavailable:
+        return JSONResponse({"error": "authz_unavailable"}, status_code=503)
+    if not allowed:
+        return JSONResponse({"error": "authz_denied"}, status_code=403)
+    return None
+
+
+async def _org(request: Request) -> scope.OrgScope | Response:
+    """The checked organisation of a read request, or the refusal."""
+    sub = _owner_sub(request)
+    if isinstance(sub, Response):
+        return sub
+    org_id = request.query_params.get("org_id", "")
+    if not org_id:
+        return JSONResponse({"error": "org_id is required"}, status_code=400)
+    refused = await _owner_check(sub, org_id)
+    return refused if refused is not None else scope.OrgScope(org_id)
+
+
+async def rules(request: Request) -> Response:
+    sub = _owner_sub(request)
+    if isinstance(sub, Response):
+        return sub
     org_id = request.query_params.get("org_id", "")
     if not org_id:
         return JSONResponse({"error": "org_id is required"}, status_code=400)
@@ -86,13 +122,9 @@ async def rules(request: Request) -> Response:
             return JSONResponse(
                 {"error": f"{RULE_KIND} must be an integer from 0 to 100"}, status_code=400
             )
-    # §10: `user owner org:<o>` before anything else.
-    try:
-        allowed, _ = await asyncio.to_thread(fga.check, f"user:{sub}", "owner", f"org:{org_id}")
-    except AuthzUnavailable:
-        return JSONResponse({"error": "authz_unavailable"}, status_code=503)
-    if not allowed:
-        return JSONResponse({"error": "authz_denied"}, status_code=403)
+    refused = await _owner_check(sub, org_id)
+    if refused is not None:
+        return refused
 
     async with request.app.state.connect() as conn:
         agents = await _seller_agents(conn, org_id)
@@ -124,4 +156,35 @@ async def rules(request: Request) -> Response:
     return JSONResponse({"org_id": org_id, RULE_KIND: value})
 
 
-routes = [Route("/app/rules", rules, methods=["GET", "POST"])]
+async def orders(request: Request) -> Response:
+    flag = request.query_params.get("summary", "0")
+    if flag not in ("0", "1"):
+        return JSONResponse({"error": "summary must be 0 or 1"}, status_code=400)
+    org = await _org(request)
+    if isinstance(org, Response):
+        return org
+    async with request.app.state.connect() as conn:
+        if flag == "1":
+            day = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+            return JSONResponse(await owner_views.summary(conn, org, day))
+        return JSONResponse({"orders": await owner_views.orders(conn, org)})
+
+
+async def notices(request: Request) -> Response:
+    raw = request.query_params.get("limit", str(NOTICES_DEFAULT))
+    if not raw.isdigit() or not 1 <= int(raw) <= owner_views.MAX_ROWS:
+        return JSONResponse(
+            {"error": f"limit must be 1 to {owner_views.MAX_ROWS}"}, status_code=400
+        )
+    org = await _org(request)
+    if isinstance(org, Response):
+        return org
+    async with request.app.state.connect() as conn:
+        return JSONResponse({"notices": await owner_views.notices(conn, org, int(raw))})
+
+
+routes = [
+    Route("/app/rules", rules, methods=["GET", "POST"]),
+    Route("/app/orders", orders, methods=["GET"]),
+    Route("/app/notices", notices, methods=["GET"]),
+]
