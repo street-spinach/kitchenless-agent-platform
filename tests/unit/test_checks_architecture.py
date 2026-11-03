@@ -144,7 +144,20 @@ def test_new_checks_declare_invariant(name: str) -> None:
 
 def test_completion_checks_are_the_progress_checks() -> None:
     completion = {n for n in NEW_CHECKS if not checks.CHECKS[n].invariant}
-    assert completion == {"run_status", "requoted_after_expiry"}
+    # Architecture item 66 and P37, plus the completion checks of evals.md §12.
+    assert completion == {
+        "run_status",
+        "requoted_after_expiry",
+        "learned_dislike",
+        "reply_template",
+        "constraints_requests_sent",
+        "counter_amount_equals_remaining",
+        "chosen_offer_covers_all",
+        "explanation_within_limits",
+        "decision_rows_present",
+        "chose_earliest_window",
+        "approval_requested",
+    }
 
 
 def test_model_judge_not_built() -> None:
