@@ -76,6 +76,18 @@ ALLOWLIST: dict[str, str] = {
 # EX-I46: the owner API's files. Their SQL on `ORG_TABLES` goes through `scope.org_scoped`.
 ORG_FILES = ("services/api/routes/app.py", "services/api/owner_views.py")
 
+# experience.md EX-A11 (EX-I9): reasons a file may use besides its `ALLOWLIST` entry. A
+# `scoped` file may use only these. A path that does not exist yet is skipped until it does.
+EXTRA_REASONS: dict[str, frozenset[str]] = {
+    # The join-code lookup by code, and the held-message release by user (EX-I32, EX-I19).
+    "services/api/ingest.py": frozenset({"join_lookup", "held_release"}),
+    # `propose_setup`'s phone check, yes/no only (EX-I26).
+    "services/mcp/household/server.py": frozenset({"setup_phone_check"}),
+    # The sweeper's reminder pass (EX-I41).
+    "services/agents/reminders.py": frozenset({"reminder_pass"}),
+}
+DESIGN_EXTRA_REASONS = {"join_lookup", "held_release", "setup_phone_check", "reminder_pass"}
+
 # SQL built from a table-name variable cannot be checked, so it fails the scan unless
 # listed here with the tables it can name (none of them household-owned, except the seed's
 # and the protocol check's, which are allowlisted above).
@@ -167,7 +179,7 @@ def test_scoped_tables_only_via_helper() -> None:
             assert reason in unscoped_reasons(Path(path).read_text()), (path, reason)
         elif entry == SCOPED:
             source = Path(path).read_text()
-            assert not unscoped_reasons(source), path
+            assert unscoped_reasons(source) <= EXTRA_REASONS.get(path, frozenset()), path
             unbound = [
                 s
                 for s in _strings(ast.parse(source))
@@ -180,12 +192,32 @@ def test_scoped_tables_only_via_helper() -> None:
 
 
 def test_unscoped_reasons_are_allowlisted() -> None:
-    """Every `unscoped(conn, reason)` in the code names its file's allowlisted reason."""
+    """Every `unscoped(conn, reason)` in the code names its file's allowlisted reason or one
+    of its `EXTRA_REASONS`."""
     for path in _py_files():
         reasons = unscoped_reasons(path.read_text())
-        if reasons:
-            assert ALLOWLIST.get(path.as_posix()) in {f"unscoped:{r}" for r in reasons}, path
-            assert len(reasons) == 1, (path, reasons)
+        if not reasons:
+            continue
+        entry = ALLOWLIST.get(path.as_posix(), "")
+        allowed = set(EXTRA_REASONS.get(path.as_posix(), frozenset()))
+        if entry.startswith("unscoped:"):
+            allowed.add(entry.removeprefix("unscoped:"))
+        assert reasons <= allowed, (path, reasons)
+
+
+def test_extra_reasons_match_design() -> None:
+    """EX-A11: the allowlist gains exactly these reasons, each in its one file."""
+    names = [r for reasons in EXTRA_REASONS.values() for r in reasons]
+    assert sorted(names) == sorted(DESIGN_EXTRA_REASONS)
+    # The new tables are household-scoped.
+    assert {
+        "join_codes",
+        "onboarding_proposals",
+        "held_messages",
+        "whatsapp_sends",
+        "reminders",
+        "meal_reactions",
+    } <= scope.HOUSEHOLD_TABLES
 
 
 def test_table_name_variables_refused() -> None:
