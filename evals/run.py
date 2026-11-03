@@ -34,7 +34,7 @@ from psycopg.types.json import Jsonb
 
 from evals.checks import CHECKS
 from services.agents.common.trace import read_trace
-from services.common import directory, ids
+from services.common import directory, ids, orders
 from services.common.protocol import render_summary
 from services.common.trace import TraceStore
 from services.safety.scope import Unscoped, unscoped
@@ -469,6 +469,8 @@ def drive(dsn: str, run_id: uuid.UUID, steps: list[Step], deadline: float) -> No
 # --- the read-only db snapshot (agent-protocol P38) -----------------------------------------
 
 _ORDERS = "SELECT order_id FROM orders WHERE run_id = %(run)s"
+_EVAL_HH = "SELECT household_id FROM households WHERE env = 'eval'"
+_EVAL_USERS = f"SELECT user_id FROM household_members WHERE household_id IN ({_EVAL_HH})"
 SNAPSHOT_SQL: dict[str, str] = {
     "agent_messages": "SELECT * FROM agent_messages WHERE run_id = %(run)s",
     "checkpoints": "SELECT * FROM checkpoints WHERE thread_id LIKE %(thread)s",
@@ -485,13 +487,36 @@ SNAPSHOT_SQL: dict[str, str] = {
     "mock_deliveries": "SELECT * FROM mock_deliveries WHERE external_delivery_id IN"
     " (SELECT external_delivery_id FROM orders WHERE run_id = %(run)s)",
     "sim_outbound": "SELECT * FROM sim_outbound WHERE run_id = %(run)s ORDER BY id",
+    # The checks of architecture item 66 and agent-protocol P37: the run row, the eval
+    # households' profile rows, and the sellers' floors and catalog allergens.
+    "runs": "SELECT * FROM runs WHERE run_id = %(run)s",
+    "household_members": f"SELECT * FROM household_members WHERE household_id IN ({_EVAL_HH})",
+    "users": "SELECT user_id, display_name, keycloak_sub FROM users"
+    f" WHERE user_id IN ({_EVAL_USERS})",
+    "channel_identities": f"SELECT * FROM channel_identities WHERE user_id IN ({_EVAL_USERS})",
+    "member_constraints": f"SELECT * FROM member_constraints WHERE user_id IN ({_EVAL_USERS})",
+    "household_addresses": f"SELECT * FROM household_addresses WHERE household_id IN ({_EVAL_HH})",
+    # `spent_other_minor`: this week's placed-or-later orders of other runs, so the remaining
+    # budget is `amount_minor - spent_other_minor` (orders.remaining_weekly_budget).
+    "budgets": "SELECT b.*, COALESCE((SELECT sum(o.total_minor) FROM orders o"
+    " WHERE o.household_id = b.household_id AND o.run_id <> %(run)s"
+    " AND o.state = ANY(%(placed)s) AND o.created_at >= (date_trunc('week', now() AT TIME ZONE"
+    " h.timezone) AT TIME ZONE h.timezone)), 0)::bigint AS spent_other_minor"
+    " FROM budgets b JOIN households h USING (household_id)"
+    f" WHERE b.period = 'weekly' AND b.household_id IN ({_EVAL_HH})",
+    "business_rules": "SELECT * FROM business_rules WHERE kind = 'floors' AND agent_id IN"
+    " (SELECT seller_agent_id FROM quotes WHERE run_id = %(run)s)",
+    "catalog_items": "SELECT agent_id, sku, allergens, diets FROM catalog_items WHERE agent_id IN"
+    " (SELECT seller_agent_id FROM orders WHERE run_id = %(run)s)",
+    "menu_items": "SELECT agent_id, sku, allergens, diets FROM menu_items WHERE agent_id IN"
+    " (SELECT seller_agent_id FROM orders WHERE run_id = %(run)s)",
 }
 
 
 def db_snapshot(dsn: str, run_id: uuid.UUID) -> Mapping[str, tuple[dict[str, Any], ...]]:
     """The run's rows, read in one read-only transaction. A table that does not exist is left
     out, so a check that needs it fails closed."""
-    params = {"run": run_id, "thread": f"%:{run_id}"}
+    params = {"run": run_id, "thread": f"%:{run_id}", "placed": list(orders.PLACED_OR_LATER)}
     tables: dict[str, tuple[dict[str, Any], ...]] = {}
     with psycopg.connect(dsn, row_factory=dict_row) as conn:
         conn.read_only = True
