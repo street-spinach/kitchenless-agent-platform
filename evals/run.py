@@ -3,9 +3,11 @@
 For each selected case and repeat: reset and seed mocks, start the scenario, drive the open
 run (`approve_as`, `inject`, `shortfall`; architecture item 65, agent-protocol P38), wait for
 an `outcome` trace event, then run the case's checks over the trace (and, for checks that take
-it, a read-only `db` snapshot of the run's rows). Writes
-evals/results/<timestamp>.json and .md and exits non-zero if a gated category falls below its
-threshold or the suite exceeds its token budget.
+it, a read-only `db` snapshot of the run's rows). Each attempt's verdict and the eval run's
+outcome come from `evals/outcome.py` (evals.md §5). Writes evals/results/<timestamp>.json (JSON
+v1, the field table in `evals/outcome.py`) and .md, prints the Markdown summary between
+`SUMMARY_BEGIN` and `SUMMARY_END`, and ends standard output with one `EVAL_STATUS` line. Exit
+codes: 0 pass or budget exhausted, 1 regression, 2 invalid cases, 3 infra or model unavailable.
 
 Cases follow the format of evals.md §4 and are validated before any attempt (exit 2). Flags
 (evals.md §5): `--tag`, `--category`, `--case`, `--cases-file`, `--all`, `--repeats`,
@@ -22,11 +24,12 @@ import json
 import os
 import sys
 import time
+import urllib.error
 import urllib.request
 import uuid
 from collections import Counter
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
@@ -37,6 +40,7 @@ import yaml
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from evals import outcome
 from evals.checks import CHECKS
 from services.agents.common.trace import read_trace
 from services.common import directory, ids, orders
@@ -102,6 +106,15 @@ DEFAULT_TEXT = {
 # Shortfall reply buttons are `sf:<shortfall_id>:<line>:<sku | drop>` (agent-protocol §10).
 SHORTFALL_BUTTON = "sf"
 
+# evals.md §5, "Standard output".
+SUMMARY_BEGIN = "<!-- EVAL_SUMMARY_BEGIN -->"
+SUMMARY_END = "<!-- EVAL_SUMMARY_END -->"
+STATUS_PREFIX = "EVAL_STATUS "
+RESULTS_SCHEMA = 1
+# A runner error after the agent run started is a failed invariant check, so it can never
+# become a skip (see the PR's Decisions).
+RUNNER_ERROR_CHECK = "runner_error"
+
 
 class CaseError(ValueError):
     pass
@@ -109,6 +122,9 @@ class CaseError(ValueError):
 
 @dataclass
 class RunResult:
+    """One attempt. `verdict` and `error_kind` come from `outcome.verdict`; `passed` is
+    `verdict == pass`. Built with only `passed`, it is a plain pass or a check failure."""
+
     case_id: str
     category: str
     repeat: int
@@ -119,6 +135,30 @@ class RunResult:
     reason: str | None = None
     checks: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
+    mode: str = "stub"
+    stopped: str | None = None
+    model_error: bool = False
+    models_used: list[str] = field(default_factory=list)
+    verdict: str | None = None
+    error_kind: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.verdict is None:
+            self.verdict = outcome.PASS if self.passed else outcome.FAIL
+            self.error_kind = outcome.NONE if self.passed else outcome.CHECK_FAILED
+
+    def judge(self) -> None:
+        """Set `verdict`, `error_kind` and `passed` from the attempt's facts."""
+        self.verdict, self.error_kind = outcome.verdict(
+            {
+                "mode": self.mode,
+                "stopped": self.stopped,
+                "reason": self.reason,
+                "checks": self.checks,
+                "model_error": self.model_error,
+            }
+        )
+        self.passed = self.verdict == outcome.PASS
 
 
 # --- cases and thresholds -------------------------------------------------------------------
@@ -724,38 +764,82 @@ def run_checks(
     case: dict[str, Any],
     db: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Run the case's checks; a check that takes `db` gets the read-only snapshot."""
+    """Run the case's checks; a check that takes `db` gets the read-only snapshot. Each result
+    carries the check's `invariant` declaration; an undeclared check is invariant (§5)."""
     results = []
     for item in case["expect"]:
         check = CHECKS[item["check"]]
-        args = dict(item.get("args") or {})
+        given = dict(item.get("args") or {})
+        args = dict(given)
         if _takes_db(check):
             args["db"] = db
         try:
             passed, detail = check(trace, case, **args)
         except Exception as err:
             passed, detail = False, f"check raised {type(err).__name__}: {err}"
-        results.append({"check": item["check"], "passed": passed, "detail": detail})
+        results.append(
+            {
+                "check": item["check"],
+                "args": given,
+                "invariant": getattr(check, "invariant", True) is not False,
+                "passed": bool(passed),
+                "detail": detail,
+            }
+        )
     return results
 
 
-def run_case(case: dict[str, Any], repeat: int, dsn: str, timeout: float) -> RunResult:
-    result = RunResult(case["id"], case["category"], repeat, passed=False)
+def is_infra(err: BaseException, stage: str) -> bool:
+    """Whether an error before the agent run started is infrastructure (evals.md §5): the
+    reset failed, `api` answered 5xx, or the connection failed."""
+    if isinstance(err, urllib.error.HTTPError):
+        return stage == "reset" or err.code >= 500
+    return isinstance(err, urllib.error.URLError | ConnectionError | TimeoutError)
+
+
+def run_case(
+    case: dict[str, Any], repeat: int, dsn: str, timeout: float, mode: str = "stub"
+) -> RunResult:
+    """One attempt. On a timeout the checks still run over the partial trace, so a failed
+    invariant check is `fail` whatever stopped the run (evals.md §5)."""
+    result = RunResult(case["id"], case["category"], repeat, passed=False, mode=mode)
     started = time.monotonic()
+    stage = "reset"
     try:
         reset_and_seed_mocks(case)
+        stage = "start"
         run_id = SCENARIOS[case["run"]](case)
+        stage = "run"
         result.run_id = str(run_id)
         deadline = time.monotonic() + timeout
         drive(dsn, run_id, run_steps(case, dsn, run_id), deadline)
-        trace = wait_for_outcome(dsn, run_id, max(0.0, deadline - time.monotonic()))
-        result.tokens = sum((r["tokens_in"] or 0) + (r["tokens_out"] or 0) for r in trace)
-        result.reason = [r for r in trace if r["kind"] == "outcome"][-1]["payload"].get("reason")
+        try:
+            trace = wait_for_outcome(dsn, run_id, max(0.0, deadline - time.monotonic()))
+        except TimeoutError as err:
+            result.stopped, result.error = outcome.TIMEOUT, f"TimeoutError: {err}"
+            trace = read_trace(dsn, run_id)
+        result.tokens = sum((r.get("tokens_in") or 0) + (r.get("tokens_out") or 0) for r in trace)
+        outcomes = [r for r in trace if r["kind"] == "outcome"]
+        result.reason = outcomes[-1]["payload"].get("reason") if outcomes else None
+        result.model_error = outcome.model_error(trace)
+        result.models_used = sorted({r["model"] for r in trace if r.get("model")})
         db = db_snapshot(dsn, run_id) if needs_db(case) else None
         result.checks = run_checks(trace, case, db)
-        result.passed = all(c["passed"] for c in result.checks)
     except Exception as err:
         result.error = f"{type(err).__name__}: {err}"
+        if stage != "run" and is_infra(err, stage):
+            result.stopped = outcome.INFRA
+        else:
+            result.checks.append(
+                {
+                    "check": RUNNER_ERROR_CHECK,
+                    "args": {},
+                    "invariant": True,
+                    "passed": False,
+                    "detail": result.error,
+                }
+            )
+    result.judge()
     result.seconds = round(time.monotonic() - started, 2)
     return result
 
@@ -763,70 +847,167 @@ def run_case(case: dict[str, Any], repeat: int, dsn: str, timeout: float) -> Run
 # --- reporting ------------------------------------------------------------------------------
 
 
-def summarize(results: list[RunResult], thresholds: dict[str, Any]) -> dict[str, Any]:
-    categories = {}
-    for name in sorted({r.category for r in results}):
-        runs = [r for r in results if r.category == name]
-        rule = thresholds["categories"][name]
-        rate = sum(r.passed for r in runs) / len(runs)
-        categories[name] = {
-            "runs": len(runs),
-            "passed": sum(r.passed for r in runs),
-            "pass_rate": round(rate, 4),
-            "min_pass_rate": rule["min_pass_rate"],
-            "gate": rule["gate"],
-            "ok": rate >= rule["min_pass_rate"],
-        }
-    budget = thresholds["budget"]
-    tokens = sum(r.tokens for r in results)
-    slow = sorted({r.case_id for r in results if r.seconds > budget["warn_seconds_per_scenario"]})
-    gate_failures = [n for n, c in categories.items() if c["gate"] and not c["ok"]]
-    over_budget = tokens > budget["max_tokens_per_suite"]
-    reason_counts = Counter(r.reason for r in results if r.reason is not None)
+def _attempt_facts(r: RunResult) -> dict[str, Any]:
     return {
-        "categories": categories,
-        "tokens": tokens,
-        "max_tokens_per_suite": budget["max_tokens_per_suite"],
-        "reason_counts": dict(sorted(reason_counts.items())),
-        "over_budget": over_budget,
-        "slow_cases": slow,
-        "gate_failures": gate_failures,
-        "passed": not gate_failures and not over_budget,
+        "category": r.category,
+        "verdict": r.verdict,
+        "error_kind": r.error_kind,
+        "tokens": r.tokens,
     }
 
 
+def summarize(
+    results: list[RunResult], thresholds: dict[str, Any], mode: str = "stub"
+) -> dict[str, Any]:
+    """Category rates, counts and the eval run outcome, all through `evals/outcome.py`."""
+    attempts = [_attempt_facts(r) for r in results]
+    budget = thresholds["budget"]
+    tokens = sum(r.tokens for r in results)
+    slow = sorted({r.case_id for r in results if r.seconds > budget["warn_seconds_per_scenario"]})
+    reason_counts = Counter(r.reason for r in results if r.reason is not None)
+    kinds = Counter(r.error_kind for r in results)
+    name, detail, exit_code = outcome.outcome(attempts, thresholds, mode)
+    return {
+        "categories": outcome.categories(attempts, thresholds),
+        "tokens": tokens,
+        "max_tokens_per_suite": budget["max_tokens_per_suite"],
+        "reason_counts": dict(sorted(reason_counts.items())),
+        "error_kind_counts": dict(sorted(kinds.items())),
+        "over_budget": tokens > budget["max_tokens_per_suite"],
+        "slow_cases": slow,
+        "gate_failures": outcome.gate_failures(attempts, thresholds, mode),
+        "outcome": name,
+        "outcome_detail": detail,
+        "exit_code": exit_code,
+        "passed": name == outcome.PASS,
+    }
+
+
+def _rate(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.0%}"
+
+
 def to_markdown(summary: dict[str, Any], results: list[RunResult]) -> str:
+    detail = f" ({summary['outcome_detail']})" if summary.get("outcome_detail") else ""
     lines = [
-        f"# Eval results: {'PASS' if summary['passed'] else 'FAIL'}",
+        f"# Eval results: {summary['outcome']}{detail}",
         "",
-        "| Category | Passed | Pass rate | Threshold | Gate | Status |",
-        "|---|---|---|---|---|---|",
+        "| Category | Pass | Fail | Skipped | Pass rate | Threshold | Gate | Status |",
+        "|---|---|---|---|---|---|---|---|",
     ]
     for name, c in summary["categories"].items():
-        status = "ok" if c["ok"] else ("FAIL" if c["gate"] else "below (not gating)")
+        if c["ok"] is None:
+            status = "no rate (all skipped)"
+        elif c["ok"]:
+            status = "ok"
+        else:
+            status = "FAIL" if name in summary["gate_failures"] else "below (not gating)"
         lines.append(
-            f"| {name} | {c['passed']}/{c['runs']} | {c['pass_rate']:.0%} | "
+            f"| {name} | {c['pass']} | {c['fail']} | {c['skipped']} | {_rate(c['pass_rate'])} | "
             f"{c['min_pass_rate']:.0%} | {'yes' if c['gate'] else 'no'} | {status} |"
         )
     lines += ["", f"Tokens: {summary['tokens']} / {summary['max_tokens_per_suite']}"]
     if summary["slow_cases"]:
         lines.append(f"Slow cases (warn): {', '.join(summary['slow_cases'])}")
-    failed = [r for r in results if not r.passed]
-    if failed:
-        lines += ["", "## Failed runs", ""]
-        for r in failed:
-            why = r.error or "; ".join(c["detail"] for c in r.checks if not c["passed"])
-            lines.append(f"- `{r.case_id}` repeat {r.repeat} (run {r.run_id}): {why}")
+    sections = (("Failed attempts", outcome.FAIL), ("Skipped attempts", outcome.SKIPPED))
+    for title, verdict in sections:
+        shown = [r for r in results if r.verdict == verdict]
+        if shown:
+            lines += ["", f"## {title}", ""]
+            for r in shown:
+                why = r.error or "; ".join(str(c["detail"]) for c in r.checks if not c["passed"])
+                lines.append(
+                    f"- `{r.case_id}` repeat {r.repeat} (run {r.run_id}, {r.error_kind}): {why}"
+                )
     return "\n".join(lines) + "\n"
+
+
+def results_json(summary: dict[str, Any], results: list[RunResult]) -> dict[str, Any]:
+    """The results JSON v1 (the field table in `evals/outcome.py`)."""
+    return {
+        "schema": RESULTS_SCHEMA,
+        "eval_run_id": summary.get("eval_run_id"),
+        "trigger": summary.get("trigger"),
+        "git_sha": summary.get("git_sha"),
+        "model_mode": summary.get("model_mode", "stub"),
+        "models": summary.get("models") or {"people": None, "business": None},
+        "started_at": summary.get("started_at"),
+        "finished_at": summary.get("finished_at"),
+        "outcome": summary["outcome"],
+        "outcome_detail": summary["outcome_detail"],
+        "exit_code": summary["exit_code"],
+        "selection": summary.get("selection") or list(dict.fromkeys(r.case_id for r in results)),
+        "categories": summary["categories"],
+        "tokens": summary["tokens"],
+        "max_tokens_per_suite": summary["max_tokens_per_suite"],
+        "reason_counts": summary["reason_counts"],
+        "error_kind_counts": summary["error_kind_counts"],
+        "history_write_errors": summary.get("history_write_errors", 0),
+        "attempts": [
+            {
+                "case_id": r.case_id,
+                "repeat": r.repeat,
+                "agent_run_ids": [r.run_id] if r.run_id else [],
+                "verdict": r.verdict,
+                "error_kind": r.error_kind,
+                "reason": r.reason,
+                "seconds": r.seconds,
+                "tokens": r.tokens,
+                "checks": [
+                    {
+                        "check": c["check"],
+                        "args": c.get("args") or {},
+                        "invariant": outcome.is_invariant(c),
+                        "passed": c["passed"],
+                        "detail": c.get("detail"),
+                    }
+                    for c in r.checks
+                ],
+                "models_used": list(r.models_used),
+            }
+            for r in results
+        ],
+    }
 
 
 def write_results(summary: dict[str, Any], results: list[RunResult], markdown: str) -> Path:
     RESULTS_DIR.mkdir(exist_ok=True)
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    payload = {"summary": summary, "runs": [asdict(r) for r in results]}
-    (RESULTS_DIR / f"{stamp}.json").write_text(json.dumps(payload, indent=2))
+    payload = results_json(summary, results)
+    (RESULTS_DIR / f"{stamp}.json").write_text(json.dumps(payload, indent=2, default=str))
     (RESULTS_DIR / f"{stamp}.md").write_text(markdown)
     return RESULTS_DIR / f"{stamp}.json"
+
+
+def status_line(summary: dict[str, Any], results: list[RunResult]) -> str:
+    """The last line of standard output (evals.md §5). `last_green_sha` is null until the
+    history of build step 5c exists."""
+    mode = summary.get("model_mode", "stub")
+    failed = sorted({r.case_id for r in results if r.verdict == outcome.FAIL})
+    real_safety_failed = mode == "real" and any(
+        r.category == outcome.SAFETY and r.verdict == outcome.FAIL for r in results
+    )
+    status = {
+        "outcome": summary["outcome"],
+        "detail": summary["outcome_detail"],
+        "exit_code": summary["exit_code"],
+        "eval_run_id": summary.get("eval_run_id"),
+        "mode": mode,
+        "trigger": summary.get("trigger"),
+        "git_sha": summary.get("git_sha"),
+        "last_green_sha": summary.get("last_green_sha"),
+        "failed_cases": failed,
+        "real_safety_failed": real_safety_failed,
+    }
+    return STATUS_PREFIX + json.dumps(status)
+
+
+def print_report(markdown: str, status: str) -> None:
+    """The summary between the markers, then the `EVAL_STATUS` line, last."""
+    print(SUMMARY_BEGIN)
+    print(markdown.rstrip("\n"))
+    print(SUMMARY_END)
+    print(status, flush=True)
 
 
 # --- entry point ----------------------------------------------------------------------------
@@ -863,46 +1044,74 @@ def repeats_for(
     return int(thresholds["categories"][case["category"]]["repeats"][mode])
 
 
+def _now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    run_info: dict[str, Any] = {
+        "eval_run_id": str(ids.new_eval_run_id()),
+        "trigger": args.trigger,
+        # Without --trigger the runner writes no history (evals.md §5); the GIT_SHA
+        # requirement, the history and `last_green_sha` come with build step 5c.
+        "git_sha": os.environ.get("GIT_SHA") or None,
+        "model_mode": args.mode,
+        "models": {"people": None, "business": None},
+        "last_green_sha": None,
+        "started_at": _now(),
+    }
     thresholds = load_thresholds()
+    invalid = None
     try:
         cases = load_cases(set(thresholds["categories"]))
         case_ids = (
             load_case_ids(args.cases_file, {c["id"] for c in cases}) if args.cases_file else None
         )
+        selected = select(
+            cases,
+            tag=args.tag,
+            category=args.category,
+            case_id=args.case_id,
+            all_cases=args.all_cases,
+            case_ids=case_ids,
+            mode=args.mode,
+        )
+        if not selected:
+            invalid = "No eval cases matched the selection."
     except CaseError as err:
-        print(f"Invalid eval case: {err}", file=sys.stderr)
-        return 2
-    selected = select(
-        cases,
-        tag=args.tag,
-        category=args.category,
-        case_id=args.case_id,
-        all_cases=args.all_cases,
-        case_ids=case_ids,
-        mode=args.mode,
-    )
-    if not selected:
-        print("No eval cases matched the selection.", file=sys.stderr)
-        return 2
+        invalid = f"Invalid eval case: {err}"
+    if invalid is not None:
+        print(invalid, file=sys.stderr)
+        name, detail, exit_code = outcome.outcome([], thresholds, args.mode, invalid=invalid)
+        summary = {
+            **run_info,
+            "outcome": name,
+            "outcome_detail": detail,
+            "exit_code": exit_code,
+        }
+        print_report(f"# Eval results: {name}\n\n{invalid}\n", status_line(summary, []))
+        return exit_code
 
     dsn = os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL)
     timeout = float(os.environ.get("EVAL_TIMEOUT_SECONDS", "300"))
     results = [
-        run_case(case, repeat, dsn, timeout)
+        run_case(case, repeat, dsn, timeout, mode=args.mode)
         for case in selected
         for repeat in range(1, repeats_for(case, thresholds, args.repeats, args.mode) + 1)
     ]
-    summary = summarize(results, thresholds)
-    # Without --trigger the runner writes no history (evals.md §5); the eval run's history
-    # and the GIT_SHA check come with build step 5c.
-    summary["model_mode"], summary["trigger"] = args.mode, args.trigger
+    summary = {
+        **summarize(results, thresholds, args.mode),
+        **run_info,
+        "selection": [c["id"] for c in selected],
+        "history_write_errors": 0,
+        "finished_at": _now(),
+    }
     markdown = to_markdown(summary, results)
     path = write_results(summary, results, markdown)
-    print(markdown)
     print(f"Results: {path}")
-    return 0 if summary["passed"] else 1
+    print_report(markdown, status_line(summary, results))
+    return int(summary["exit_code"])
 
 
 if __name__ == "__main__":
