@@ -617,6 +617,22 @@
      "contains": []
     }
    ]
+  },
+  {
+   "sku": "SQ-RICE-2LB",
+   "name": "Long grain white rice 2 lb",
+   "category": "rice",
+   "diets": [
+    "vegetarian",
+    "vegan"
+   ],
+   "ingredients": [
+    {
+     "name": "rice",
+     "allergens": [],
+     "contains": []
+    }
+   ]
   }
  ]
 }

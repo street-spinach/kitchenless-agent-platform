@@ -53,6 +53,9 @@ catalogs:
        diets: [vegetarian, vegan], price_minor: 279, pantry_item: bread}
     - {sku: SQ-BANANAS-2LB, name: Bananas 2 lb, ingredients: bananas, allergens: [],
        diets: [vegetarian, vegan], price_minor: 139, pantry_item: bananas}
+    - {sku: SQ-RICE-2LB, name: Long grain white rice 2 lb, brand: Valley,
+       ingredients: rice, allergens: [], diets: [vegetarian, vegan], price_minor: 259,
+       pantry_item: rice}
     - {sku: SQ-PASTA-1LB, name: Penne pasta 1 lb, brand: Valley,
        ingredients: durum wheat semolina, allergens: [gluten], diets: [vegetarian, vegan],
        price_minor: 189, pantry_item: pasta}
