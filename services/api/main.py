@@ -17,7 +17,16 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from services.api.connect import Connect, pool_connect
-from services.api.routes import hello, internal, me, panel, reserved, runs, whatsapp
+from services.api.routes import (
+    hello,
+    internal,
+    me,
+    owner_static,
+    panel,
+    reserved,
+    runs,
+    whatsapp,
+)
 from services.api.whatsapp.sender import GraphSender, Sender
 from services.common import db
 from services.common import logging as app_logging
@@ -47,6 +56,7 @@ def create_app(connect: Connect = pool_connect) -> Starlette:
             *whatsapp.routes,
             *panel.routes,
             *hello.routes,
+            *owner_static.routes,
         ]
     )
     app.state.connect = connect

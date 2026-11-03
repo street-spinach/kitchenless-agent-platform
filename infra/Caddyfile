@@ -22,6 +22,11 @@
 	handle /app/* {
 		reverse_proxy api:8000
 	}
+	# The owner app's web export, served by api (experience EX-I45).
+	redir /owner /owner/
+	handle /owner/* {
+		reverse_proxy api:8000
+	}
 	# Magic-link, consent and history pages on api (architecture item 57; identity-authz I-A14, routes/me.py).
 	handle /me/* {
 		reverse_proxy api:8000
