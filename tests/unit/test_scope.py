@@ -44,6 +44,8 @@ ALLOWLIST: dict[str, str] = {
     "services/mocks/control.py": "unscoped:control.reset",
     # Every household query through `scope.scoped` with the session's scope (I24).
     "services/api/routes/me.py": SCOPED,
+    # The eval runner reads one run's rows by run_id (agent-protocol P38), eval only.
+    "evals/run.py": "unscoped:evals.run",
     # Not yet moved to `scope.scoped` (I39, step 12).
     "services/agents/a2a/demo.py": NOT_MOVED,
     "services/agents/common/seller.py": NOT_MOVED,

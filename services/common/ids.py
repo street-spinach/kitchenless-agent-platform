@@ -230,6 +230,13 @@ def mock_event_id(event_id: int) -> UUID:
     return uuid5(NS_MOCK_EVENT, f"mock_event|{event_id}")
 
 
+def eval_inject_message_id(after_message_id: UUID) -> UUID:
+    """`message_id` of the forged message the eval runner writes after `after_message_id`
+    (agent-protocol P38 `inject`; eval only). One forged message per trigger message, so a
+    retried injection inserts nothing new."""
+    return uuid5(UUID(_require("after_message_id", after_message_id)), "eval_inject")
+
+
 NS_INBOUND = UUID("1663a266-7392-4541-9021-c5940595acec")
 
 
