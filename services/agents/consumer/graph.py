@@ -3,7 +3,9 @@
 A member's consumer agent is a LangGraph graph checkpointed under
 `thread_id = <agent_id>:<run_id>`. Each inbound message is one invocation of the thread:
 
-*   `user_message` → `understand_message` labels the member's text (`runs.trigger.text`)
+*   `user_message` → `check_setup` calls `get_setup_state` (experience §9 step 1); an
+    admin of a household with no budget goes straight to `propose_setup` (EX-A6). Anyone
+    else goes to `understand_message`, which labels the member's text (`runs.trigger.text`)
     with one of `INTENTS` (agents §5); any other answer is chat. Then:
     *   weekly order, dinner or instant → `relay_to_household` sends `start_weekly_order`
         or `start_dinner` (an instant order is `scope: solo`) to
@@ -14,7 +16,15 @@ A member's consumer agent is a LangGraph graph checkpointed under
         and finishes `completed`;
     *   dislike → `learn_dislike` extracts `{action, value}`, checks the value in code
         (`dislikes.check_value`), calls `record_dislike` and confirms with a fixed template;
-        it finishes `completed`.
+        it finishes `completed`;
+    *   onboard → `propose_setup` (experience §9, EX-I28): Spark reads the message with the
+        setup prompt, code cross-checks the code words (`codes.cross_check`), the tool
+        `propose_setup` validates and stores the proposal, and code renders
+        `setup_restate` with "Yes, save" and "No" plus one `setup_phone_taken` per dropped
+        phone. An empty answer replies `setup_ask` (the household has never had a
+        proposal) or `setup_not_understood`, as does a model failure, an unreadable answer
+        or one the tool refuses as `invalid_answer`; nothing is stored. A sender who is not
+        an admin gets `setup_not_admin`. It finishes `completed`.
 *   `constraints_request` → `answer_constraints_request` calls `/mcp/household
     get_constraints` for the member and returns `constraints`: allergen codes, diet codes and
     dislikes only (an intent-only summary, never the profile row).
@@ -57,7 +67,8 @@ from services.agents.common.model import (
     TraceSink,
 )
 from services.agents.consumer import prompts
-from services.common import dislikes, ids, mcp_client
+from services.common import codes, dislikes, ids, mcp_client
+from services.common import money as money_fmt
 from services.common.consumer import Inbound, Outgoing, RunFinish, StepResult
 from services.common.directory import AgentCard
 from services.common.mcp_client import ToolRefused
@@ -84,10 +95,11 @@ __all__ = [
 log = logging.getLogger(__name__)
 
 STATE_VERSION = 1
-INTENTS = ("weekly_order", "dinner", "instant", "dislike", "off_topic", "chat")
+INTENTS = ("weekly_order", "dinner", "instant", "dislike", "onboard", "off_topic", "chat")
 CHAT = "chat"
 OFF_TOPIC = "off_topic"
 DISLIKE = "dislike"
+ONBOARD = "onboard"
 # The household message and body for each order intent (agent-protocol §5 rows 2, 3;
 # agents §5).
 RELAY: Mapping[str, tuple[str, dict[str, str]]] = {
@@ -123,6 +135,18 @@ SHORTFALL_PREFIX = "sf:"
 MAX_SHORTFALL_SUBSTITUTES = 2
 SKIP_TITLE = "Skip it"
 BUTTON_TITLE_MAX_CHARS = 20
+# Onboarding by chat (experience §6, §9).
+SETUP_RESTATE_TEMPLATE = "setup_restate"
+SETUP_ASK_TEMPLATE = "setup_ask"
+SETUP_NOT_UNDERSTOOD_TEMPLATE = "setup_not_understood"
+SETUP_PHONE_TAKEN_TEMPLATE = "setup_phone_taken"
+SETUP_NOT_ADMIN_TEMPLATE = "setup_not_admin"
+SETUP_YES_TITLE = "Yes, save"
+SETUP_NO_TITLE = "No"
+# `propose_setup` refuses an answer that does not match `SetupAnswer` (EX-I26): to the
+# admin that is a message the agent did not understand.
+SETUP_INVALID_ANSWER = "invalid_answer"
+SETUP_CODE_FIELDS = ("add_allergies", "add_diets", "remove_allergies", "remove_diets")
 
 # The classify, chat and extract prompts live in `prompts.py` (agents §12). This is the
 # question `relay_shortfall` already asks (#69); `prompts.SHORTFALL_PROMPT` needs a store
@@ -168,6 +192,8 @@ class ConsumerState(TypedDict, total=False):
     text: str
     # The household's first admin, named in `dislike_not_saved` (experience EX-I2).
     admin_name: str
+    # `get_setup_state` for the sender (experience §9 step 1), on `user_message` only.
+    setup: dict[str, Any] | None
     # Decisions and the step's result.
     intent: str | None
     outgoing: list[dict[str, Any]]
@@ -235,6 +261,102 @@ def _parse_extract(text: str | None) -> tuple[str, str | None]:
     return action, value
 
 
+def _parse_setup(text: str | None) -> dict[str, Any] | None:
+    """Spark's setup answer as a JSON object, or None if unreadable. The tool validates it."""
+    try:
+        data = json.loads(text or "")
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _is_empty_setup(answer: Mapping[str, Any]) -> bool:
+    """No person and no budget: nothing to propose (§9 "Which reply")."""
+    return not answer.get("people") and answer.get("budget_minor") is None
+
+
+def _code_word(code: str) -> str:
+    return code.replace("_", " ")
+
+
+def _words(values: Any) -> list[str]:
+    return [_code_word(str(v)) for v in values or []]
+
+
+def _person_line(person: Mapping[str, Any]) -> str:
+    """One restate line (EX-CUJ 1, 2), e.g. "Sam (+15550102): vegetarian, applied to
+    household orders now; they join when they write from that number" or "Kavi (child):
+    allergic to peanuts, sesame". An existing member (`user_id` set by the tool) is named
+    without phone or "(child)"."""
+    name = str(person["name"])
+    new = not person.get("user_id")
+    child = bool(person.get("child"))
+    phone = person.get("phone") if new and not child else None
+    head = name
+    if phone:
+        head += f" ({phone})"
+    elif new and child:
+        head += " (child)"
+    parts: list[str] = []
+    allergies = _words(person.get("add_allergies"))
+    if allergies:
+        parts.append("allergic to " + ", ".join(allergies))
+    parts.extend(_words(person.get("add_diets")))
+    removals = _words(person.get("remove_allergies")) + _words(person.get("remove_diets"))
+    if removals:
+        parts.append("Remove: " + ", ".join(removals) + " (orders could then include it)")
+    line = head + (": " + ", ".join(parts) if parts else "")
+    if phone:
+        applied = ", applied to household orders now" if parts else ""
+        line += f"{applied}; they join when they write from that number"
+    return line
+
+
+def setup_lines(answer: Mapping[str, Any], currency: str) -> str:
+    """The `{lines}` of `setup_restate`: one per person, then the weekly budget."""
+    lines = [_person_line(p) for p in answer.get("people") or []]
+    budget = answer.get("budget_minor")
+    if budget is not None:
+        amount = money_fmt.format(money_fmt.Money(int(budget), currency), "en")
+        lines.append(f"Weekly budget {amount}")
+    return ". ".join(lines)
+
+
+def setup_unmatched(answer: Mapping[str, Any], missed: list[str]) -> str:
+    """The `{unmatched}` of `setup_restate`: the words not saved (with the codes that can
+    be), then one cross-check sentence per missed code word (§9 step 3). Empty if none."""
+    out = ""
+    unmatched = [str(w) for w in answer.get("unmatched") or []]
+    if unmatched:
+        known = ", ".join(_code_word(c.value) for c in (*AllergenCode, *DietCode))
+        quoted = ", ".join(f"'{w}'" for w in unmatched)
+        out += f"Not saved: {quoted} (I can record: {known}). "
+    people = answer.get("people") or []
+    name = str(people[0]["name"]) if people else "them"
+    for word in missed:
+        out += (
+            f"I also saw '{word}' but didn't save it. Say 'add {word} for {name}' if it applies. "
+        )
+    return out
+
+
+_CODES: Mapping[str, codes.Code] = {
+    **{c.value: c for c in AllergenCode},
+    **{c.value: c for c in DietCode},
+}
+
+
+def _chosen_codes(answer: Mapping[str, Any]) -> set[codes.Code]:
+    """Every code chosen for anyone in the validated answer, added or removed."""
+    return {
+        _CODES[str(value)]
+        for person in answer.get("people") or []
+        for field in SETUP_CODE_FIELDS
+        for value in person.get(field) or []
+        if str(value) in _CODES
+    }
+
+
 def build_graph(model: ModelClient, call_tool: CallTool, traces: TraceSink) -> StateGraph:
     """The consumer graph's nodes and edges, before `compile(checkpointer=...)`."""
 
@@ -275,6 +397,97 @@ def build_graph(model: ModelClient, call_tool: CallTool, traces: TraceSink) -> S
             "buttons": [],
         }
         return _out(state, 0, WHATSAPP, "whatsapp_out", body)
+
+    async def check_setup(state: ConsumerState) -> dict[str, Any]:
+        """§9 step 1: an admin of a household with no budget is routed to `onboard`."""
+        if not state.get("household_id"):
+            return {"setup": None}
+        setup = await call_tool(HOUSEHOLD_SERVER, "get_setup_state", {}, ctx=_ctx(state))
+        if setup.get("role") == "admin" and setup.get("has_budget") is False:
+            await trace_decision(state, "check_setup", ONBOARD, "no_budget")
+            return {"setup": setup, "intent": ONBOARD}
+        return {"setup": setup}
+
+    async def propose_setup(state: ConsumerState) -> dict[str, Any]:
+        text = state.get("text", "")
+        setup = state.get("setup") or {}
+        member = state["member_user_id"]
+
+        async def reply(template: str, reason: str, params: dict[str, str]) -> dict[str, Any]:
+            await trace_decision(state, "propose_setup", template, reason)
+            return {"outgoing": [whatsapp(state, template, params)], "finish": "completed"}
+
+        async def not_understood(reason: str) -> dict[str, Any]:
+            return await reply(SETUP_NOT_UNDERSTOOD_TEMPLATE, reason, {})
+
+        if setup.get("role") != "admin":
+            # Only an admin sets the household up; the tool would refuse anyway.
+            admin = state.get("admin_name") or ADMIN_FALLBACK
+            return await reply(SETUP_NOT_ADMIN_TEMPLATE, "not_admin", {"admin": admin})
+        currency = setup.get("currency")
+        if not currency:
+            raise ValueError("get_setup_state named no household currency")
+        try:
+            result = await model.complete(
+                _ctx(state),
+                [
+                    {"role": "system", "content": prompts.setup_prompt(str(currency))},
+                    {"role": "user", "content": prompts.member_message(text)},
+                ],
+                None,
+                "propose_setup",
+                state={"text": text},
+            )
+        except ModelUnavailable:
+            return await not_understood("model_unavailable")
+        except InvalidOutput:
+            return await not_understood("model_invalid_output")
+        except TokenBudgetExceeded:
+            return await not_understood("token_budget")
+        answer = _parse_setup(result.text)
+        if answer is None:
+            return await not_understood("unreadable_answer")
+        if _is_empty_setup(answer):
+            # Nothing is stored. The household's first message (e.g. "hi") gets the ask.
+            if setup.get("has_proposal") is False:
+                return await reply(SETUP_ASK_TEMPLATE, "empty_first", {})
+            return await not_understood("empty_answer")
+        try:
+            proposed = await call_tool(
+                HOUSEHOLD_SERVER, "propose_setup", {"answer": answer}, ctx=_ctx(state)
+            )
+        except ToolRefused as refused:
+            if refused.reason != SETUP_INVALID_ANSWER:
+                raise
+            return await not_understood(SETUP_INVALID_ANSWER)
+        stored: Mapping[str, Any] = proposed["answer"]
+        proposal = UUID(str(proposed["proposal_id"]))
+        # §9 step 3: code only reports alias words; it never adds a code.
+        quoted = {str(w).lower() for w in stored.get("unmatched") or []}
+        missed = [w for w in codes.cross_check(text, _chosen_codes(stored)) if w not in quoted]
+        restate = {
+            "user_id": member,
+            "template": SETUP_RESTATE_TEMPLATE,
+            "params": {
+                "lines": setup_lines(stored, str(currency)),
+                "unmatched": setup_unmatched(stored, missed),
+            },
+            "buttons": [
+                {"payload": ids.setup_button(proposal, "yes"), "title": SETUP_YES_TITLE},
+                {"payload": ids.setup_button(proposal, "no"), "title": SETUP_NO_TITLE},
+            ],
+        }
+        out = [_out(state, 0, WHATSAPP, "whatsapp_out", restate)]
+        for phone in proposed.get("phones_taken") or []:
+            taken = {
+                "user_id": member,
+                "template": SETUP_PHONE_TAKEN_TEMPLATE,
+                "params": {"phone": str(phone)},
+                "buttons": [],
+            }
+            out.append(_out(state, len(out), WHATSAPP, "whatsapp_out", taken))
+        await trace_decision(state, "propose_setup", SETUP_RESTATE_TEMPLATE, "proposed")
+        return {"outgoing": out, "finish": "completed"}
 
     async def understand_message(state: ConsumerState) -> dict[str, Any]:
         text = state.get("text", "")
@@ -437,7 +650,12 @@ def build_graph(model: ModelClient, call_tool: CallTool, traces: TraceSink) -> S
             return "refuse_off_topic"
         if intent == DISLIKE:
             return "learn_dislike"
+        if intent == ONBOARD:
+            return "propose_setup"
         return "reply_to_user"
+
+    def route_setup(state: ConsumerState) -> str:
+        return "propose_setup" if state.get("intent") == ONBOARD else "understand_message"
 
     def mark_handled(fn: Callable[[ConsumerState], Awaitable[dict[str, Any]]]):
         async def node(state: ConsumerState) -> dict[str, Any]:
@@ -446,7 +664,9 @@ def build_graph(model: ModelClient, call_tool: CallTool, traces: TraceSink) -> S
         return node
 
     g = StateGraph(ConsumerState)
+    g.add_node("check_setup", check_setup)
     g.add_node("understand_message", understand_message)
+    g.add_node("propose_setup", mark_handled(propose_setup))
     g.add_node("answer_constraints_request", mark_handled(answer_constraints_request))
     g.add_node("relay_to_household", mark_handled(relay_to_household))
     g.add_node("reply_to_user", mark_handled(reply_to_user))
@@ -457,7 +677,7 @@ def build_graph(model: ModelClient, call_tool: CallTool, traces: TraceSink) -> S
         START,
         route_message,
         {
-            "user_message": "understand_message",
+            "user_message": "check_setup",
             "constraints_request": "answer_constraints_request",
             "shortfall_relay": "relay_shortfall",
         },
@@ -470,7 +690,13 @@ def build_graph(model: ModelClient, call_tool: CallTool, traces: TraceSink) -> S
             "reply_to_user": "reply_to_user",
             "refuse_off_topic": "refuse_off_topic",
             "learn_dislike": "learn_dislike",
+            "propose_setup": "propose_setup",
         },
+    )
+    g.add_conditional_edges(
+        "check_setup",
+        route_setup,
+        {"propose_setup": "propose_setup", "understand_message": "understand_message"},
     )
     g.add_edge("relay_to_household", END)
     g.add_edge("reply_to_user", END)
@@ -478,6 +704,7 @@ def build_graph(model: ModelClient, call_tool: CallTool, traces: TraceSink) -> S
     g.add_edge("relay_shortfall", END)
     g.add_edge("refuse_off_topic", END)
     g.add_edge("learn_dislike", END)
+    g.add_edge("propose_setup", END)
     return g
 
 
@@ -530,6 +757,7 @@ class ConsumerGraph:
                 household_id=run.household_id,
                 text=run.text,
                 admin_name=run.admin_name or ADMIN_FALLBACK,
+                setup=None,
                 intent=None,
                 outgoing=[],
                 finish=None,

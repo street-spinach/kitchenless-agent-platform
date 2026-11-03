@@ -38,6 +38,8 @@ CARD = AgentCard(
     host_process="agents",
     vendor=None,
 )
+SET_UP = {"role": "admin", "has_budget": True, "has_proposal": True, "currency": "USD"}
+NEW_HOUSEHOLD = {"role": "admin", "has_budget": False, "has_proposal": False, "currency": "USD"}
 
 
 class FakeHousehold:
@@ -48,11 +50,43 @@ class FakeHousehold:
         result: dict[str, Any] | Exception | None = None,
         *,
         dislike_result: Exception | None = None,
+        setup: dict[str, Any] | None = None,
+        members: dict[str, str] | None = None,
+        phones_taken: frozenset[str] = frozenset(),
     ) -> None:
         self.result = result
         self.dislike_result = dislike_result
+        # `get_setup_state`: a set-up household by default (it has a budget).
+        self.setup = setup or {**SET_UP}
+        # `propose_setup`: existing members by lower-case name, phones in another household.
+        self.members = members or {}
+        self.phones_taken = phones_taken
         self.learned: set[str] = set()
         self.calls: list[dict[str, Any]] = []
+        # `get_setup_state` calls are kept apart, so the other tests' call lists are as before.
+        self.setup_calls: list[dict[str, Any]] = []
+        self.proposals: list[dict[str, Any]] = []
+
+    def propose_setup(self, args: dict[str, Any], ctx: Any) -> dict[str, Any]:
+        """The EX-I26 tool on memory: the server's own code sort, member names, phones."""
+        from services.mcp.household import server as household
+
+        try:
+            answer = household._sort_codes(args["answer"])
+        except household.GuardRefused as refused:
+            raise ToolRefused(refused.reason) from None
+        taken: list[str] = []
+        for person in answer["people"]:
+            member = self.members.get(person["name"].strip().lower())
+            if member is not None:
+                person["user_id"] = member
+            if person.get("phone") in self.phones_taken:
+                taken.append(person["phone"])
+                person["phone"] = None
+        proposal = ids.proposal_id(ctx.run_id)
+        self.proposals.append(answer)
+        self.setup["has_proposal"] = True
+        return {"proposal_id": str(proposal), "answer": answer, "phones_taken": taken}
 
     def record_dislike(self, args: dict[str, Any]) -> dict[str, Any]:
         """The §9 outcomes, on an in-memory set of learned values."""
@@ -71,7 +105,13 @@ class FakeHousehold:
 
     async def __call__(self, server: str, tool: str, args: dict, *, ctx: Any) -> dict:
         # No `token` argument: `call_tool_as` obtains it (identity-authz I6).
-        self.calls.append({"server": server, "tool": tool, "args": args, "ctx": ctx})
+        call = {"server": server, "tool": tool, "args": args, "ctx": ctx}
+        if tool == "get_setup_state":
+            self.setup_calls.append(call)
+            return dict(self.setup)
+        self.calls.append(call)
+        if tool == "propose_setup":
+            return self.propose_setup(args, ctx)
         if tool == "record_dislike":
             return self.record_dislike(args)
         if isinstance(self.result, Exception):
@@ -639,6 +679,218 @@ def test_shortfall_relay_one_message_per_line_with_buttons() -> None:
     assert result.finish is None
     decisions = [d["node"] for d in w.traces.of("decision")]
     assert decisions == ["relay_shortfall", "relay_shortfall"]
+
+
+# Onboarding by chat (experience §9, EX-I28) ---------------------------------------------
+
+KAVI = "22222222-2222-4222-8222-222222222222"
+CODE_LIST = (
+    "celery, gluten, crustaceans, eggs, fish, lupin, milk, molluscs, mustard, tree nuts, "
+    "peanuts, sesame, soy, sulphites, vegetarian, vegan, pescatarian, halal, kosher, keto, "
+    "high protein"
+)
+
+
+def _setup_world(
+    text: str,
+    setup: dict[str, Any],
+    *,
+    answer: dict[str, Any] | str | None = None,
+    overrides: dict[str, Any] | None = None,
+    **household: Any,
+) -> World:
+    """A world whose model answers `propose_setup` with `answer` (else the EX-I29 stubs)."""
+    w = World(text, household=FakeHousehold(setup={**setup}, **household), overrides=overrides)
+    if answer is not None:
+        text = answer if isinstance(answer, str) else json.dumps(answer)
+        w.agent = cg.ConsumerGraph(
+            model=mf.client(
+                traces=w.traces,
+                run_state=mf.FakeRunState(overrides),
+                stubs={**stubs.STUBS, "propose_setup": lambda s: mf.ModelResult(text)},
+            ),
+            checkpointer=w.checkpointer,
+            load_run=w.load_run,
+            call_tool=w.household,
+        )
+    return w
+
+
+def _text(out: Any) -> str:
+    """The WhatsApp text the sender would send for a `whatsapp_out` body."""
+    from services.api.whatsapp import sender
+
+    payload = sender.graph_payload("+15135550100", out.body)
+    assert payload is not None, out.body
+    if payload["type"] == "text":
+        return payload["text"]["body"]
+    return payload["interactive"]["body"]["text"]
+
+
+def _model_nodes(w: World) -> list[str]:
+    return [d["node"] for d in w.traces.of("decision") if "ref" not in d]
+
+
+def _person(name: str, **fields: Any) -> dict[str, Any]:
+    return stubs._person(name, **fields)
+
+
+def test_onboard_forced_without_budget() -> None:
+    # EX-CUJ 1: the admin of a household with no budget skips the classifier.
+    w = _setup_world(stubs.SETUP_CUJ1, NEW_HOUSEHOLD)
+    result = w.step(w.user_message())
+    _valid(result)
+    [out] = result.messages
+    assert (out.type, out.to_agent) == ("whatsapp_out", "channel:whatsapp")
+    assert out.body["template"] == "setup_restate"
+    assert _text(out) == (
+        "I'll save: Sam (+15550102): vegetarian, applied to household orders now; they join "
+        "when they write from that number. Kavi (child): allergic to peanuts, sesame. Weekly "
+        "budget $200.00. Nothing else is saved."
+    )
+    proposal = ids.proposal_id(w.run_id)
+    assert out.body["buttons"] == [
+        {"payload": f"ob:{proposal}:yes", "title": "Yes, save"},
+        {"payload": f"ob:{proposal}:no", "title": "No"},
+    ]
+    assert result.finish == RunFinish("completed")
+    assert _model_nodes(w) == ["propose_setup"]  # never classified
+    assert [d["choice"] for d in w.traces.of("decision") if "ref" in d] == [
+        "onboard",
+        "setup_restate",
+    ]
+    [state_call] = w.household.setup_calls
+    assert state_call["args"] == {} and state_call["ctx"].agent_id == CONSUMER
+    [call] = w.household.calls
+    assert call["tool"] == "propose_setup"
+    assert call["args"]["answer"] == stubs.SETUP_ANSWERS[" ".join(stubs.SETUP_CUJ1.lower().split())]
+    # No name, phone or code in a decision row (agents §15).
+    assert not any("Kavi" in str(d) or "555" in str(d) for d in w.traces.of("decision"))
+
+    # A member of that household, or the admin once the budget is saved, is classified.
+    for setup in ({**NEW_HOUSEHOLD, "role": "member"}, SET_UP):
+        w = _setup_world("hello", setup)
+        [out] = w.step(w.user_message()).messages
+        assert out.body["template"] == cg.CHAT_REPLY_TEMPLATE
+        assert _model_nodes(w) == ["understand_message", "reply_to_user"]
+
+
+def test_onboard_phone_taken_reply() -> None:
+    # §9 step 5: one `setup_phone_taken` after the restate per dropped phone.
+    w = _setup_world(stubs.SETUP_CUJ1, NEW_HOUSEHOLD, phones_taken=frozenset({"+15550102"}))
+    msg = w.user_message()
+    restate, taken = w.step(msg).messages
+    assert _text(restate).startswith("I'll save: Sam: vegetarian. Kavi (child)")
+    assert taken.body["template"] == "setup_phone_taken"
+    assert _text(taken) == "+15550102 is already in another household, so I didn't add it."
+    assert taken.message_id == ids.message_id(msg.row.message_id, 1)
+
+
+def test_onboard_unknown_code_unmatched() -> None:
+    # The model's code outside the enums reaches the tool, which moves it to `unmatched`;
+    # code neither drops nor adds a code.
+    answer = {
+        "people": [_person("Kavi", child=True, add_allergies=["kiwi", "peanuts"])],
+        "budget_minor": None,
+        "unmatched": [],
+    }
+    w = _setup_world("Kavi can't have kiwi or peanuts", NEW_HOUSEHOLD, answer=answer)
+    [out] = w.step(w.user_message()).messages
+    [call] = w.household.calls
+    assert call["args"]["answer"]["people"][0]["add_allergies"] == ["kiwi", "peanuts"]
+    [stored] = w.household.proposals
+    assert stored["people"][0]["add_allergies"] == ["peanuts"]
+    assert _text(out) == (
+        f"I'll save: Kavi (child): allergic to peanuts. Not saved: 'kiwi' (I can record: "
+        f"{CODE_LIST}). Nothing else is saved."
+    )
+
+
+def test_unmatched_word_quoted_back() -> None:
+    # EX-CUJ 2, after setup: classified `onboard`; Kavi is an existing member.
+    w = _setup_world(stubs.SETUP_CUJ2, SET_UP, members={"kavi": KAVI})
+    result = w.step(w.user_message())
+    _valid(result)
+    [out] = result.messages
+    assert _model_nodes(w) == ["understand_message", "propose_setup"]
+    assert _text(out) == (
+        f"I'll save: Kavi: allergic to tree nuts, peanuts. Not saved: 'kiwi' (I can record: "
+        f"{CODE_LIST}). Nothing else is saved."
+    )
+    assert result.finish == RunFinish("completed")
+
+
+def test_cross_check_names_missed_word() -> None:
+    # Spark chose only one nut code: code names the word, and adds no code.
+    answer = {
+        "people": [_person("Kavi", child=True, add_allergies=["peanuts"])],
+        "budget_minor": None,
+        "unmatched": ["kiwi"],
+    }
+    w = _setup_world(stubs.SETUP_CUJ2, SET_UP, answer=answer, members={"kavi": KAVI})
+    [out] = w.step(w.user_message()).messages
+    assert out.body["params"]["unmatched"].endswith(
+        "I also saw 'nuts' but didn't save it. Say 'add nuts for Kavi' if it applies. "
+    )
+    assert _text(out).startswith("I'll save: Kavi: allergic to peanuts. Not saved: 'kiwi'")
+    [call] = w.household.calls
+    assert call["args"]["answer"]["people"][0]["add_allergies"] == ["peanuts"]
+    # 'kiwi' is quoted once, as not saved, never also as a missed word.
+    assert out.body["params"]["unmatched"].count("'kiwi'") == 1
+
+
+def test_onboard_model_failure_fixed_reply() -> None:
+    w = _setup_world(stubs.SETUP_CUJ1, NEW_HOUSEHOLD, overrides={"STUB_FAIL_NODE": "propose_setup"})
+    result = w.step(w.user_message())
+    [out] = result.messages
+    assert out.body["template"] == "setup_not_understood"
+    assert out.body["params"] == {} and out.body["buttons"] == []
+    assert result.finish == RunFinish("completed")
+    assert w.household.calls == []  # nothing is stored
+
+    # An unreadable answer, or one the tool refuses as `invalid_answer`, is the same.
+    for answer in ("not json", "[]", {"people": "Kavi"}):
+        w = _setup_world("Kavi", NEW_HOUSEHOLD, answer=answer)
+        [out] = w.step(w.user_message()).messages
+        assert out.body["template"] == "setup_not_understood"
+        assert w.household.proposals == []
+
+
+def test_onboard_first_empty_message_asks() -> None:
+    # EX-CUJ 1: "hi" from the admin of a household that never had a proposal.
+    w = _setup_world("hi", NEW_HOUSEHOLD)
+    result = w.step(w.user_message())
+    [out] = result.messages
+    assert out.body["template"] == "setup_ask"
+    assert _text(out).startswith("Let's set up your household.")
+    assert result.finish == RunFinish("completed")
+    assert w.household.calls == []  # nothing is stored
+
+
+def test_onboard_later_empty_not_understood() -> None:
+    w = _setup_world("hi", {**NEW_HOUSEHOLD, "has_proposal": True})
+    [out] = w.step(w.user_message()).messages
+    assert out.body["template"] == "setup_not_understood"
+    assert w.household.calls == []
+
+
+def test_onboard_not_admin_refused() -> None:
+    # A member classified `onboard` is told who can change it; no model or tool call.
+    w = _setup_world("add sesame for Kavi", {**SET_UP, "role": "member"})
+    [out] = w.step(w.user_message()).messages
+    assert out.body["template"] == "setup_not_admin"
+    assert out.body["params"] == {"admin": ADMIN_NAME}
+    assert _model_nodes(w) == ["understand_message"]
+    assert w.household.calls == []
+
+
+def test_setup_prompt_lists_codes_and_marks_data() -> None:
+    from services.agents.consumer import prompts
+
+    prompt = prompts.setup_prompt("USD")
+    assert prompts.MESSAGE_RULE in prompt
+    assert "tree_nuts" in prompt and "high_protein" in prompt and "USD" in prompt
+    assert "onboard" in prompts.CLASSIFY_PROMPT and "onboard" in cg.INTENTS
 
 
 def test_host_registers_the_consumer_handler() -> None:

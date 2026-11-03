@@ -14,9 +14,13 @@ from services.agents.common.model import ModelResult
 __all__ = [
     "CHAT_REPLY",
     "FOOD_WORDS",
+    "SETUP_ANSWERS",
+    "SETUP_CUJ1",
+    "SETUP_CUJ2",
     "SHORTFALL_TEXT",
     "STUBS",
     "learn_dislike",
+    "propose_setup",
     "relay_shortfall",
     "reply_to_user",
     "understand_message",
@@ -68,9 +72,12 @@ EXTRACT_MAX_WORDS = 3
 
 
 def understand_message(state: Mapping[str, Any]) -> ModelResult:
-    """The first matching rule wins: dislike, off topic, instant, dinner, weekly order, chat."""
+    """The first matching rule wins: onboard, dislike, off topic, instant, dinner, weekly
+    order, chat."""
     text = str(state.get("text", "")).lower()
     words = set(_WORD.findall(text))
+    if _is_setup(text, words):
+        return ModelResult(text="onboard")
     if any(p in text for p in DISLIKE_PHRASES):
         return ModelResult(text="dislike")
     if words & OFF_TOPIC_WORDS:
@@ -82,6 +89,16 @@ def understand_message(state: Mapping[str, Any]) -> ModelResult:
     if words & FOOD_WORDS:
         return ModelResult(text="weekly_order")
     return ModelResult(text="chat")
+
+
+def _is_setup(text: str, words: set[str]) -> bool:
+    """Onboard: a stubbed setup message, a budget, or "add/remove <x> for <name>"."""
+    key = " ".join(text.split())
+    return (
+        (key in SETUP_ANSWERS and key != SETUP_HI)
+        or "budget" in words
+        or _SETUP_CHANGE.match(key) is not None
+    )
 
 
 def learn_dislike(state: Mapping[str, Any]) -> ModelResult:
@@ -109,9 +126,60 @@ def relay_shortfall(state: Mapping[str, Any]) -> ModelResult:
     return ModelResult(text=SHORTFALL_TEXT)
 
 
+# Experience EX-I29: the setup answers for the EX-CUJ 1 and 2 messages and for "hi". Any
+# other message gets the empty answer (§9 "Which reply").
+SETUP_CUJ1 = (
+    "Me, my husband Sam +1 555 0102, and Kavi who is 8. Kavi can't have peanuts or sesame. "
+    "Sam is vegetarian. Budget 200 a week."
+)
+SETUP_CUJ2 = "Kavi is allergic to kiwi and nuts"
+SETUP_HI = "hi"
+EMPTY_SETUP: Mapping[str, Any] = {"people": [], "budget_minor": None, "unmatched": []}
+_SETUP_CHANGE = re.compile(r"^(add|remove) .+ for \S+")
+
+
+def _person(name: str, **fields: Any) -> dict[str, Any]:
+    return {
+        "name": name,
+        "phone": None,
+        "child": False,
+        "add_allergies": [],
+        "add_diets": [],
+        "remove_allergies": [],
+        "remove_diets": [],
+        **fields,
+    }
+
+
+# Keys are lower-case with single spaces.
+SETUP_ANSWERS: Mapping[str, Mapping[str, Any]] = {
+    " ".join(SETUP_CUJ1.lower().split()): {
+        "people": [
+            _person("Sam", phone="+15550102", add_diets=["vegetarian"]),
+            _person("Kavi", child=True, add_allergies=["peanuts", "sesame"]),
+        ],
+        "budget_minor": 20000,
+        "unmatched": [],
+    },
+    " ".join(SETUP_CUJ2.lower().split()): {
+        "people": [_person("Kavi", child=True, add_allergies=["tree_nuts", "peanuts"])],
+        "budget_minor": None,
+        "unmatched": ["kiwi"],
+    },
+    SETUP_HI: EMPTY_SETUP,
+}
+
+
+def propose_setup(state: Mapping[str, Any]) -> ModelResult:
+    """The `SetupAnswer` JSON for a stubbed message, else the empty answer."""
+    key = " ".join(str(state.get("text", "")).lower().split())
+    return ModelResult(text=json.dumps(SETUP_ANSWERS.get(key, EMPTY_SETUP)))
+
+
 STUBS: Mapping[str, Callable[[Mapping[str, Any]], ModelResult]] = {
     "understand_message": understand_message,
     "learn_dislike": learn_dislike,
     "reply_to_user": reply_to_user,
     "relay_shortfall": relay_shortfall,
+    "propose_setup": propose_setup,
 }
