@@ -7,9 +7,11 @@ from zoneinfo import ZoneInfo
 
 import psycopg
 import pytest
+from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
 from services.agents import sweeper
+from services.api import ingest as ingest_module
 from services.api.ingest import (
     API_AGENT,
     APPROVAL_EXPIRED,
@@ -30,7 +32,8 @@ from services.common.mcp_client import ToolRefused
 from services.common.protocol.a2a import AgentMessageRow
 from services.common.protocol.schemas import WhatsAppOut
 from services.common.run_context import RunContext
-from services.identity import fga, links
+from services.identity import fga, links, onboarding
+from services.identity.keycloak_admin import KeycloakError
 from services.mcp.household import server as household
 from services.mcp.meta import CallContext
 from services.safety.guard import GuardRefused
@@ -166,9 +169,12 @@ async def _call_tool(server: str, tool: str, args: dict, *, ctx: RunContext, **k
     fn = {
         "decide_approval": household.decide_approval,
         "set_take_turns": household.set_take_turns,
+        "apply_setup": household.apply_setup,
     }[tool]
-    uuids = ("approval_id", "user_id", "order_id")
+    uuids = ("approval_id", "user_id", "order_id", "proposal_id")
     typed = {k: uuid.UUID(v) if k in uuids else v for k, v in args.items()}
+    if "child_user_ids" in typed:
+        typed["child_user_ids"] = {k: uuid.UUID(v) for k, v in typed["child_user_ids"].items()}
     try:
         return await fn(call, **typed)
     except GuardRefused as refused:
@@ -919,3 +925,413 @@ def test_renew_button_sends_consent_link(
             "agent_ids": agent_ids,
         }
     ]
+
+
+# Setup taps (experience §9, EX-I30) ------------------------------------------------------
+#
+# The tap goes through the real `create_child` (an eval household, so no Keycloak) and the
+# real `apply_setup`, in process on the test database.
+
+JOIN_PHONE = "+15550100377"
+BUSINESS_NUMBER = "+15550109999"
+SETUP_ANSWER: dict[str, Any] = {
+    "people": [
+        {"name": "Asha", "child": False, "user_id": str(w.ADMIN), "add_allergies": ["sesame"]},
+        {"name": "Mira", "child": True, "add_allergies": ["peanuts"]},
+        {"name": "Kavi", "child": True, "add_diets": ["vegan"]},
+    ],
+    "budget_minor": 15000,
+    "unmatched": [],
+}
+
+
+@pytest.fixture
+def setup_world(world: str, monkeypatch: pytest.MonkeyPatch) -> str:
+    """The admin is Asha; OpenFGA writes are recorded, not sent; `api` knows its number."""
+    with psycopg.connect(world) as conn:
+        conn.execute("UPDATE users SET display_name = 'Asha' WHERE user_id = %s", (w.ADMIN,))
+    monkeypatch.setattr(fga, "ensure", lambda tuples: None)
+    env = {
+        "SERVICE_NAME": "migrate",
+        "DATABASE_URL": "x",
+        "LOG_LEVEL": "info",
+        "OPENFGA_PRESHARED_KEY": "x",
+        "OPENFGA_API_URL": "x",
+        "WHATSAPP_NUMBER": BUSINESS_NUMBER,
+    }
+    settings = Settings.from_env(env)
+    monkeypatch.setattr(ingest_module, "get_settings", lambda: settings)
+    return world
+
+
+def _propose(pg: str, answer: dict[str, Any] | None = None, *, expired: bool = False) -> uuid.UUID:
+    proposal_id = uuid.uuid4()
+    with psycopg.connect(pg) as conn:
+        conn.execute(
+            "INSERT INTO onboarding_proposals"
+            " (proposal_id, household_id, proposed_by, answer, expires_at)"
+            " VALUES (%s, %s, %s, %s, now() + %s * interval '1 hour')",
+            (
+                proposal_id,
+                w.HOUSEHOLD_ID,
+                w.ADMIN,
+                Jsonb(SETUP_ANSWER if answer is None else answer),
+                -1 if expired else 1,
+            ),
+        )
+    return proposal_id
+
+
+class _Calls:
+    """Records `create_child` and `apply_setup` calls in order; `fail_on` makes
+    `create_child` raise a Keycloak error for that name."""
+
+    def __init__(self, fail_on: str | None = None) -> None:
+        self.calls: list[tuple[str, Any]] = []
+        self.fail_on = fail_on
+
+    async def add_child(
+        self, conn: psycopg.AsyncConnection, admin: uuid.UUID, household_id: str, name: str
+    ) -> uuid.UUID:
+        self.calls.append(("create_child", name))
+        if name == self.fail_on:
+            raise KeycloakError("POST /users answered 503")
+        return await onboarding.create_child(conn, admin, household_id, name)
+
+    async def call_tool(self, server: str, tool: str, args: dict, *, ctx: RunContext) -> dict:
+        self.calls.append((tool, args))
+        return await _call_tool(server, tool, args, ctx=ctx)
+
+
+def _ob_tap(
+    pg: str,
+    monkeypatch: pytest.MonkeyPatch,
+    external_id: str,
+    button: str,
+    calls: _Calls | None = None,
+    phone: str = w.ADMIN_PHONE,
+) -> uuid.UUID | None:
+    calls = calls or _Calls()
+
+    async def go(conn: psycopg.AsyncConnection) -> uuid.UUID | None:
+        return await ingest(
+            conn,
+            CHANNEL,
+            external_id,
+            phone,
+            Content("button", button=button),
+            call_tool=calls.call_tool,
+            add_child=calls.add_child,
+        )
+
+    return _with_pool(pg, monkeypatch, go)
+
+
+def _replies(pg: str, run_id: uuid.UUID, external_id: str) -> list[dict]:
+    """The tap's replies by ordinal `ids.message_id(inbound, n)`, in order."""
+    inbound = ids.inbound_id(CHANNEL, external_id)
+    rows = {m["message_id"]: m for m in _messages(pg, run_id) if m["type"] == "whatsapp_out"}
+    out = []
+    for n in range(len(rows)):
+        msg = rows.pop(ids.message_id(inbound, n))
+        assert (msg["from_agent"], msg["to_agent"]) == (API_AGENT, w.WHATSAPP)
+        out.append(msg["body"])
+    assert rows == {}, "every reply has an ordinal"
+    return out
+
+
+def _children(pg: str) -> list[dict]:
+    return w.query(
+        pg,
+        "SELECT u.display_name, m.user_id FROM household_members m"
+        " JOIN users u ON u.user_id = m.user_id"
+        " WHERE m.household_id = %s AND m.role = 'child' ORDER BY u.display_name",
+        w.HOUSEHOLD_ID,
+    )
+
+
+def _proposal_status(pg: str, proposal_id: uuid.UUID) -> str:
+    [row] = w.query(
+        pg, "SELECT status FROM onboarding_proposals WHERE proposal_id = %s", proposal_id
+    )
+    return row["status"]
+
+
+def _saved(pg: str) -> dict[str, Any]:
+    return {
+        "constraints": w.query(
+            pg, "SELECT user_id, kind, value FROM member_constraints ORDER BY user_id, kind, value"
+        ),
+        "budgets": w.query(pg, "SELECT amount_minor FROM budgets"),
+        "join_codes": w.query(pg, "SELECT code FROM join_codes"),
+    }
+
+
+def _body(template: str, params: dict | None = None, buttons: list | None = None) -> dict:
+    return {
+        "user_id": str(w.ADMIN),
+        "template": template,
+        "params": params or {},
+        "buttons": buttons or [],
+    }
+
+
+def test_setup_tap_calls_create_child_then_apply(
+    setup_world: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proposal = _propose(setup_world)
+    calls = _Calls()
+    run_id = _ob_tap(setup_world, monkeypatch, "wamid.ob", ids.setup_button(proposal, "yes"), calls)
+    assert run_id is not None
+    # A new household `chat` run for the tapper, `source: "tap"`, ended `completed`.
+    run = _run_row(setup_world, run_id)
+    assert (run["kind"], run["household_id"], run["status"], run["reason"]) == (
+        "chat",
+        w.HOUSEHOLD_ID,
+        "completed",
+        "apply_setup",
+    )
+    assert (run["trigger"]["source"], run["trigger"]["user_id"]) == ("tap", str(w.ADMIN))
+    [inbound_row] = w.query(setup_world, "SELECT run_id FROM inbound_messages")
+    assert inbound_row["run_id"] == run_id
+    # `create_child` for each new child, in answer order, then `apply_setup` with their ids.
+    kids = {c["display_name"]: str(c["user_id"]) for c in _children(setup_world)}
+    assert sorted(kids) == ["Kavi", "Mira"]
+    assert calls.calls == [
+        ("create_child", "Mira"),
+        ("create_child", "Kavi"),
+        (
+            "apply_setup",
+            {
+                "proposal_id": str(proposal),
+                "answer": "yes",
+                "removal": None,
+                "child_user_ids": kids,
+                "user_id": str(w.ADMIN),
+            },
+        ),
+    ]
+    assert _proposal_status(setup_world, proposal) == "applied"
+    saved = _saved(setup_world)
+    assert sorted(
+        (str(c["user_id"]), c["kind"], c["value"]) for c in saved["constraints"]
+    ) == sorted(
+        [
+            (str(w.ADMIN), "allergy", "sesame"),
+            (kids["Mira"], "allergy", "peanuts"),
+            (kids["Kavi"], "diet", "vegan"),
+        ]
+    )
+    assert saved["budgets"] == [{"amount_minor": 15000}]
+    # The tap again: no second child, `already_decided`.
+    again = _ob_tap(setup_world, monkeypatch, "wamid.ob2", ids.setup_button(proposal, "yes"))
+    assert again is not None
+    assert len(_children(setup_world)) == 2
+    assert _replies(setup_world, again, "wamid.ob2") == [_body("already_decided")]
+    assert _saved(setup_world) == saved
+
+
+def test_setup_tap_keycloak_failure_writes_nothing(
+    setup_world: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proposal = _propose(setup_world)
+    before = _saved(setup_world)
+    calls = _Calls(fail_on="Kavi")
+    button = ids.setup_button(proposal, "yes")
+    run_id = _ob_tap(setup_world, monkeypatch, "wamid.kc", button, calls)
+    assert run_id is not None
+    # Mira was created before Kavi failed; neither is kept, and `apply_setup` is not called.
+    assert calls.calls == [("create_child", "Mira"), ("create_child", "Kavi")]
+    assert _children(setup_world) == []
+    assert (
+        w.query(
+            setup_world,
+            "SELECT 1 FROM agent_cards WHERE starts_with(agent_id, %s)",
+            f"consumer:{w.HOUSEHOLD_ID}.",
+        )
+        == []
+    )
+    assert _saved(setup_world) == before
+    assert _proposal_status(setup_world, proposal) == "pending"
+    assert _replies(setup_world, run_id, "wamid.kc") == [_body("retry_prompt")]
+    run = _run_row(setup_world, run_id)
+    assert (run["status"], run["reason"]) == ("completed", "create_child_failed")
+    # The tap can simply be sent again.
+    retried = _ob_tap(setup_world, monkeypatch, "wamid.kc2", button)
+    assert retried is not None
+    assert [c["display_name"] for c in _children(setup_world)] == ["Kavi", "Mira"]
+    assert _proposal_status(setup_world, proposal) == "applied"
+
+
+def test_setup_tap_no_discards(setup_world: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    proposal = _propose(setup_world)
+    before = _saved(setup_world)
+    calls = _Calls()
+    run_id = _ob_tap(setup_world, monkeypatch, "wamid.no", ids.setup_button(proposal, "no"), calls)
+    assert run_id is not None
+    # No child is created for "No".
+    assert [c[0] for c in calls.calls] == ["apply_setup"]
+    assert _children(setup_world) == []
+    assert _saved(setup_world) == before
+    assert _proposal_status(setup_world, proposal) == "discarded"
+    assert _replies(setup_world, run_id, "wamid.no") == [_body("setup_discarded")]
+    # "Yes" after "No" has expired.
+    late = _ob_tap(setup_world, monkeypatch, "wamid.no2", ids.setup_button(proposal, "yes"))
+    assert late is not None
+    assert _children(setup_world) == []
+    assert _replies(setup_world, late, "wamid.no2") == [_body("setup_expired")]
+
+
+def test_setup_tap_remove_then_keep(setup_world: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    with psycopg.connect(setup_world) as conn:
+        for kind, value in (("allergy", "sesame"), ("diet", "vegan")):
+            conn.execute(
+                "INSERT INTO member_constraints (user_id, kind, value) VALUES (%s, %s, %s)",
+                (w.MEMBER, kind, value),
+            )
+    answer = {
+        "people": [
+            {
+                "name": "Sam",
+                "child": False,
+                "user_id": str(w.MEMBER),
+                "remove_allergies": ["sesame"],
+                "remove_diets": ["vegan"],
+            }
+        ],
+        "budget_minor": None,
+        "unmatched": [],
+    }
+    proposal = _propose(setup_world, answer)
+
+    def sams() -> list[tuple[str, str]]:
+        rows = w.query(
+            setup_world, "SELECT kind, value FROM member_constraints WHERE user_id = %s", w.MEMBER
+        )
+        return sorted((r["kind"], r["value"]) for r in rows)
+
+    yes = _ob_tap(setup_world, monkeypatch, "wamid.rm", ids.setup_button(proposal, "yes"))
+    assert yes is not None
+    assert [r["template"] for r in _replies(setup_world, yes, "wamid.rm")] == [
+        "setup_saved",
+        "setup_remove_confirm",
+        "setup_remove_confirm",
+    ]
+    assert sams() == [("allergy", "sesame"), ("diet", "vegan")]  # nothing removed yet
+
+    remove = _ob_tap(setup_world, monkeypatch, "wamid.rm0", ids.setup_button(proposal, "remove", 0))
+    assert remove is not None
+    assert sams() == [("diet", "vegan")]
+    assert _replies(setup_world, remove, "wamid.rm0") == []  # not the last removal
+    assert _proposal_status(setup_world, proposal) == "awaiting_remove"
+
+    keep = _ob_tap(setup_world, monkeypatch, "wamid.rm1", ids.setup_button(proposal, "keep", 1))
+    assert keep is not None
+    assert sams() == [("diet", "vegan")]
+    assert _replies(setup_world, keep, "wamid.rm1") == [_body("setup_saved")]
+    assert _proposal_status(setup_world, proposal) == "applied"
+
+    # A second answer to the same removal is already decided and changes nothing.
+    late = _ob_tap(setup_world, monkeypatch, "wamid.rm2", ids.setup_button(proposal, "keep", 0))
+    assert late is not None
+    assert _replies(setup_world, late, "wamid.rm2") == [_body("already_decided")]
+    assert sams() == [("diet", "vegan")]
+
+
+@pytest.mark.parametrize("children", [True, False])
+def test_setup_tap_non_admin(
+    setup_world: str, monkeypatch: pytest.MonkeyPatch, children: bool
+) -> None:
+    answer = SETUP_ANSWER if children else {**SETUP_ANSWER, "people": SETUP_ANSWER["people"][:1]}
+    proposal = _propose(setup_world, answer)
+    before = _saved(setup_world)
+    calls = _Calls()
+    button = ids.setup_button(proposal, "yes")
+    run_id = _ob_tap(setup_world, monkeypatch, "wamid.na", button, calls, phone=w.MEMBER_PHONE)
+    assert run_id is not None
+    # With new children, `create_child` refuses the member and `apply_setup` is not
+    # called; without, `apply_setup` refuses. Either way nothing is written.
+    tools = [c[0] for c in calls.calls]
+    assert tools == (["create_child"] if children else ["apply_setup"])
+    assert _children(setup_world) == []
+    assert _saved(setup_world) == before
+    assert _proposal_status(setup_world, proposal) == "pending"
+    [reply] = _replies(setup_world, run_id, "wamid.na")
+    assert reply == {
+        "user_id": str(w.MEMBER),
+        "template": "setup_not_admin",
+        "params": {"admin": "Asha"},
+        "buttons": [],
+    }
+    run = _run_row(setup_world, run_id)
+    assert (run["status"], run["reason"]) == ("completed", "not_admin")
+
+
+def test_setup_tap_expired(setup_world: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    expired = _propose(setup_world, expired=True)
+    older = _propose(setup_world)
+    with psycopg.connect(setup_world) as conn:
+        conn.execute(
+            "UPDATE onboarding_proposals SET status = 'superseded' WHERE proposal_id = %s",
+            (older,),
+        )
+    before = _saved(setup_world)
+    for n, proposal in enumerate((expired, older)):
+        for answer in ("yes", "no"):
+            calls = _Calls()
+            external_id = f"wamid.exp{n}{answer}"
+            button = ids.setup_button(proposal, answer)  # type: ignore[arg-type]
+            run_id = _ob_tap(setup_world, monkeypatch, external_id, button, calls)
+            assert run_id is not None
+            # No child is created for a proposal that cannot be applied.
+            assert [c[0] for c in calls.calls] == ["apply_setup"]
+            assert _replies(setup_world, run_id, external_id) == [_body("setup_expired")]
+    assert _children(setup_world) == []
+    assert _saved(setup_world) == before
+
+
+def test_setup_tap_reply_order(setup_world: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    with psycopg.connect(setup_world) as conn:
+        conn.execute("UPDATE users SET display_name = 'Sam' WHERE user_id = %s", (w.MEMBER,))
+        conn.execute(
+            "INSERT INTO member_constraints (user_id, kind, value) VALUES (%s, 'allergy', 'fish')",
+            (w.MEMBER,),
+        )
+    answer = {
+        "people": [
+            {"name": "Mira", "child": True, "add_allergies": ["peanuts"]},
+            {"name": "Sam", "child": False, "user_id": str(w.MEMBER), "remove_allergies": ["fish"]},
+            {"name": "Ravi", "phone": JOIN_PHONE, "child": False, "add_allergies": ["milk"]},
+        ],
+        "budget_minor": 12000,
+        "unmatched": [],
+    }
+    proposal = _propose(setup_world, answer)
+    run_id = _ob_tap(setup_world, monkeypatch, "wamid.order", ids.setup_button(proposal, "yes"))
+    assert run_id is not None
+    [code] = w.query(setup_world, "SELECT code FROM join_codes")
+    # setup_saved, then the removal confirms, a join_link per new adult, and setup_complete
+    # because the budget was just set; ordinals 0, 1, 2, 3.
+    assert _replies(setup_world, run_id, "wamid.order") == [
+        _body("setup_saved"),
+        _body(
+            "setup_remove_confirm",
+            {"value": "fish", "name": "Sam"},
+            [
+                {"payload": ids.setup_button(proposal, "remove", 0), "title": "Yes, remove"},
+                {"payload": ids.setup_button(proposal, "keep", 0), "title": "Keep"},
+            ],
+        ),
+        _body(
+            "join_link",
+            {
+                "name": "Ravi",
+                "phone": JOIN_PHONE,
+                "link": f"https://wa.me/15550109999?text=JOIN%20{code['code']}",
+            },
+        ),
+        _body("setup_complete"),
+    ]
+    # Every reply passes the sender's validation.
+    for body in _replies(setup_world, run_id, "wamid.order"):
+        WhatsAppOut.model_validate(body)

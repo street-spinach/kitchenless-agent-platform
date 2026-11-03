@@ -178,6 +178,9 @@ class Settings:
     wa_tpl_consent_revoked: str = _var({"api"}, "")
     wa_tpl_reminder_delivery_today: str = _var({"api"}, "")
     wa_tpl_reminder_pantry_summary: str = _var({"api"}, "")
+    # Experience §9: the business's WhatsApp number (E.164) that `join_link`'s
+    # `https://wa.me/<number>?text=JOIN%20<code>` opens; empty: no `join_link` is sent.
+    whatsapp_number: str = _var({"api"}, "")
     # On: `GET /app/insights` serves the fixed sample in services/api/insights_sample.yaml (§11).
     insights_sample: bool = _var({"api"}, False)
 

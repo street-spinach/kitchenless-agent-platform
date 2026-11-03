@@ -27,6 +27,10 @@
         approval button, starts a `chat` run (committed first, so the guard sees it) and
         calls `/mcp/household set_take_turns` with `api`'s service token; see
         `_take_turns_tap`.
+    *   A setup button (`ob:<proposal_id>:<answer>[:<n>]`, experience §9, EX-I30) starts a
+        household `chat` run with `source: "tap"` (committed first), registers each new
+        child with `create_child` on "Yes, save", then calls `/mcp/household apply_setup`
+        with `api`'s service token and sends the §9 replies; see `_setup_tap`.
     *   `rs:stop` and `me:<page>` (experience §7, §10, EX-I34): a code reply, see below.
     *   Any other button starts nothing.
 4.  Text equal to "retry", any case: if `runs.retry_target` finds a run, start a new run
@@ -79,8 +83,9 @@ from services.common.config import get_settings
 from services.common.mcp_client import ToolRefused, call_tool_as
 from services.common.run_context import RunContext
 from services.common.trace import TraceStore
-from services.identity import grants
+from services.identity import grants, onboarding
 from services.identity.errors import GrantError
+from services.mcp.household.server import NOT_ADMIN, SETUP_EXPIRED, setup_removals
 from services.safety.scope import unscoped
 
 __all__ = [
@@ -111,6 +116,8 @@ __all__ = [
 log = logging.getLogger(__name__)
 
 CallTool = Callable[..., Awaitable[dict[str, Any]]]
+# `onboarding.create_child(conn, admin_user_id, household_id, display_name)`.
+AddChild = Callable[[AsyncConnection, uuid.UUID, str, str], Awaitable[uuid.UUID]]
 
 WHATSAPP = "channel:whatsapp"
 # The sender of replies `api` writes itself (architecture §3).
@@ -139,6 +146,24 @@ CONSENT_RENEWAL = "consent_renewal"
 # A run that only carries a code-built reply (experience §3): no household, so it is exempt
 # from the grant check, and `runs.retry_target` skips it.
 CODE_SOURCE = "code"
+# A setup tap's run (experience §3), also skipped by `runs.retry_target`.
+TAP_SOURCE = "tap"
+# Setup taps (experience §6, §9; EX-I30).
+APPLY_SETUP = "apply_setup"
+SETUP_SAVED = "setup_saved"
+SETUP_REMOVE_CONFIRM = "setup_remove_confirm"
+SETUP_COMPLETE = "setup_complete"
+SETUP_DISCARDED = "setup_discarded"
+SETUP_NOT_ADMIN = "setup_not_admin"
+SETUP_EXPIRED_REPLY = "setup_expired"
+JOIN_LINK = "join_link"
+RETRY_PROMPT = "retry_prompt"
+CREATE_CHILD_FAILED = "create_child_failed"
+SETUP_REMOVE_TITLE = "Yes, remove"
+SETUP_KEEP_TITLE = "Keep"
+# `setup_not_admin` names the admin; a household without one gets this instead (as the
+# consumer graph's `dislike_not_saved`).
+ADMIN_FALLBACK = "your household admin"
 # Text commands and page taps (experience §6, §7, §10; EX-I34).
 ME_LINK = "me_link"
 REMINDERS_OFF = "reminders_off"
@@ -313,6 +338,7 @@ async def ingest(
     run_id: uuid.UUID | None = None,
     call_tool: CallTool = mcp_client.call_tool_as,
     reply_unknown: SendUnknownNumber = send_unknown_number,
+    add_child: AddChild = onboarding.create_child,
 ) -> uuid.UUID | None:
     """Handle one inbound message in one transaction; return the run it started, if any
     (for an approval button, the approval's run).
@@ -321,9 +347,10 @@ async def ingest(
     `chat` run and the consumer agent classifies it. `call_tool` reaches `/mcp/household`
     for an approval button. `reply_unknown` sends the `unknown_number` reply to a phone
     that is not registered, after the inbound row is committed (a duplicate gets none).
+    `add_child` registers each new child on a setup "Yes, save" tap (identity-authz I23).
     """
     result = await _ingest(
-        conn, channel, external_id, phone, content, kind, overrides, run_id, call_tool
+        conn, channel, external_id, phone, content, kind, overrides, run_id, call_tool, add_child
     )
     if isinstance(result, _Unregistered):
         await reply_unknown(phone)
@@ -341,6 +368,7 @@ async def _ingest(
     overrides: dict[str, Any] | None,
     run_id: uuid.UUID | None,
     call_tool: CallTool,
+    add_child: AddChild,
 ) -> uuid.UUID | _Unregistered | None:
     async with conn.transaction():
         cur = await unscoped(conn, "ingest").execute(_INSERT_INBOUND_SQL, (channel, external_id))
@@ -376,9 +404,11 @@ async def _ingest(
                         _SET_RUN_SQL, (run, channel, external_id)
                     )
                 return None
-            # The take-turns tap is checked before the approval button (agents §10).
-            take_turns = ids.parse_take_turns_button(content.button)
-            if take_turns is None:
+            # A setup tap (experience §3, §9) gets a `chat` run with `source: "tap"`; the
+            # take-turns tap is checked before the approval button (agents §10).
+            setup = ids.parse_setup_button(content.button)
+            take_turns = None if setup is not None else ids.parse_take_turns_button(content.button)
+            if setup is None and take_turns is None:
                 tap = ids.parse_approval_button(content.button)
                 if tap is None:
                     log.info("inbound button ignored: not a shortfall, take-turns or approval")
@@ -389,8 +419,10 @@ async def _ingest(
                         _SET_RUN_SQL, (approval_run, channel, external_id)
                     )
                 return approval_run
-            # A new `chat` run, since the order's run has ended. It is committed below,
-            # before the tool call, so that the guard's step 0 sees it running.
+            if setup is not None:
+                trigger = {"source": TAP_SOURCE, "user_id": member.user_id, "inbound_id": inbound}
+            # A new `chat` run, since the order's run has ended (or the proposal's run). It is
+            # committed below, before the tool call, so that the guard's step 0 sees it running.
             started, ok = await _start(
                 conn, member, inbound, household_id=member.household_id, kind=CHAT, trigger=trigger
             )
@@ -411,8 +443,14 @@ async def _ingest(
             await unscoped(conn, "ingest").execute(_SET_RUN_SQL, (started, channel, external_id))
             return started
 
-    # Only a take-turns tap gets here.
+    # Only a setup or take-turns tap gets here.
     await conn.commit()
+    if setup is not None:
+        await _setup_tap(
+            conn, started, member, inbound, *setup, call_tool=call_tool, add_child=add_child
+        )
+        return started
+    assert take_turns is not None
     order_id, on = take_turns
     await _take_turns_tap(conn, started, member, inbound, order_id, on, call_tool=call_tool)
     return started
@@ -463,6 +501,186 @@ async def _take_turns_tap(
             state = {"state": "on" if result.get("take_turns") else "off"}
             await _reply(conn, run_id, member, inbound, TAKE_TURNS_SAVED, state)
         await runs.finish(conn, run_id, API_AGENT, "completed", SET_TAKE_TURNS)
+
+
+# The proposal a setup tap names, in the tapper's household only.
+_PROPOSAL_SQL = """
+SELECT status, expires_at <= now(), answer FROM onboarding_proposals
+WHERE proposal_id = %s AND household_id = %s
+"""
+
+# The household's first admin, named in `setup_not_admin` (as the consumer graph's
+# `dislike_not_saved`, experience EX-I2).
+_ADMIN_NAME_SQL = """
+SELECT u.display_name FROM household_members m JOIN users u ON u.user_id = m.user_id
+WHERE m.household_id = %s AND m.role = 'admin'
+ORDER BY m.created_at, m.user_id LIMIT 1
+"""
+
+# A reply: `(template, params, buttons)`.
+_Reply = tuple[str, dict[str, str], list[dict[str, str]]]
+
+
+async def _new_children(
+    conn: AsyncConnection, household_id: str, proposal_id: uuid.UUID
+) -> list[str]:
+    """The names of the new children (no `user_id`) of a `pending`, unexpired proposal of
+    the household, in answer order. Any other proposal gets none, so no child is created
+    for a tap `apply_setup` will refuse."""
+    cur = await unscoped(conn, "ingest").execute(_PROPOSAL_SQL, (proposal_id, household_id))
+    row = await cur.fetchone()
+    if row is None or row[0] != "pending" or row[1]:
+        return []
+    people = (row[2] or {}).get("people") or []
+    return [p["name"] for p in people if p.get("child") and not p.get("user_id")]
+
+
+async def _stored_removals(
+    conn: AsyncConnection, household_id: str, proposal_id: uuid.UUID
+) -> list[dict[str, str]]:
+    """The proposal's numbered removals, read after `apply_setup` committed."""
+    cur = await unscoped(conn, "ingest").execute(_PROPOSAL_SQL, (proposal_id, household_id))
+    row = await cur.fetchone()
+    return setup_removals(row[2] or {}) if row is not None else []
+
+
+def _join_link(number: str, code: str) -> str:
+    """`https://wa.me/<number>?text=JOIN%20<code>` (experience §9 "Joining")."""
+    return f"https://wa.me/{number.lstrip('+')}?text=JOIN%20{code}"
+
+
+def _setup_replies(
+    proposal_id: uuid.UUID,
+    answer: str,
+    result: dict[str, Any],
+    removals: list[dict[str, str]],
+) -> list[_Reply]:
+    """The §9 replies to an `apply_setup` result, in the listed order. `removals` is the
+    proposal's numbered removals (`setup_removals` of its stored answer)."""
+    outcome = result.get("outcome")
+    if outcome == "already_decided":
+        return [(ALREADY_DECIDED, {}, [])]
+    if outcome == "expired":
+        return [(SETUP_EXPIRED_REPLY, {}, [])]
+    if outcome != "done":
+        return []
+    if answer == "no":
+        return [(SETUP_DISCARDED, {}, [])]
+    if answer in ("remove", "keep"):
+        return [(SETUP_SAVED, {}, [])] if result.get("status") == "applied" else []
+    saved = result.get("saved") or {}
+    replies: list[_Reply] = [(SETUP_SAVED, {}, [])]
+    for n in result.get("removals_pending") or []:
+        removal = removals[n]
+        buttons = [
+            {"payload": ids.setup_button(proposal_id, "remove", n), "title": SETUP_REMOVE_TITLE},
+            {"payload": ids.setup_button(proposal_id, "keep", n), "title": SETUP_KEEP_TITLE},
+        ]
+        params = {"value": removal["value"], "name": removal["name"]}
+        replies.append((SETUP_REMOVE_CONFIRM, params, buttons))
+    codes = saved.get("join_codes") or []
+    number = get_settings().whatsapp_number if codes else ""
+    if codes and not number:
+        log.warning("join_link not sent: WHATSAPP_NUMBER is not set")
+    for code in codes if number else []:
+        params = {
+            "name": code["name"],
+            "phone": code["phone"],
+            "link": _join_link(number, code["code"]),
+        }
+        replies.append((JOIN_LINK, params, []))
+    if saved.get("budget_set"):
+        replies.append((SETUP_COMPLETE, {}, []))
+    return replies
+
+
+async def _setup_tap(
+    conn: AsyncConnection,
+    run_id: uuid.UUID,
+    member: _Member,
+    inbound: uuid.UUID,
+    proposal_id: uuid.UUID,
+    answer: str,
+    removal: int | None,
+    *,
+    call_tool: CallTool,
+    add_child: AddChild,
+) -> None:
+    """A setup tap (experience §9, EX-I30), in its committed `chat` run.
+
+    For "Yes, save" on a `pending`, unexpired proposal, `create_child` registers each new
+    child first, all in one transaction: if any fails, none is kept, `apply_setup` is not
+    called and the reply is `retry_prompt` (§16; both are idempotent, so the tap can be
+    sent again). A tapper who is not an admin gets `setup_not_admin`. Then `apply_setup`
+    with `api`'s service token, with `child_user_ids` keyed by the name as written. Its
+    `not_admin` and `setup_expired` refusals reply `setup_not_admin` and `setup_expired`;
+    any other refusal is logged and sends nothing. Every reply gets its own ordinal
+    `ids.message_id(inbound, n)`, in the §9 order, and the run ends `completed`.
+
+    If the tool cannot be reached the error propagates, nothing is sent and the run is
+    left to its `run_timeout`, as for the take-turns tap.
+    """
+    children: dict[str, str] = {}
+    replies: list[_Reply] | None = None
+    result: dict[str, Any] = {}
+    reason = APPLY_SETUP
+    if answer == "yes":
+        try:
+            async with conn.transaction():
+                for name in await _new_children(conn, member.household_id, proposal_id):
+                    child = await add_child(conn, member.user_id, member.household_id, name)
+                    children[name] = str(child)
+        except onboarding.NotAdmin:
+            log.info("setup tap refused: not an admin")
+            replies, reason = [], NOT_ADMIN
+        except Exception as exc:  # Keycloak, OpenFGA or the database: nothing is kept
+            log.warning("create_child failed: %s", type(exc).__name__)
+            replies, reason = [(RETRY_PROMPT, {}, [])], CREATE_CHILD_FAILED
+    if replies is None:
+        args = {
+            "proposal_id": str(proposal_id),
+            "answer": answer,
+            "removal": removal,
+            "child_user_ids": children,
+            "user_id": str(member.user_id),
+        }
+        ctx = RunContext(run_id=run_id, agent_id=API_AGENT, conversation_id=None)
+        try:
+            result = await call_tool(HOUSEHOLD_SERVER, APPLY_SETUP, args, ctx=ctx)
+        except ToolRefused as refused:
+            log.info("setup tap refused: %s", refused.reason)
+            replies = [(SETUP_EXPIRED_REPLY, {}, [])] if refused.reason == SETUP_EXPIRED else []
+            reason = refused.reason
+    async with conn.transaction():
+        if replies is None:
+            removals = (
+                await _stored_removals(conn, member.household_id, proposal_id)
+                if result.get("removals_pending")
+                else []
+            )
+            replies = _setup_replies(proposal_id, answer, result, removals)
+        if reason == NOT_ADMIN:
+            cur = await unscoped(conn, "ingest").execute(_ADMIN_NAME_SQL, (member.household_id,))
+            (name,) = await cur.fetchone() or (None,)
+            replies = [(SETUP_NOT_ADMIN, {"admin": name or ADMIN_FALLBACK}, [])]
+        for n, (template, params, buttons) in enumerate(replies):
+            await outbox.send(
+                conn,
+                message_id=ids.message_id(inbound, n),
+                run_id=run_id,
+                conversation_id=None,
+                causation_id=None,
+                from_agent=API_AGENT,
+                to_agent=WHATSAPP,
+                type="whatsapp_out",
+                body={
+                    "user_id": str(member.user_id),
+                    "template": template,
+                    "params": params,
+                    "buttons": buttons,
+                },
+            )
+        await runs.finish(conn, run_id, API_AGENT, "completed", reason)
 
 
 async def _start(
