@@ -27,6 +27,11 @@ sends the same message ids and changes nothing twice.
 *   `quote_round_closed` (`round = delivery`): the cheapest live courier quote inside the
     requested window, then `place_order`, `order_confirm` and `delivery_request`. With no
     courier: `rejected`, `closed_by = seller` and `reject {reason: no_courier}`.
+*   `delivery_quote` (agent-protocol message 14): the courier stored its quote row in the
+    same commit, and the courier round reads the rows when it closes, so a quote inside the
+    round needs no action. After the round closed (order placed, or no accepted quote), a
+    `late_courier_quote` decision (the §6 arrival table).
+*   `delivery_booked` (message 16): the store takes no action.
 *   A step that rejects a quote whose buyer is `external:a2a-demo` also finishes the run
     `cancelled` (`a2a_demo_closed`, §11).
 *   `shortfall_detected` (§10): for each missing order line, `search_items` with the
@@ -125,6 +130,8 @@ HANDLED_TYPES = frozenset(
         "reject",
         "cancel",
         "quote_round_closed",
+        "delivery_quote",
+        "delivery_booked",
         "shortfall_detected",
         "shortfall_decision",
         "protocol_error",
@@ -1005,6 +1012,19 @@ class SellerHandler:
         if amended["state"] == "failed":
             confirm["reason"] = NOTHING_TO_DELIVER
         step.send(step.msg.row.from_agent, "order_confirm", confirm, conversation_id=conversation)
+
+    # Courier replies to the store ---------------------------------------------------------
+
+    async def _delivery_quote(self, step: _Step) -> None:
+        order_id = step.msg.body.order_id  # type: ignore[attr-defined]
+        quote = await self.store.accepted_quote(order_id, step.card.agent_id)
+        order = await self.store.order(order_id)
+        if quote is None or (order is not None and order.state in orders.PLACED_OR_LATER):
+            await self._decision(step, "delivery_quote", "late_courier_quote")
+
+    async def _delivery_booked(self, step: _Step) -> None:
+        # Nothing to do: the household agent tracks the order (agent-protocol message 16).
+        return
 
     # protocol_error -----------------------------------------------------------------------
 
