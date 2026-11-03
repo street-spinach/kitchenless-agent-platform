@@ -1,22 +1,29 @@
 """The WhatsApp sender: the `api` host's handler for `whatsapp_out` (architecture item 39).
 
-`dispatch` looks up the member's phone and its `channel_mode`:
+`dispatch` looks up the member's phone, its `channel_mode` and its window state
+(`last_inbound_at`), then follows experience §5:
 
-*   `sim`: insert the message into `sim_outbound`, with the Graph payload it would send
-    under `graph`. The Graph API is never called. A body that breaks the Graph limits is
-    not inserted; a `decision` trace row records outcome `refused` (EX-I3).
-*   `real`: call `send_real`. `main.py` passes `GraphSender`, which calls the Graph API
-    (issue #73): 3 attempts in total over about a minute, then `StepFailed`, so the row
-    becomes `failed` and the run is unaffected (§9). A `Sender` built without `send_real`
-    raises `RealSendUnavailable` (fails closed).
+1.  Render and validate the body (both paths). A body that breaks the Graph limits ends
+    with outcome `refused`, reason `whatsapp_unrenderable`.
+2.  Inside the window (`last_inbound_at` within 23 h 45 min): send; outcome `sent`.
+    *   `sim`: insert into `sim_outbound`, with the Graph payload under `graph`. The Graph
+        API is never called.
+    *   `real`: call `send_real`. `main.py` passes `GraphSender`, which calls the Graph API
+        (issue #73): 3 attempts in total over about a minute, then `StepFailed`, so the row
+        becomes `failed` and the run is unaffected (§9). A Graph 131047 (outside the window
+        after all) raises `GraphRefused` and continues at step 3. A `Sender` built without
+        `send_real` raises `RealSendUnavailable` (fails closed).
+3.  Outside: no Meta template is sent yet (EX-I13). A holdable message is held
+    (`held_messages`, outcome `held`); anything else is `skipped`.
 
-The Graph API decides the 24-hour customer service window: a send outside it is refused
-there and counts as a failed attempt. Templates for that case are Q5 (experience design).
+Every outcome writes one `whatsapp_sends` row and one `decision` trace row
+(`node: whatsapp_window`). A replayed step whose `whatsapp_sends` row exists does nothing.
 
 A member with no phone has nothing to send to, and the message is dropped with a log line.
 """
 
 import asyncio
+import datetime
 import logging
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
@@ -27,6 +34,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from services.api.connect import Connect, pool_connect
+from services.api.whatsapp import templates
 from services.common.config import Settings
 from services.common.consumer import Inbound, StepFailed, StepResult
 from services.common.trace import TraceStore
@@ -34,16 +42,24 @@ from services.common.trace import TraceStore
 __all__ = [
     "ATTEMPTS",
     "GRAPH_URL",
+    "HELD",
+    "NO_TEMPLATE",
+    "OUTSIDE_WINDOW",
+    "OUTSIDE_WINDOW_CODE",
     "MAX_BODY_CHARS",
     "MAX_BUTTONS",
     "MAX_TITLE_CHARS",
     "REFUSED",
     "RETRY_DELAYS_SECONDS",
     "SEND_FAILED",
+    "SENT",
+    "SKIPPED",
     "TEXTS",
     "UNRENDERABLE",
     "WHERE",
+    "WINDOW",
     "WINDOW_NODE",
+    "GraphRefused",
     "GraphSender",
     "RealSendUnavailable",
     "Sender",
@@ -53,10 +69,26 @@ __all__ = [
 
 log = logging.getLogger(__name__)
 
-# One phone per member; the earliest wins if there are more.
+# One phone per member; the earliest wins if there are more. `inside` is the window check
+# (experience §5): NULL `last_inbound_at` is outside (fails closed).
 _PHONE_SQL = """
-SELECT phone_e164, channel_mode FROM channel_identities
-WHERE user_id = %s ORDER BY created_at, phone_e164 LIMIT 1
+SELECT phone_e164, channel_mode, last_inbound_at,
+       coalesce(last_inbound_at > now() - %(window)s::interval, false) AS inside
+FROM channel_identities
+WHERE user_id = %(user_id)s ORDER BY created_at, phone_e164 LIMIT 1
+"""
+
+# A step replayed after its outcome was written does nothing again.
+_DONE_SQL = "SELECT 1 FROM whatsapp_sends WHERE message_id = %s"
+
+_SENDS_SQL = """
+INSERT INTO whatsapp_sends (message_id, user_id, outcome, reason, graph_message_id)
+VALUES (%s, %s, %s, %s, %s) ON CONFLICT (message_id) DO NOTHING
+"""
+
+_HOLD_SQL = """
+INSERT INTO held_messages (message_id, user_id, body, ref_kind, ref_id)
+VALUES (%s, %s, %s, %s, %s) ON CONFLICT (message_id) DO NOTHING
 """
 
 # A replayed step (the row went back to `pending` after the insert) inserts nothing again.
@@ -72,14 +104,23 @@ WHERE NOT EXISTS (SELECT 1 FROM sim_outbound
 _TRACES = TraceStore(None)  # type: ignore[arg-type]
 WHATSAPP = "channel:whatsapp"
 
-SendReal = Callable[[str, dict[str, Any]], Awaitable[None]]
+# Returns the Graph message id (`messages[0].id`), or `None` if the response has none.
+SendReal = Callable[[str, dict[str, Any]], Awaitable[str | None]]
 
 
 class RealSendUnavailable(RuntimeError):
     """This `Sender` was built without a real sender."""
 
 
-async def not_built(phone: str, body: dict[str, Any]) -> None:
+class GraphRefused(Exception):
+    """The Graph API refused a send with an error code that a retry cannot change."""
+
+    def __init__(self, code: int) -> None:
+        super().__init__(f"Graph error {code}")
+        self.code = code
+
+
+async def not_built(phone: str, body: dict[str, Any]) -> str | None:
     raise RealSendUnavailable("this Sender has no real WhatsApp sender")
 
 
@@ -101,7 +142,19 @@ MAX_TITLE_CHARS = 20
 MAX_BODY_CHARS = 1024
 # The `decision` trace row for a send's outcome (experience §5 and §15).
 WINDOW_NODE = "whatsapp_window"
+# Outcomes and reasons (experience §5). `template` comes with EX-I13.
+SENT = "sent"
+HELD = "held"
+SKIPPED = "skipped"
 REFUSED = "refused"
+OUTSIDE_WINDOW = "outside_window"
+NO_TEMPLATE = "no_template"
+# Inside means `last_inbound_at` later than now minus 23 h 45 min; the margin fails closed.
+WINDOW = datetime.timedelta(hours=23, minutes=45)
+# Graph: the person is outside the window (§5 step 7). Not retried.
+OUTSIDE_WINDOW_CODE = 131047
+# Template refused or paused (§5 step 7); handled by EX-I13. Not retried.
+_TEMPLATE_REFUSED_CODES = range(132000, 133000)
 
 # The message catalog (experience §6). `{x}` is a `params` value; lists are passed already
 # joined, as one string param. A key that is not here is not sent (fails closed).
@@ -222,9 +275,12 @@ def graph_payload(phone: str, body: dict[str, Any]) -> dict[str, Any] | None:
 class GraphSender:
     """`send_real` for `channel_mode='real'` phones: one Graph API text or button message.
 
-    An attempt that times out, fails to connect or gets a non-2xx response is retried after
-    `RETRY_DELAYS_SECONDS`; after `ATTEMPTS` it raises `StepFailed`. A body that cannot be
-    rendered, or missing credentials, raise `StepFailed` without calling the Graph API.
+    Returns the Graph message id (`messages[0].id`). A Graph error body with code 131047
+    or 132000-132999 raises `GraphRefused(code)` at once: a retry cannot change it. Any
+    other failed attempt (a timeout, a connection error, another non-2xx response) is
+    retried after `RETRY_DELAYS_SECONDS`; after `ATTEMPTS` it raises `StepFailed`. A body
+    that cannot be rendered, or missing credentials, raise `StepFailed` without calling the
+    Graph API.
     """
 
     def __init__(
@@ -246,7 +302,7 @@ class GraphSender:
     def from_settings(cls, settings: Settings) -> "GraphSender":
         return cls(settings.whatsapp_token or "", settings.whatsapp_phone_number_id or "")
 
-    async def __call__(self, phone: str, body: dict[str, Any]) -> None:
+    async def __call__(self, phone: str, body: dict[str, Any]) -> str | None:
         payload = graph_payload(phone, body)
         if payload is None:
             raise StepFailed(WHERE, UNRENDERABLE)
@@ -261,7 +317,10 @@ class GraphSender:
                 try:
                     response = await client.post(url, json=payload, headers=headers)
                     if response.is_success:
-                        return
+                        return _graph_message_id(response)
+                    code = _graph_error_code(response)
+                    if code == OUTSIDE_WINDOW_CODE or code in _TEMPLATE_REFUSED_CODES:
+                        raise GraphRefused(code)
                     error = f"HTTP {response.status_code}"
                 except httpx.HTTPError as exc:
                     error = type(exc).__name__
@@ -269,6 +328,31 @@ class GraphSender:
                 if attempt < ATTEMPTS:
                     await self._sleep(self._delays[min(attempt, len(self._delays)) - 1])
         raise StepFailed(WHERE, SEND_FAILED)
+
+
+def _json(response: httpx.Response) -> Any:
+    try:
+        return response.json()
+    except ValueError:
+        return None
+
+
+def _graph_message_id(response: httpx.Response) -> str | None:
+    data = _json(response)
+    try:
+        message_id = data["messages"][0]["id"]
+    except (KeyError, IndexError, TypeError):
+        return None
+    return message_id if isinstance(message_id, str) and message_id else None
+
+
+def _graph_error_code(response: httpx.Response) -> int | None:
+    data = _json(response)
+    try:
+        code = data["error"]["code"]
+    except (KeyError, TypeError):
+        return None
+    return code if isinstance(code, int) else None
 
 
 # --- the handler ------------------------------------------------------------------------
@@ -286,18 +370,26 @@ class Sender:
         if row.type != "whatsapp_out":
             raise ValueError(f"the api host only sends whatsapp_out, got {row.type!r}")
         body = msg.body.model_dump(mode="json")
+        user_id = body["user_id"]
         async with self._connect() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(_PHONE_SQL, (body["user_id"],))
+                await cur.execute(_PHONE_SQL, {"window": WINDOW, "user_id": user_id})
                 phone = await cur.fetchone()
-            if phone is None:
-                log.warning("whatsapp_out %s: the member has no phone", row.message_id)
+                if phone is None:
+                    log.warning("whatsapp_out %s: the member has no phone", row.message_id)
+                    return StepResult()
+                await cur.execute(_DONE_SQL, (row.message_id,))
+                if await cur.fetchone() is not None:
+                    return StepResult()  # a replayed step: its outcome is written
+            graph = graph_payload(phone["phone_e164"], body)
+            if graph is None:
+                log.warning("whatsapp_out %s: %s", row.message_id, UNRENDERABLE)
+                await _record(conn, msg, user_id, REFUSED, UNRENDERABLE)
+                return StepResult()
+            if not phone["inside"]:
+                await _outside(conn, msg, body)
                 return StepResult()
             if phone["channel_mode"] == "sim":
-                graph = graph_payload(phone["phone_e164"], body)
-                if graph is None:
-                    await _refuse_unrenderable(conn, msg, body["user_id"])
-                    return StepResult()
                 payload = {"message_id": str(row.message_id), **body, "graph": graph}
                 async with conn.transaction():
                     await conn.execute(
@@ -309,24 +401,58 @@ class Sender:
                             "message_id": str(row.message_id),
                         },
                     )
+                    await _record(conn, msg, user_id, SENT, None)
                 return StepResult()
-        await self._send_real(phone["phone_e164"], body)
+            try:
+                graph_message_id = await self._send_real(phone["phone_e164"], body)
+            except GraphRefused as refused:
+                if refused.code != OUTSIDE_WINDOW_CODE:
+                    raise StepFailed(WHERE, SEND_FAILED) from refused
+                # Outside after all (§5 step 7): not retried; continue as outside.
+                await _outside(conn, msg, body)
+                return StepResult()
+            await _record(conn, msg, user_id, SENT, None, graph_message_id)
         return StepResult()
 
 
-async def _refuse_unrenderable(conn: AsyncConnection, msg: Inbound, user_id: str) -> None:
-    """A sim send that breaks the Graph limits: no `sim_outbound` row, and one `decision`
-    trace row with outcome `refused` (EX-I3; the `whatsapp_sends` row comes with X9)."""
-    log.warning("whatsapp_out %s: %s", msg.row.message_id, UNRENDERABLE)
+async def _outside(conn: AsyncConnection, msg: Inbound, body: dict[str, Any]) -> None:
+    """§5 steps 4-6 outside the window. No Meta template is sent until EX-I13, so step 4
+    finds none: a holdable message is held, anything else is skipped."""
+    key = body["template"]
+    ref = body.get("ref") or {}
+    if templates.holdable(key, ref.get("kind")):
+        async with conn.transaction():
+            await conn.execute(
+                _HOLD_SQL,
+                (msg.row.message_id, body["user_id"], Jsonb(body), ref["kind"], ref["id"]),
+            )
+            await _record(conn, msg, body["user_id"], HELD, None)
+        return
+    reason = NO_TEMPLATE if key in templates.REMINDER_KEYS else OUTSIDE_WINDOW
+    await _record(conn, msg, body["user_id"], SKIPPED, reason)
+
+
+async def _record(
+    conn: AsyncConnection,
+    msg: Inbound,
+    user_id: str,
+    outcome: str,
+    reason: str | None,
+    graph_message_id: str | None = None,
+) -> None:
+    """One `whatsapp_sends` row and one `decision` trace row for a send's outcome (§5)."""
     async with conn.transaction():
+        await conn.execute(
+            _SENDS_SQL, (msg.row.message_id, user_id, outcome, reason, graph_message_id)
+        )
         await _TRACES.write(
             msg.row.run_id,
             WHATSAPP,
             "decision",
             {
                 "node": WINDOW_NODE,
-                "choice": REFUSED,
-                "reason": UNRENDERABLE,
+                "choice": outcome,
+                "reason": reason,
                 "explanation": "",
                 "ref": str(msg.row.message_id),
             },

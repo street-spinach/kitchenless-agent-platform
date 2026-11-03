@@ -24,7 +24,7 @@ RETRY = {"user_id": str(uuid.uuid4()), "template": "retry_prompt", "params": {},
 class Graph:
     """A mock Graph API that answers each request with the next of `responses`."""
 
-    def __init__(self, *responses: int | Exception) -> None:
+    def __init__(self, *responses: int | tuple[int, dict[str, Any]] | Exception) -> None:
         self.responses = list(responses)
         self.requests: list[httpx.Request] = []
         self.sleeps: list[float] = []
@@ -34,6 +34,8 @@ class Graph:
         result = self.responses.pop(0)
         if isinstance(result, Exception):
             raise result
+        if isinstance(result, tuple):
+            return httpx.Response(result[0], json=result[1])
         return httpx.Response(result, json={})
 
     async def sleep(self, seconds: float) -> None:
@@ -232,6 +234,31 @@ def test_unrenderable_body_fails_without_calling_graph(body: dict[str, Any]) -> 
     assert graph.requests == []
 
 
+def test_window_refusal_not_retried() -> None:
+    # Experience §5 step 7: 131047 means the person is outside the window; a retry can't
+    # change that, so it raises `GraphRefused` after one request, with no sleep.
+    graph = Graph((400, {"error": {"code": s.OUTSIDE_WINDOW_CODE, "message": "outside"}}))
+    with pytest.raises(s.GraphRefused) as err:
+        asyncio.run(graph.sender()(PHONE, RETRY))
+    assert err.value.code == s.OUTSIDE_WINDOW_CODE
+    assert len(graph.requests) == 1
+    assert graph.sleeps == []
+
+
+def test_other_graph_error_codes_keep_three_attempts() -> None:
+    error = (400, {"error": {"code": 131026, "message": "undeliverable"}})
+    graph = Graph(error, error, error)
+    with pytest.raises(StepFailed):
+        asyncio.run(graph.sender()(PHONE, RETRY))
+    assert len(graph.requests) == s.ATTEMPTS
+
+
+def test_graph_sender_returns_message_id() -> None:
+    graph = Graph((200, {"messages": [{"id": "wamid.ABC"}]}), 200)
+    assert asyncio.run(graph.sender()(PHONE, RETRY)) == "wamid.ABC"
+    assert asyncio.run(graph.sender()(PHONE, RETRY)) is None  # no id in the response
+
+
 @pytest.mark.parametrize(("token", "phone_number_id"), [("", PHONE_NUMBER_ID), (TOKEN, "")])
 def test_missing_credentials_fail_without_calling_graph(token: str, phone_number_id: str) -> None:
     graph = Graph()
@@ -267,9 +294,10 @@ def sim_world(pg: str, monkeypatch: pytest.MonkeyPatch) -> str:
 
 def _sim_send(world: str, body: dict[str, Any]) -> Inbound:
     body = {"user_id": str(w.MEMBER), "params": {}, "buttons": [], **body}
+    message_id, run_id = w.sent_message(world, "system:runs", w.WHATSAPP, "whatsapp_out", body)
     row = AgentMessageRow(
-        message_id=uuid.uuid4(),
-        run_id=uuid.uuid4(),
+        message_id=message_id,
+        run_id=run_id,
         conversation_id=None,
         causation_id=None,
         from_agent="system:runs",
@@ -306,6 +334,12 @@ def test_sim_applies_limits(sim_world: str, body: dict[str, Any]) -> None:
         s.UNRENDERABLE,
     )
     assert payload["ref"] == str(msg.row.message_id)
+    [send] = w.query(sim_world, "SELECT * FROM whatsapp_sends")
+    assert (send["message_id"], send["outcome"], send["reason"]) == (
+        msg.row.message_id,
+        s.REFUSED,
+        s.UNRENDERABLE,
+    )
 
 
 @pytest.mark.db
@@ -325,7 +359,9 @@ def test_sim_keeps_message_id_and_template(sim_world: str) -> None:
     assert body["graph"]["to"] == w.MEMBER_PHONE.removeprefix("+")
     assert body["graph"]["interactive"]["body"]["text"] == s.TEXTS["retry_prompt"]
     assert second["body"]["graph"]["text"]["body"] == longest
-    assert w.query(sim_world, "SELECT * FROM agent_traces") == []
+    # X9: each send writes one `sent` decision row; the replay writes nothing more.
+    traces = w.query(sim_world, "SELECT * FROM agent_traces")
+    assert [t["payload"]["choice"] for t in traces] == [s.SENT, s.SENT]
 
     resp = w.client(sim_world).get(f"/internal/sim/outbox?phone={w.MEMBER_PHONE}&after_id=0")
     assert [m["id"] for m in resp.json()["messages"]] == [first["id"], second["id"]]
