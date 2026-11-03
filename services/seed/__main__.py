@@ -10,7 +10,9 @@ Identity (identity-authz I27, build step 5): members get `users.keycloak_sub` fr
 `keycloak_user_id`; every seeded agent and `system:api` get an `agent_clients` row; eval
 households always, and simulated households under `TOKEN_SOURCE=mock`, get mock grants
 renewed to 30 days on every run. `main` then calls `seed_fga`: `fga.sync_agent` for every
-seeded agent, then `fga.reconcile()`.
+seeded agent, the seeded owners' `owner` tuples, then `fga.reconcile()`.
+Owner rules (build step 13): `restaurant:square-us` keeps 95 % floors and gets
+`max_discount_pct = 4`, so the owner rule binds in I-CUJ 7 (I-A19).
 """
 
 import argparse
@@ -278,6 +280,17 @@ def _seed_business(conn: psycopg.Connection, data: dict[str, Any]) -> None:
                 ["agent_id", "kind"],
                 {"agent_id": agent_id, "kind": "delivery", "value": dict(rules["delivery"])},
             )
+        if "max_discount_pct" in rules:
+            # The owner rule (identity-authz I27 step 13, I-A19); `api` changes it later.
+            pct = rules["max_discount_pct"]
+            if isinstance(pct, bool) or not isinstance(pct, int) or not 0 <= pct <= 100:
+                raise SeedError(f"{agent_id}: max_discount_pct must be an integer from 0 to 100")
+            _upsert(
+                conn,
+                "business_rules",
+                ["agent_id", "kind"],
+                {"agent_id": agent_id, "kind": "max_discount_pct", "value": Jsonb(pct)},
+            )
         if "floor_pct" not in rules:
             continue
         prices = _seeded_prices(data, agent_id)
@@ -465,16 +478,28 @@ def _seed_agent_clients(conn: psycopg.Connection) -> None:
         )
 
 
-def seed_fga(conn: psycopg.Connection) -> None:
-    """Write the structural OpenFGA tuples of every seeded agent, then reconcile the store
-    with Postgres (identity-authz §7, I27)."""
+def owner_tuples(data: dict[str, Any]) -> list[tuple[str, str, str]]:
+    """`user:<keycloak_user_id> owner org:<org_id>` for each seeded owner (identity-authz
+    §7: the seeded owner, written by the seed). An owner token's `sub` is that id."""
+    return sorted(
+        (f"user:{o['keycloak_user_id']}", "owner", f"org:{o['org_id']}")
+        for o in data["agents"]["owners"]
+    )
+
+
+def seed_fga(conn: psycopg.Connection, data: dict[str, Any] | None = None) -> None:
+    """Write the structural OpenFGA tuples of every seeded agent and the seeded owners'
+    tuples, then reconcile the store with Postgres (identity-authz §7, I27)."""
     from services.identity import fga
 
+    data = load_data() if data is None else data
     agents = conn.execute(
         "SELECT agent_id FROM agent_cards WHERE enabled ORDER BY agent_id"
     ).fetchall()
     for (agent_id,) in agents:
         fga.sync_agent(conn, agent_id)
+    # `org owner` has no Postgres source, so `reconcile` leaves these alone (fga.MANAGED).
+    fga.ensure(owner_tuples(data))
     fga.reconcile(conn)
 
 
@@ -596,7 +621,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 data=data,
                 token_source=settings.token_source or MOCK_TOKEN_SOURCE,
             )
-            seed_fga(conn)
+            seed_fga(conn, data)
         load_graph(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password, data["off"])
     except Exception as exc:  # noqa: BLE001 - any failure must exit non-zero (§9)
         print(f"seed failed: {type(exc).__name__}: {exc}", file=sys.stderr)

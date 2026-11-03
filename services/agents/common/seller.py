@@ -18,7 +18,9 @@ sends the same message ids and changes nothing twice.
     and the `offer` copies that `expires_at`.
 *   `counter_offer`: the arrival table, then one `choose(respond_to_counter)`. "agree"
     and `counter` set `countered` with `round + 1` and reply `offer {final: true}` (A8);
-    `reject` sets `rejected`, `closed_by = seller`.
+    `reject` sets `rejected`, `closed_by = seller`. The floor includes the owner's
+    `max_discount_pct` rule (identity-authz I33); when that rule is the binding bound of a
+    counter below the floor, a `decision` row with `node = owner_floor` names it.
 *   `accept`: the arrival table; when live with the same `items_hash` and total, the
     conditional update to `accepted`, one `delivery_quote_request` per in-zone courier and
     the 10 s courier `quote_round` timer. Nothing waits.
@@ -91,6 +93,8 @@ __all__ = [
     "COURIER_ROUND_SECONDS",
     "HANDLED_TYPES",
     "MAX_SUBSTITUTES",
+    "OWNER_FLOOR_NODE",
+    "OWNER_RULE",
     "CourierQuote",
     "OrderInfo",
     "SellerHandler",
@@ -114,6 +118,9 @@ MAX_SUBSTITUTES = 3
 MAX_SHORTFALL_SUBSTITUTES = 2
 SHORTFALL_REPLY_OVERRIDE = "SHORTFALL_REPLY_SECONDS"
 NOTHING_TO_DELIVER = "nothing_to_deliver"
+# The owner's maximum-discount rule (identity-authz §10, I33).
+OWNER_RULE = "max_discount_pct"
+OWNER_FLOOR_NODE = "owner_floor"
 # `quotes.round` is 0-2 in the protocol schema (P2).
 MAX_ROUND = 2
 _COUNTER_TEMPLATE = TEMPLATES["respond_to_counter"]
@@ -250,18 +257,38 @@ def _time(value: Any) -> datetime:
     return value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
 
 
+def _max_discount_pct(rules: Mapping[str, Any]) -> int | None:
+    """The owner rule (`business_rules` kind `max_discount_pct`, identity-authz §10), or
+    `None` when none is set. A value that is not an integer from 0 to 100 counts as 0, so
+    a damaged rule raises the floor to the list price instead of lowering it."""
+    if OWNER_RULE not in rules:
+        return None
+    pct = rules[OWNER_RULE]
+    if isinstance(pct, bool) or not isinstance(pct, int) or not 0 <= pct <= 100:
+        return 0
+    return pct
+
+
 def floor_total(lines: Sequence[Mapping[str, Any]], rules: Mapping[str, Any]) -> int:
-    """Σ qty × the item's floor unit price (`business_rules` kind `floors`) over the
-    offered lines. An item with no floor uses its quoted unit price (architecture §4)."""
+    """Σ qty × the item's floor unit price over the offered lines (architecture §4).
+
+    An item's floor is its seeded floor (`business_rules` kind `floors`), or its quoted unit
+    price when it has none. With an owner rule it is the higher of that and
+    `unit × (1 − max_discount_pct / 100)`, rounded up to the cent (identity-authz I-A11).
+    The quoted unit price is the list price: a counter changes only the total."""
     floors = rules.get("floors") if isinstance(rules.get("floors"), Mapping) else {}
+    pct = _max_discount_pct(rules)
     total = 0
     for line in lines:
         sku = line.get("offered_sku")
         if not sku:
             continue
+        list_unit = int(line["unit_minor"])
         floor = floors.get(sku)
         has_floor = isinstance(floor, int) and not isinstance(floor, bool)
-        unit = floor if has_floor else int(line["unit_minor"])
+        unit = floor if has_floor else list_unit
+        if pct is not None:
+            unit = max(unit, -(-list_unit * (100 - pct) // 100))
         total += int(line["qty"]) * unit
     return total
 
@@ -462,6 +489,42 @@ class SellerHandler:
             conversation_id=step.msg.row.conversation_id,
         )
 
+    async def _owner_floor(
+        self,
+        step: _Step,
+        quote: StoredQuote,
+        rules: Mapping[str, Any],
+        floor: int,
+        buyer_total: int,
+    ) -> None:
+        """When the owner rule is the binding bound of a counter below the floor, one
+        `decision` row names it (identity-authz §10, I33)."""
+        seeded = floor_total(quote.lines, {"floors": rules.get("floors")})
+        if floor <= seeded or buyer_total >= floor:
+            return
+        await self.traces.write(
+            step.msg.row.run_id,
+            step.card.agent_id,
+            "decision",
+            {
+                "node": OWNER_FLOOR_NODE,
+                "choice": "below_floor",
+                "explanation": (
+                    f"The owner's rule ({OWNER_RULE} = {_max_discount_pct(rules)}) sets the"
+                    f" floor at {floor}, above the seeded floor of {seeded}."
+                ),
+                "rule": OWNER_RULE,
+                OWNER_RULE: _max_discount_pct(rules),
+                "floor_minor": floor,
+                "seeded_floor_minor": seeded,
+                "buyer_total_minor": buyer_total,
+                "quote_id": str(quote.quote_id),
+                "ref": str(step.msg.row.message_id),
+            },
+            on_behalf_of=step.card.owner_ref,
+            conversation_id=step.msg.row.conversation_id,
+        )
+
     async def _quote_of(self, step: _Step) -> StoredQuote:
         quote_id = step.msg.body.quote_id  # type: ignore[attr-defined]
         quote = await self.store.quote(quote_id)
@@ -653,6 +716,7 @@ class SellerHandler:
         rules = await self.store.rules(step.card.agent_id)
         floor = floor_total(quote.lines, rules)
         buyer_total = int(step.msg.body.total_minor)  # type: ignore[attr-defined]
+        await self._owner_floor(step, quote, rules, floor, buyer_total)
         allowed, default = allowed_counter(
             buyer_total=buyer_total,
             current_total=quote.total_minor,

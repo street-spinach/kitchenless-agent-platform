@@ -6,6 +6,7 @@ import psycopg
 import pytest
 from psycopg.rows import dict_row
 
+from services.agents.common import seller
 from services.common import ids
 from services.identity import grants
 from services.seed import __main__ as seed_mod
@@ -13,6 +14,7 @@ from services.seed import __main__ as seed_mod
 pytestmark = pytest.mark.db
 
 US1_PHONES = ["+15550109901", "+15550109902", "+15550109903"]
+RESTAURANT = "restaurant:square-us"
 
 
 def _seed(pg: str, token_source: str = "mock") -> None:
@@ -133,3 +135,45 @@ def test_seed_writes_agent_clients_and_keycloak_ids(pg: str) -> None:
                 ids.seed_user_id(m["member_id"]),
             )
             assert user["keycloak_sub"] == str(m["keycloak_user_id"])
+
+
+def test_seed_owner_rule_binds(pg: str) -> None:
+    """I27 step 13, I-A19: `restaurant:square-us` keeps 95 % floors and gets
+    `max_discount_pct = 4`, so on every item the owner's 96 % floor is the binding one."""
+    _seed(pg)
+    rows = _rows(
+        pg,
+        "SELECT agent_id, kind, value FROM business_rules WHERE kind IN (%s, %s)",
+        "floors",
+        seller.OWNER_RULE,
+    )
+    rules = {(r["agent_id"], r["kind"]): r["value"] for r in rows}
+    assert rules[(RESTAURANT, seller.OWNER_RULE)] == 4
+    # Only the I-CUJ 7 card has an owner rule.
+    assert [k for k in rules if k[1] == seller.OWNER_RULE] == [(RESTAURANT, seller.OWNER_RULE)]
+    floors = rules[(RESTAURANT, "floors")]
+    prices = {
+        r["sku"]: r["price_minor"]
+        for r in _rows(
+            pg, "SELECT sku, price_minor FROM menu_items WHERE agent_id = %s", RESTAURANT
+        )
+    }
+    assert prices and set(floors) == set(prices)
+    card_rules = {"floors": floors, seller.OWNER_RULE: 4}
+    for sku, price in prices.items():
+        assert floors[sku] == -(-price * 95 // 100)  # seeded floors stay at 95 %
+        line = [{"offered_sku": sku, "qty": 1, "unit_minor": price}]
+        owner_floor = seller.floor_total(line, card_rules)
+        assert owner_floor == -(-price * 96 // 100)
+        assert owner_floor > floors[sku], sku  # the owner rule binds
+
+
+def test_seed_owner_tuples() -> None:
+    """identity-authz §7: `user:<o> owner org:<o>` for each seeded owner, keyed by the
+    owner's Keycloak id (the realm file uses the same ids)."""
+    data = seed_mod.load_data()
+    tuples = seed_mod.owner_tuples(data)
+    owners = data["agents"]["owners"]
+    assert len(tuples) == len(owners) == len(data["agents"]["organizations"])
+    for o in owners:
+        assert (f"user:{o['keycloak_user_id']}", "owner", f"org:{o['org_id']}") in tuples

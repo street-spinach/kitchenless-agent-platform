@@ -16,6 +16,9 @@
     `grants.load_active` requires that person's active grant for the agent.
 6.  `Claims(user_id, agent_id, kind, scopes, grant_id, token_source)`.
 
+`validate_owner(token)` runs the same signature checks on an owner app token (audience
+`owner-app`, §10 and I32) and returns its `sub`.
+
 Refusals raise `TokenRefused(reason)` or a `GrantError`; a key fetch that fails raises
 `IdentityUnavailable`. `TOOL_SCOPES` is the §8 step 1b table, which the guard checks.
 """
@@ -53,6 +56,7 @@ __all__ = [
     "mock_issuer",
     "mock_private_key",
     "validate",
+    "validate_owner",
 ]
 
 ALGORITHM = "RS256"
@@ -232,13 +236,13 @@ def _unverified(token: str) -> tuple[dict[str, Any], dict[str, Any]]:
     return header, payload
 
 
-def _decode(token: str, key: Any, issuer: str) -> dict[str, Any]:
+def _decode(token: str, key: Any, issuer: str, audience: str = c.MCP_AUDIENCE) -> dict[str, Any]:
     try:
         return jwt.decode(
             token,
             key,
             algorithms=[ALGORITHM],
-            audience=c.MCP_AUDIENCE,
+            audience=audience,
             issuer=issuer,
             leeway=SKEW_SECONDS,
             options={"require": ["iss", "aud", "exp", "sub", "azp"]},
@@ -318,3 +322,30 @@ async def validate(conn: AsyncConnection, token: str, ctx: _Ctx) -> Claims:
     user_id = await _person(conn, payload["sub"])
     grant = await grants.load_active(conn, agent_id, user_id)
     return Claims(user_id, agent_id, "people", scopes, grant.grant_id, token_source)
+
+
+def validate_owner(token: str) -> str:
+    """The owner app's bearer token for `/app/*` (§10, I32): the §8 step 1 signature checks
+    (RS256, the active issuer, audience `owner-app`, expiry). Returns the token's `sub`;
+    the caller then checks `user owner org:<o>`. A mock-issued token is accepted only under
+    `TOKEN_SOURCE=mock`: an owner call has no run, so no eval household. Raises
+    `TokenRefused` or `IdentityUnavailable`."""
+    if not token:
+        raise TokenRefused(c.TOKEN_MISSING)
+    settings = get_settings()
+    header, unverified = _unverified(token)
+    if header.get("alg") != ALGORITHM:
+        raise TokenRefused(c.TOKEN_INVALID, "algorithm")
+    source = settings.token_source or MOCK_SOURCE
+    iss = unverified.get("iss")
+    if iss == mock_issuer() and source == MOCK_SOURCE:
+        key: Any = _mock_public_key()
+    elif iss == settings.issuer_url and source != MOCK_SOURCE:
+        key = _live_key(source, header.get("kid"))
+    else:
+        raise TokenRefused(c.TOKEN_INVALID_ISS)
+    payload = _decode(token, key, iss, audience=c.OWNER_AUDIENCE)
+    sub = payload["sub"]
+    if not isinstance(sub, str) or not sub:
+        raise TokenRefused(c.TOKEN_INVALID, "sub")
+    return sub
