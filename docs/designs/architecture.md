@@ -5,7 +5,8 @@
     amended 2026-10-31 (agent-protocol); amended 2026-10-31 (build step 1 ports and smoke);
     amended 2026-11-01 (MCP client contract); amended 2026-11-01 (identity-authz);
     amended 2026-11-01 (tool_errors signature); amended 2026-11-02 (adapters, #146); amended 2026-11-02 (agents, #186);
-    amended 2026-11-03 (service callers and the eval low-budget condition)
+    amended 2026-11-03 (service callers and the eval low-budget condition);
+    amended 2026-11-03 (PR eval gate: safety cases only)
 *   **Date:** 2026-10-31
 *   **Path:** `docs/designs/architecture.md`
 
@@ -1176,7 +1177,7 @@ G6 measures the **peak** during a full weekly-order run: `docker stats` sampled 
 |---|---|---|---|
 | Every PR (`ci.yml` `test` job) | Lint, unit tests (with a Postgres service), contract tests | None (`stub`) | Mock (`MODE_FORCE_MOCK=1`) |
 | Every PR (`guards` job and `merge-policy`) | The test-count guard and the critical-path label check (ENGINEERING_PROCESS §11) | None | n/a |
-| PR touching agents, MCP, safety, common, api, seed, migrations or evals | `make eval-fast` on the `ci` Compose profile | `stub` | Mock |
+| PR touching agents, MCP, safety, identity, common, api, seed, migrations or evals | `make eval-safety` (fast safety cases; amended 2026-11-03) on the `ci` Compose profile | `stub` | Mock |
 | Merge to main | Build and push the image; deploy; seed; smoke; scenario | `stub` | Mock |
 | Nightly on the VM | `make eval-full` on `eval` households | `real`, within `RUN_TOKEN_CEILING` | Mock, plus real sandboxes where configured |
 | Rehearsal (manual) | The demo script | `real` | Real where configured |
@@ -2749,6 +2750,11 @@ and values; none of these may be renamed or dropped.
 
 ##### 63. `.github/workflows/ci.yml` (Modify, critical)
 
+*Amended 2026-11-03 (PR eval gate):* to keep loop PRs fast, the eval job runs
+`make eval-safety` (the `fast` cases in the `safety` category) instead of `make eval-fast`,
+and the path filter gains `services/identity/`. The other categories run in the nightly
+`make eval-full` (item 64), which files an issue when one falls below its threshold.
+
 *Amended 2026-11-02 (evals, #142):* the eval job uses this item's eight-path filter, sets `MODEL_MODE=stub`, passes no `MUSE_API_KEY` or other model key, seeds the eval households before `make eval-fast`, and uploads the results as an artifact and job summary (evals.md E-A2).
 
 *   **Type / Scope**: GitHub workflow.
@@ -2757,9 +2763,9 @@ and values; none of these may be renamed or dropped.
         so `db`-marked unit tests run. It sets `MODE_FORCE_MOCK=1` and `MODEL_MODE=stub`.
     *   The `MUSE_API_KEY` secret is no longer passed to any job.
     *   The eval trigger regex becomes
-        `'^(services/agents/|services/mcp/|services/safety/|services/common/|services/api/|services/seed/|migrations/|evals/)'`.
+        `'^(services/agents/|services/mcp/|services/safety/|services/identity/|services/common/|services/api/|services/seed/|migrations/|evals/)'`.
     *   The eval job starts the `ci` profile, runs `make seed SEED_ARGS="--env eval"`, then
-        `make eval-fast`.
+        `make eval-safety` (amended 2026-11-03; was `make eval-fast`).
 
 ##### 64. `.github/workflows/nightly-evals.yml` (Modify, critical)
 
@@ -3175,7 +3181,7 @@ go in their own PR. This design does not change `evals/thresholds.yaml`.
 *   **End to end**:
     *   Locally with `MODEL_MODE=stub`: `make up && make seed && make smoke && make
         scenario`.
-    *   `make eval-fast` in CI.
+    *   `make eval-safety` in CI (amended 2026-11-03); `make eval-fast` locally.
     *   `make eval-full` nightly with the real model.
 *   **Measurements (G6, Q1, Q2)**: in the step 8 deploy PR, record the peak `docker stats`
     per container, the lowest `MemAvailable` during a full weekly-order run, and the trace

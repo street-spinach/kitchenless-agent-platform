@@ -7,7 +7,7 @@ define allow_empty
 s=$$?; if [ $$s -eq 5 ]; then echo "No $(1) tests yet."; exit 0; fi; exit $$s
 endef
 
-.PHONY: up down lint test-unit test-contract fga-test smoke scenario eval-fast eval-full seed seed-local app-deps app-lint app-test
+.PHONY: up down lint test-unit test-contract fga-test smoke scenario eval-fast eval-safety eval-full seed seed-local app-deps app-lint app-test
 
 up:
 	$(COMPOSE) up -d --build --remove-orphans --wait
@@ -41,6 +41,10 @@ scenario:
 # /hello/run (architecture item 73).
 eval-fast:
 	uv run python -m evals.run --tag fast
+
+# The PR gate (architecture item 63, amended 2026-11-03): the fast safety cases only.
+eval-safety:
+	uv run python -m evals.run --tag fast --category safety
 
 eval-full:
 	$(COMPOSE) run --rm testrunner python -m evals.run --all

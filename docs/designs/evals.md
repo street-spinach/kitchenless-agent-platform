@@ -2,7 +2,8 @@
 
 *   **Author:** madushankaf
 *   **Status:** Approved; amended 2026-11-03 (low-budget condition 1000, architecture
-    "Eval cases")
+    "Eval cases"); amended 2026-11-03 (PR gate runs the fast safety cases only,
+    architecture item 63)
 *   **Date:** 2026-11-02
 *   **Path:** `docs/designs/evals.md`
 *   **Issue:** #142
@@ -256,6 +257,10 @@ Every goal names the test or check that verifies it. Unit tests run with `MODE=m
 ## Critical User Journeys (CUJs)
 
 ### E-CUJ 1: A PR changes the household graph
+
+*Amended 2026-11-03 (architecture item 63):* the job runs `make eval-safety`, the `fast`
+cases in the `safety` category, instead of `make eval-fast`. The other categories are gated
+by the nightly run only.
 
 *   **Given**: a loop PR touching `services/agents/household/graph.py`.
 *   **When**: `ci.yml` runs.
