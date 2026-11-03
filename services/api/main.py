@@ -64,7 +64,9 @@ async def serve() -> None:
         consumer = asyncio.create_task(
             consume_forever(
                 HOST,
-                Sender(send_real=GraphSender.from_settings(get_settings())),
+                Sender(
+                    send_real=GraphSender.from_settings(get_settings()), settings=get_settings()
+                ),
                 finish_run=common_runs.finish,
                 pool=pool,
                 stop=stop,

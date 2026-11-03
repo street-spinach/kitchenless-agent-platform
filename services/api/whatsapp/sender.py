@@ -13,8 +13,12 @@
         becomes `failed` and the run is unaffected (§9). A Graph 131047 (outside the window
         after all) raises `GraphRefused` and continues at step 3. A `Sender` built without
         `send_real` raises `RealSendUnavailable` (fails closed).
-3.  Outside: no Meta template is sent yet (EX-I13). A holdable message is held
-    (`held_messages`, outcome `held`); anything else is `skipped`.
+3.  Outside, with an approved Meta template for the key (`WA_TPL_<KEY>`) whose parameters
+    code can build (`templates.params`): send the template, on the sim path into
+    `sim_outbound` as above; outcome `template` (EX-I13). A Graph 132000-132999 (template
+    refused or paused) ends with outcome `refused`, reason `template_refused`, not retried.
+4.  Outside, otherwise: a holdable message is held (`held_messages`, outcome `held`);
+    anything else is `skipped`.
 
 Every outcome writes one `whatsapp_sends` row and one `decision` trace row
 (`node: whatsapp_window`). A replayed step whose `whatsapp_sends` row exists does nothing.
@@ -54,6 +58,8 @@ __all__ = [
     "SEND_FAILED",
     "SENT",
     "SKIPPED",
+    "TEMPLATE",
+    "TEMPLATE_REFUSED",
     "TEXTS",
     "UNRENDERABLE",
     "WHERE",
@@ -65,6 +71,7 @@ __all__ = [
     "Sender",
     "graph_payload",
     "not_built",
+    "template_payload",
 ]
 
 log = logging.getLogger(__name__)
@@ -142,18 +149,20 @@ MAX_TITLE_CHARS = 20
 MAX_BODY_CHARS = 1024
 # The `decision` trace row for a send's outcome (experience §5 and §15).
 WINDOW_NODE = "whatsapp_window"
-# Outcomes and reasons (experience §5). `template` comes with EX-I13.
+# Outcomes and reasons (experience §5).
 SENT = "sent"
+TEMPLATE = "template"
 HELD = "held"
 SKIPPED = "skipped"
 REFUSED = "refused"
 OUTSIDE_WINDOW = "outside_window"
 NO_TEMPLATE = "no_template"
+TEMPLATE_REFUSED = "template_refused"
 # Inside means `last_inbound_at` later than now minus 23 h 45 min; the margin fails closed.
 WINDOW = datetime.timedelta(hours=23, minutes=45)
 # Graph: the person is outside the window (§5 step 7). Not retried.
 OUTSIDE_WINDOW_CODE = 131047
-# Template refused or paused (§5 step 7); handled by EX-I13. Not retried.
+# Template refused or paused (§5 step 7): outcome `refused`. Not retried.
 _TEMPLATE_REFUSED_CODES = range(132000, 133000)
 
 # The message catalog (experience §6). `{x}` is a `params` value; lists are passed already
@@ -255,11 +264,7 @@ def graph_payload(phone: str, body: dict[str, Any]) -> dict[str, Any] | None:
         return None
     if any(len(b["title"]) > MAX_TITLE_CHARS for b in buttons):
         return None
-    base: dict[str, Any] = {
-        "messaging_product": "whatsapp",
-        "recipient_type": "individual",
-        "to": phone.removeprefix("+"),
-    }
+    base = _base(phone)
     if not buttons:
         return {**base, "type": "text", "text": {"body": text}}
     replies = [
@@ -272,8 +277,22 @@ def graph_payload(phone: str, body: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _base(phone: str) -> dict[str, Any]:
+    return {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": phone.removeprefix("+"),
+    }
+
+
+def template_payload(phone: str, template: dict[str, Any]) -> dict[str, Any]:
+    """The Graph API `/messages` request for a Meta template (`templates.request`)."""
+    return {**_base(phone), "type": "template", "template": template}
+
+
 class GraphSender:
-    """`send_real` for `channel_mode='real'` phones: one Graph API text or button message.
+    """`send_real` for `channel_mode='real'` phones: one Graph API text or button message,
+    or the Meta template under the body's `meta_template` key when the `Sender` adds one.
 
     Returns the Graph message id (`messages[0].id`). A Graph error body with code 131047
     or 132000-132999 raises `GraphRefused(code)` at once: a retry cannot change it. Any
@@ -303,7 +322,12 @@ class GraphSender:
         return cls(settings.whatsapp_token or "", settings.whatsapp_phone_number_id or "")
 
     async def __call__(self, phone: str, body: dict[str, Any]) -> str | None:
-        payload = graph_payload(phone, body)
+        template = body.get("meta_template")
+        payload = (
+            template_payload(phone, template)
+            if isinstance(template, dict)
+            else graph_payload(phone, body)
+        )
         if payload is None:
             raise StepFailed(WHERE, UNRENDERABLE)
         if not self._token or not self._phone_number_id:
@@ -359,11 +383,20 @@ def _graph_error_code(response: httpx.Response) -> int | None:
 
 
 class Sender:
-    """`consume_forever("api", Sender(...))` delivers every `whatsapp_out` message."""
+    """`consume_forever("api", Sender(...))` delivers every `whatsapp_out` message.
 
-    def __init__(self, connect: Connect = pool_connect, send_real: SendReal = not_built) -> None:
+    `settings` holds the approved Meta template names; without it no template is sent
+    (fails closed)."""
+
+    def __init__(
+        self,
+        connect: Connect = pool_connect,
+        send_real: SendReal = not_built,
+        settings: Settings | None = None,
+    ) -> None:
         self._connect = connect
         self._send_real = send_real
+        self._settings = settings
 
     async def __call__(self, msg: Inbound) -> StepResult:
         row = msg.row
@@ -387,37 +420,86 @@ class Sender:
                 await _record(conn, msg, user_id, REFUSED, UNRENDERABLE)
                 return StepResult()
             if not phone["inside"]:
-                await _outside(conn, msg, body)
+                await self._outside(conn, msg, body, phone)
                 return StepResult()
             if phone["channel_mode"] == "sim":
-                payload = {"message_id": str(row.message_id), **body, "graph": graph}
-                async with conn.transaction():
-                    await conn.execute(
-                        _SIM_SQL,
-                        {
-                            "phone": phone["phone_e164"],
-                            "run_id": row.run_id,
-                            "body": Jsonb(payload),
-                            "message_id": str(row.message_id),
-                        },
-                    )
-                    await _record(conn, msg, user_id, SENT, None)
+                await _sim(conn, msg, phone["phone_e164"], {**body, "graph": graph}, SENT)
                 return StepResult()
             try:
                 graph_message_id = await self._send_real(phone["phone_e164"], body)
             except GraphRefused as refused:
                 if refused.code != OUTSIDE_WINDOW_CODE:
-                    raise StepFailed(WHERE, SEND_FAILED) from refused
-                # Outside after all (§5 step 7): not retried; continue as outside.
-                await _outside(conn, msg, body)
+                    await _refused(conn, msg, user_id, refused)
+                    return StepResult()
+                # Outside after all (§5 step 7): not retried; continue at step 4.
+                await self._outside(conn, msg, body, phone)
                 return StepResult()
             await _record(conn, msg, user_id, SENT, None, graph_message_id)
         return StepResult()
 
+    async def _outside(
+        self, conn: AsyncConnection, msg: Inbound, body: dict[str, Any], phone: dict[str, Any]
+    ) -> None:
+        """§5 step 4 outside the window: the Meta template, if the key has an approved name
+        and code can build its parameters; otherwise steps 5-6."""
+        key, user_id = body["template"], body["user_id"]
+        name = templates.meta_name(key, self._settings) if self._settings else None
+        values = await templates.params(conn, key, body) if name else None
+        if name is None or values is None:
+            await _hold_or_skip(conn, msg, body)
+            return
+        template = templates.request(name, values, body.get("buttons") or [])
+        if phone["channel_mode"] == "sim":
+            graph = template_payload(phone["phone_e164"], template)
+            await _sim(conn, msg, phone["phone_e164"], {**body, "graph": graph}, TEMPLATE)
+            return
+        try:
+            graph_message_id = await self._send_real(
+                phone["phone_e164"], {**body, "meta_template": template}
+            )
+        except GraphRefused as refused:
+            if refused.code == OUTSIDE_WINDOW_CODE:
+                # A template may be sent outside the window, so this is not expected; it is
+                # not retried and does not loop back to step 4.
+                raise StepFailed(WHERE, SEND_FAILED) from refused
+            await _refused(conn, msg, user_id, refused)
+            return
+        await _record(conn, msg, user_id, TEMPLATE, None, graph_message_id)
 
-async def _outside(conn: AsyncConnection, msg: Inbound, body: dict[str, Any]) -> None:
-    """§5 steps 4-6 outside the window. No Meta template is sent until EX-I13, so step 4
-    finds none: a holdable message is held, anything else is skipped."""
+
+async def _sim(
+    conn: AsyncConnection, msg: Inbound, phone: str, body: dict[str, Any], outcome: str
+) -> None:
+    """The sim path: one `sim_outbound` row (the Graph request under `graph`) and the
+    outcome, in one transaction."""
+    message_id = str(msg.row.message_id)
+    async with conn.transaction():
+        await conn.execute(
+            _SIM_SQL,
+            {
+                "phone": phone,
+                "run_id": msg.row.run_id,
+                "body": Jsonb({"message_id": message_id, **body}),
+                "message_id": message_id,
+            },
+        )
+        await _record(conn, msg, body["user_id"], outcome, None)
+
+
+async def _refused(
+    conn: AsyncConnection, msg: Inbound, user_id: str, refused: GraphRefused
+) -> None:
+    """§5 step 7: 132000-132999 (template refused or paused) ends `refused`, reason
+    `template_refused`, not retried. Any other code raises `StepFailed` as before."""
+    if refused.code not in _TEMPLATE_REFUSED_CODES:
+        raise StepFailed(WHERE, SEND_FAILED) from refused
+    log.warning("whatsapp_out %s: %s (%s)", msg.row.message_id, TEMPLATE_REFUSED, refused.code)
+    await _record(conn, msg, user_id, REFUSED, TEMPLATE_REFUSED)
+
+
+async def _hold_or_skip(conn: AsyncConnection, msg: Inbound, body: dict[str, Any]) -> None:
+    """§5 steps 5-6 outside the window with no template: a holdable message is held,
+    anything else is skipped."""
     key = body["template"]
     ref = body.get("ref") or {}
     if templates.holdable(key, ref.get("kind")):
