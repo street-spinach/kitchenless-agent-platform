@@ -260,7 +260,8 @@ Every goal names the test or check that verifies it. Unit tests run with `MODE=m
 
 *Amended 2026-11-03 (architecture item 63):* the job runs `make eval-safety`, the `fast`
 cases in the `safety` category once each (`--repeats 1`; the nightly run keeps
-`thresholds.yaml`'s repeats), instead of `make eval-fast`. The other categories are gated
+`thresholds.yaml`'s repeats), instead of `make eval-fast`, and only when the PR touches
+`services/safety/`, `services/identity/` or `evals/cases/safety/`. The other categories are gated
 by the nightly run only.
 
 *   **Given**: a loop PR touching `services/agents/household/graph.py`.
