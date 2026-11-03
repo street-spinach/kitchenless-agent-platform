@@ -55,3 +55,13 @@ def test_api_gets_template_vars() -> None:
     example = _env_example()
     for name in sorted(_TEMPLATE_VARS):
         assert example.get(name) == "", name
+
+
+def test_api_reaches_openfga() -> None:
+    """api writes tuples (onboarding, and `/panel/reset` reconciling after an eval reset,
+    identity-authz §7 and I27), so it needs the OpenFGA URL and preshared key. Without the
+    URL every eval reset failed with `OPENFGA_API_URL is required`."""
+    services = yaml.safe_load((_INFRA / "docker-compose.yml").read_text())["services"]
+    api_env = services["api"]["environment"]
+    assert api_env.get("OPENFGA_API_URL") == "${OPENFGA_API_URL:-http://openfga:8080}"
+    assert "OPENFGA_PRESHARED_KEY" in api_env

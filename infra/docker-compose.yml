@@ -238,6 +238,8 @@ services:
       <<: [*env-base, *env-app, *env-identity, *env-keycloak, *env-grants, *env-modes, *env-shortfall]
       SERVICE_NAME: api
       PORT: "8000"
+      # Onboarding and the eval reset write tuples (identity-authz §7, I27).
+      OPENFGA_API_URL: ${OPENFGA_API_URL:-http://openfga:8080}
       AGENT_SIGNING_CERT: ${AGENT_SIGNING_CERT:-}
       TOKEN_SERVICE_KEY: ${TOKEN_SERVICE_KEY:-}
       KC_ONBOARDING_SECRET: ${KC_ONBOARDING_SECRET:-}
