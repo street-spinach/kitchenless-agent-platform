@@ -490,11 +490,18 @@ class Sender:
 
 
 async def _issue_link(conn: AsyncConnection, user_id: str, link: dict[str, Any]) -> str:
-    """A fresh consent link for the message's person, issued now, so its token is never
-    stored in the message (identity-authz §6, I-G8)."""
+    """A fresh link for the message's person, issued now, so its token is never stored in
+    the message (identity-authz §6, I-G8): `consent` by default, or `me` with the /me page
+    to open after sign-in (experience §7, EX-I34)."""
     person = uuid.UUID(user_id)
     return await links.issue(
-        conn, "consent", person, person, link["household_id"], list(link["agent_ids"])
+        conn,
+        link.get("purpose") or "consent",
+        person,
+        person,
+        link["household_id"],
+        list(link["agent_ids"]),
+        next=link.get("next"),
     )
 
 

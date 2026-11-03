@@ -27,10 +27,21 @@
         approval button, starts a `chat` run (committed first, so the guard sees it) and
         calls `/mcp/household set_take_turns` with `api`'s service token; see
         `_take_turns_tap`.
+    *   `rs:stop` and `me:<page>` (experience §7, §10, EX-I34): a code reply, see below.
     *   Any other button starts nothing.
 4.  Text equal to "retry", any case: if `runs.retry_target` finds a run, start a new run
     with `retry_of` and send the original request again as `user_message`. Otherwise it is
     normal text.
+4a. Text commands (experience §7, EX-I34), matched exactly (case-insensitive, trimmed):
+    "my agents", "my page" and "my household" share one handler that sends `me_link` with
+    a fresh `me` link to the matching page; "reminders off" (as the `rs:stop` tap) sets
+    `channel_identities.reminders_off_at` and replies `reminders_off`; "reminders on"
+    clears it and replies `reminders_on`. A `me:household` or `me:pantry` tap sends
+    `me_link` to that page; `me:renew` sends `me_link` with a `consent` link for the
+    person's consumer agent and, for an admin, the household agent. Each runs in a `chat`
+    run with no household and `source: "code"` that ends `completed` at once (experience
+    §3). The link is issued by the sender at send time (`WhatsAppOut.link`), so its token
+    is never stored in a message (identity-authz I-G8).
 5.  Media: reply `media_not_supported` in a `chat` run that is
     finished `completed` at once, since every agent message needs a run.
 6.  Anything else: `runs.start(...)` and send `user_message` to the member's consumer agent.
@@ -76,7 +87,10 @@ __all__ = [
     "ALREADY_DECIDED",
     "API_AGENT",
     "APPROVAL_EXPIRED",
+    "ME_LINK",
     "MEDIA_NOT_SUPPORTED",
+    "REMINDERS_OFF",
+    "REMINDERS_ON",
     "NOT_APPROVER",
     "SET_TAKE_TURNS",
     "SHORTFALL_PREFIX",
@@ -125,6 +139,18 @@ CONSENT_RENEWAL = "consent_renewal"
 # A run that only carries a code-built reply (experience §3): no household, so it is exempt
 # from the grant check, and `runs.retry_target` skips it.
 CODE_SOURCE = "code"
+# Text commands and page taps (experience §6, §7, §10; EX-I34).
+ME_LINK = "me_link"
+REMINDERS_OFF = "reminders_off"
+REMINDERS_ON = "reminders_on"
+# "my agents", "my page" and "my household": one handler, the /me page to open
+# (`links.Next`; `None` is the callback's default, `/me/agents`).
+PAGE_COMMANDS: dict[str, str | None] = {
+    "my agents": "agents",
+    "my page": None,
+    "my household": "household",
+}
+REMINDER_COMMANDS: dict[str, bool] = {"reminders off": True, "reminders on": False}
 # Held items (experience §5 "Release", EX-I20).
 HELD_RELEASE_CAP = 3
 HELD_CANCELLED_LINE = "held_cancelled_line"
@@ -337,6 +363,11 @@ async def _ingest(
             "user_id": member.user_id,
             "inbound_id": inbound,
         }
+        command = _command(content) if kind == CHAT else None
+        if command is not None:
+            started = await _code_reply(conn, member, inbound, command)
+            await unscoped(conn, "ingest").execute(_SET_RUN_SQL, (started, channel, external_id))
+            return started
         if content.kind == "button":
             if content.button.startswith(SHORTFALL_PREFIX):
                 run = await _shortfall_button(conn, member, inbound, content.button)
@@ -675,6 +706,90 @@ async def _reply(
             "buttons": [],
         },
     )
+
+
+def _command(content: Content) -> str | None:
+    """The text command or page tap this message is (experience §7, EX-I34), as its
+    command text, or `None`. Text is matched exactly, case-insensitive and trimmed. A tap
+    is `rs:stop` (as "reminders off") or `me:<page>`, returned as the payload."""
+    if content.kind == "button":
+        if content.button == ids.REMINDER_STOP:
+            return "reminders off"
+        return content.button if ids.parse_page_button(content.button) is not None else None
+    if content.kind == "text":
+        text = content.text.strip().lower()
+        if text in PAGE_COMMANDS or text in REMINDER_COMMANDS:
+            return text
+    return None
+
+
+# One person's phones: `reminders.py` treats any of them opted out as opted out.
+_REMINDERS_OFF_SQL = """
+UPDATE channel_identities SET reminders_off_at = coalesce(reminders_off_at, now())
+WHERE user_id = %s
+"""
+_REMINDERS_ON_SQL = "UPDATE channel_identities SET reminders_off_at = NULL WHERE user_id = %s"
+_ROLE_SQL = "SELECT role FROM household_members WHERE household_id = %s AND user_id = %s"
+
+
+async def _page_link(conn: AsyncConnection, member: _Member, command: str) -> dict[str, Any]:
+    """The `WhatsAppOut.link` for a page command or tap: a `me` link to the matching page,
+    or for `me:renew` a `consent` link for the person's consumer agent and, if the person
+    is an admin, the household agent (identity-authz §6). The sender issues it."""
+    page = ids.parse_page_button(command)
+    if page == "renew":
+        agent_ids = [member.consumer]
+        cur = await unscoped(conn, "ingest").execute(
+            _ROLE_SQL, (member.household_id, member.user_id)
+        )
+        row = await cur.fetchone()
+        if row is not None and row[0] == "admin":
+            agent_ids.append(f"household:{member.household_id}")
+        return {"household_id": member.household_id, "agent_ids": agent_ids, "purpose": "consent"}
+    next_page = page if page is not None else PAGE_COMMANDS[command]
+    link: dict[str, Any] = {"household_id": member.household_id, "agent_ids": [], "purpose": "me"}
+    if next_page is not None:
+        link["next"] = next_page
+    return link
+
+
+async def _code_reply(
+    conn: AsyncConnection, member: _Member, inbound: uuid.UUID, command: str
+) -> uuid.UUID:
+    """A text command or page tap (experience §7, §10, EX-I34) in a new `chat` run with no
+    household and `source: "code"` (exempt from the grant check, skipped by
+    `runs.retry_target`), finished `completed` at once. Held items are released on the run
+    before its reply (EX-I20)."""
+    started = await runs.start(
+        conn,
+        household_id=None,
+        kind=CHAT,
+        trigger={"source": CODE_SOURCE, "user_id": member.user_id, "inbound_id": inbound},
+    )
+    await release_held(conn, member.user_id, started, inbound)
+    body: dict[str, Any] = {"user_id": str(member.user_id), "params": {}, "buttons": []}
+    if command in REMINDER_COMMANDS:
+        off = REMINDER_COMMANDS[command]
+        await unscoped(conn, "ingest").execute(
+            _REMINDERS_OFF_SQL if off else _REMINDERS_ON_SQL, (member.user_id,)
+        )
+        body["template"] = REMINDERS_OFF if off else REMINDERS_ON
+    else:
+        body["template"] = ME_LINK
+        body["link"] = await _page_link(conn, member, command)
+    await outbox.send(
+        conn,
+        message_id=ids.message_id(inbound, 0),
+        run_id=started,
+        conversation_id=None,
+        causation_id=None,
+        from_agent=API_AGENT,
+        to_agent=WHATSAPP,
+        type="whatsapp_out",
+        body=body,
+    )
+    await runs.finish(conn, started, API_AGENT, "completed", body["template"])
+    return started
 
 
 async def _media_reply(
