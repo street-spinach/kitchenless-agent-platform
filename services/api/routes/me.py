@@ -1,5 +1,5 @@
-"""The `/me` pages (identity-authz §6, §9, §11, §13 and I24). Minimal HTML and JSON; the
-visual design is the experience design's.
+"""The `/me` pages (identity-authz §6, §9, §11, §13 and I24; experience §4, §8, EX-I36).
+Pages render from `services/api/templates/` with `/me/static/me.css`.
 
 *   `GET /me/l/{token}` renders a confirm page and changes nothing (HEAD likewise), so link
     previews and scanners cannot use up a link.
@@ -18,9 +18,20 @@ visual design is the experience design's.
 *   `GET /me/agents` lists the person's agents and grants; `POST
     /me/agents/{agent_id}/revoke` applies the §11 rule, then calls `grants.revoke` and
     `grants.after_revoke`.
-*   `GET /me/history` lists the person's audit rows and approvals.
-*   `GET /me/household/band` returns the band; `POST /me/household/band` with
-    `{per_order_minor: int | null}` sets it (admins only) and writes `band_changed`.
+*   `GET /me/household`: this week's order and its explanation, spending against the
+    budget, take-turns (the switch for the approver), the last delivered dinners with
+    reactions, and the allergies and diets the viewer may see. Every read goes through
+    `scope.scoped` and `visibility.can_see`; a child sees only their own row.
+*   `GET /me/history` lists the person's audit rows and approvals, and spending per week
+    (per order: an admin every order, others the orders they started).
+*   `GET /me/household/band` returns the band (a page for `Accept: text/html`, else JSON);
+    `POST /me/household/band`, the page's form or `{per_order_minor: int | null}`, sets it
+    (admins only) and writes `band_changed`.
+
+Every POST but the Link's carries a CSRF token, `csrf_token(session, form)`: an
+itsdangerous signature over the session's random id and the form's name, checked first
+(experience §8). The Link's POST happens before there is a session; the Link is its own
+single-use secret.
 
 The session cookie is signed (`SESSION_SECRET`), HttpOnly, Secure, SameSite=Lax and lasts
 30 minutes (§13). Every household read goes through `scope.scoped` with the session's
@@ -31,30 +42,86 @@ import html
 import json
 import time
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import jwt
 from itsdangerous import BadSignature, URLSafeTimedSerializer
 from psycopg import AsyncConnection
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
-from starlette.routing import Route
+from starlette.routing import Mount, Route
+from starlette.staticfiles import StaticFiles
+from starlette.templating import Jinja2Templates
 
 from services.common import ids
 from services.common.config import get_settings
+from services.common.money import Money
+from services.common.money import format as money_format
+from services.common.orders import PLACED_OR_LATER
 from services.identity import audit, grants, keycloak_admin, links, token_source
 from services.identity.errors import DependencyUnavailable, IdentityError, LinkInvalid
-from services.safety import scope
+from services.safety import scope, visibility
 
-__all__ = ["SESSION_COOKIE", "SESSION_SECONDS", "STATE_SECONDS", "Session", "routes"]
+__all__ = [
+    "CSRF_FIELD",
+    "CSRF_HEADER",
+    "SESSION_COOKIE",
+    "SESSION_SECONDS",
+    "STATE_SECONDS",
+    "TEMPLATES",
+    "Session",
+    "csrf_ok",
+    "csrf_token",
+    "routes",
+]
 
 SESSION_COOKIE = "me_session"
 SESSION_SECONDS = 30 * 60
 # A consent chain must finish within a link's lifetime.
 STATE_SECONDS = links.LINK_SECONDS
 REVOKE_REASON = "user"
+
+# The page templates and stylesheet (experience §8, EX-I35, EX-I36).
+_API_DIR = Path(__file__).resolve().parents[1]
+TEMPLATES = Jinja2Templates(directory=str(_API_DIR / "templates"))
+STATIC_DIR = _API_DIR / "static"
+
+# Every POST carries a CSRF token: an itsdangerous signature over the session id and the
+# form's name, checked before any other work (§8). Forms send it as the `csrf` field; the
+# band's JSON API as the `X-CSRF-Token` header.
+CSRF_FIELD = "csrf"
+CSRF_HEADER = "X-CSRF-Token"
+FORM_REVOKE = "revoke"
+FORM_BAND = "band"
+FORM_TAKE_TURNS = "take_turns"
+FORM_REACTION = "reaction"
+FORM_PANTRY = "pantry"
+
+# §8 page copy.
+SESSION_EXPIRED = "This page timed out. Write *my page* in WhatsApp for a new link."
+FORM_EXPIRED = "This page is out of date. Go back, reload it and try again."
+LOCALE = "en"
+MEALS_SHOWN = 7
+SPENDING_WEEKS = 8
+_STATE_TEXT = {
+    "draft": "Being planned",
+    "quoting": "Getting quotes",
+    "negotiating": "Comparing offers",
+    "awaiting_approval": "Waiting for approval",
+    "authorized": "Approved",
+    "placed": "Ordered",
+    "courier_booked": "Courier booked",
+    "in_delivery": "On its way",
+    "delivered": "Delivered",
+    "cancelled": "Cancelled",
+    "expired": "Expired",
+    "failed": "Failed",
+}
 
 # Nonces of states already used, with when they stop mattering (their signature expires).
 # `api` is one process, so this is the whole record.
@@ -65,6 +132,9 @@ _spent_states: dict[str, float] = {}
 class Session:
     user_id: UUID
     household_id: str
+    # A random id per sign-in, the subject of every CSRF token (§8); None for a cookie
+    # from before it existed, which can then post nothing.
+    session_id: str | None = None
 
 
 # --- signing --------------------------------------------------------------------------
@@ -106,8 +176,13 @@ def _session(request: Request) -> Session | None:
     data = _unsign("me-session", request.cookies.get(SESSION_COOKIE), SESSION_SECONDS)
     if data is None:
         return None
+    session_id = data.get("i")
     try:
-        return Session(UUID(data["u"]), str(data["h"]))
+        return Session(
+            UUID(data["u"]),
+            str(data["h"]),
+            session_id if isinstance(session_id, str) and session_id else None,
+        )
     except (KeyError, ValueError):
         return None
 
@@ -115,7 +190,7 @@ def _session(request: Request) -> Session | None:
 def _set_session(resp: Response, user_id: UUID, household_id: str) -> None:
     resp.set_cookie(
         SESSION_COOKIE,
-        _sign("me-session", {"u": str(user_id), "h": household_id}),
+        _sign("me-session", {"u": str(user_id), "h": household_id, "i": ids.new_token_id()}),
         max_age=SESSION_SECONDS,
         path="/me",
         secure=True,
@@ -124,19 +199,61 @@ def _set_session(resp: Response, user_id: UUID, household_id: str) -> None:
     )
 
 
+# --- CSRF -----------------------------------------------------------------------------
+
+
+def csrf_token(session: Session, form: str) -> str:
+    """The token a page puts in `form`'s `csrf` field (§8)."""
+    return _sign("me-csrf", {"s": session.session_id, "f": form})
+
+
+def csrf_ok(session: Session, form: str, token: str | None) -> bool:
+    """Whether `token` was issued for this session and this form, within the session's
+    lifetime. A session with no id never passes."""
+    if not session.session_id:
+        return False
+    data = _unsign("me-csrf", token, SESSION_SECONDS)
+    return data is not None and data.get("s") == session.session_id and data.get("f") == form
+
+
+async def _posted_token(request: Request) -> str | None:
+    """The CSRF token of a POST: the header, else the form field (form encodings only)."""
+    header = request.headers.get(CSRF_HEADER)
+    if header:
+        return header
+    kind = request.headers.get("content-type", "")
+    if kind.startswith(("application/x-www-form-urlencoded", "multipart/form-data")):
+        value = (await request.form()).get(CSRF_FIELD)
+        return value if isinstance(value, str) else None
+    return None
+
+
 # --- pages ----------------------------------------------------------------------------
+
+
+def _error(heading: str, message: str, status_code: int) -> HTMLResponse:
+    body = TEMPLATES.get_template("error.html").render(
+        person=None, household=None, tab=None, heading=heading, message=message
+    )
+    return HTMLResponse(body, status_code=status_code)
+
+
+def _csrf_refused() -> HTMLResponse:
+    return _error("Out of date", FORM_EXPIRED, 403)
 
 
 def _page(title: str, body: str, status_code: int = 200) -> HTMLResponse:
     return HTMLResponse(
-        f"<!doctype html><html><head><meta charset='utf-8'><title>{html.escape(title)}</title>"
-        f"</head><body><h1>{html.escape(title)}</h1>{body}</body></html>",
+        f"<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        f"<link rel='stylesheet' href='/me/static/me.css'><title>{html.escape(title)}</title>"
+        f"</head><body><main><h1>{html.escape(title)}</h1>{body}</main></body></html>",
         status_code=status_code,
     )
 
 
 def _signed_out() -> HTMLResponse:
-    return _page("Signed out", "<p>Open the newest link we sent you to sign in.</p>", 401)
+    return _error("Session expired", SESSION_EXPIRED, 401)
 
 
 def _bad_state() -> HTMLResponse:
@@ -374,6 +491,209 @@ async def consent_done(request: Request) -> Response:
     return _page("All done", "".join(parts))
 
 
+# --- shared page parts -----------------------------------------------------------------
+
+
+def _money(amount_minor: int, currency: str) -> str:
+    return money_format(Money(int(amount_minor), str(currency).strip()), LOCALE)
+
+
+def _clock(at: datetime) -> str:
+    return f"{at:%I:%M %p}".lstrip("0").lower()
+
+
+def _day(at: datetime) -> str:
+    return f"{at:%a} {at.day} {at:%b}"
+
+
+def _code_text(code: str) -> str:
+    return code.replace("_", " ")
+
+
+async def _frame(q: scope.Scoped, session: Session, tab: str | None) -> dict[str, Any]:
+    """base.html's context: the person's name, the household's name and the tab."""
+    rows = await q.fetch(
+        "SELECT u.display_name, h.name FROM household_members m"
+        " JOIN users u ON u.user_id = m.user_id"
+        " JOIN households h ON h.household_id = m.household_id"
+        " WHERE m.household_id = %(household)s AND m.user_id = %(user)s",
+        user=session.user_id,
+    )
+    name, household = rows[0] if rows else (None, None)
+    return {
+        "person": None if name is None else {"name": name},
+        "household": None if household is None else {"name": household},
+        "tab": tab,
+    }
+
+
+async def _viewer(conn: AsyncConnection, session: Session) -> visibility.Member | None:
+    try:
+        return await visibility.load_member(conn, scope.from_session(session), session.user_id)
+    except LookupError:
+        return None
+
+
+def _render(request: Request, name: str, context: dict[str, Any]) -> Response:
+    return TEMPLATES.TemplateResponse(request, name, context)
+
+
+# --- household ------------------------------------------------------------------------
+
+
+async def _this_week_order(q: scope.Scoped) -> dict[str, Any] | None:
+    """The household's newest order this budget week (Monday 00:00, household time), with
+    the household agent's checked explanation from its `choose_offer` decision."""
+    rows = await q.fetch(
+        "SELECT o.order_id, o.kind, o.state, lower(o.delivery_window),"
+        " upper(o.delivery_window), h.timezone, g.name FROM orders o"
+        " JOIN households h ON h.household_id = o.household_id"
+        " LEFT JOIN agent_cards c ON c.agent_id = o.seller_agent_id"
+        " LEFT JOIN organizations g ON c.owner_ref = 'org:' || g.org_id"
+        " WHERE o.household_id = %(household)s AND o.state <> 'draft'"
+        " AND o.created_at >= (date_trunc('week', now() AT TIME ZONE h.timezone)"
+        " AT TIME ZONE h.timezone)"
+        " ORDER BY o.created_at DESC LIMIT 1"
+    )
+    if not rows:
+        return None
+    order_id, kind, state, start, end, tz, store = rows[0]
+    summary = "Groceries" if kind == "grocery" else "Dinner"
+    if store:
+        summary += f" from {store}"
+    if start is not None and end is not None:
+        zone = ZoneInfo(tz)
+        start, end = start.astimezone(zone), end.astimezone(zone)
+        summary += f", {_day(start)} {_clock(start)}-{_clock(end)}"
+    explained = await q.fetch(
+        "SELECT t.payload->>'explanation' FROM agent_traces t"
+        " JOIN orders o ON o.run_id = t.run_id"
+        " WHERE o.household_id = %(household)s AND o.order_id = %(order)s"
+        " AND t.kind = 'decision' AND t.payload->>'node' = 'choose_offer'"
+        " AND coalesce(t.payload->>'explanation', '') <> ''"
+        " ORDER BY t.seq DESC LIMIT 1",
+        order=order_id,
+    )
+    return {
+        "summary": summary,
+        "state": _STATE_TEXT.get(state, state),
+        "explanation": explained[0][0] if explained else None,
+    }
+
+
+async def _spending(q: scope.Scoped) -> dict[str, Any]:
+    """This budget week's orders `placed` or later against the weekly budget, the rule
+    `orders.remaining_weekly_budget` uses."""
+    spent_rows = await q.fetch(
+        "SELECT coalesce(sum(o.total_minor), 0)::bigint, h.currency FROM households h"
+        " LEFT JOIN orders o ON o.household_id = h.household_id"
+        " AND o.state = ANY(%(states)s)"
+        " AND o.created_at >= (date_trunc('week', now() AT TIME ZONE h.timezone)"
+        " AT TIME ZONE h.timezone)"
+        " WHERE h.household_id = %(household)s GROUP BY h.currency",
+        states=list(PLACED_OR_LATER),
+    )
+    spent, currency = spent_rows[0] if spent_rows else (0, "USD")
+    budget = await q.fetch(
+        "SELECT amount_minor, currency FROM budgets"
+        " WHERE household_id = %(household)s AND period = 'weekly'"
+    )
+    return {
+        "spent": _money(spent, currency),
+        "budget": _money(budget[0][0], budget[0][1]) if budget else None,
+    }
+
+
+async def _meals(
+    q: scope.Scoped, session: Session, viewer: visibility.Member
+) -> list[dict[str, Any]]:
+    """The last delivered dinners, with reaction totals only when the viewer may see them
+    and the viewer's own reaction always."""
+    rows = await q.fetch(
+        "SELECT o.order_id, coalesce(upper(o.delivery_window), o.updated_at), h.timezone,"
+        " (SELECT string_agg(i.name, ', ' ORDER BY i.line) FROM (SELECT name, line"
+        " FROM order_items WHERE order_id = o.order_id ORDER BY line LIMIT 3) i),"
+        " (SELECT count(*) FROM meal_reactions r WHERE r.order_id = o.order_id"
+        " AND r.value = 1),"
+        " (SELECT count(*) FROM meal_reactions r WHERE r.order_id = o.order_id"
+        " AND r.value = -1),"
+        " (SELECT r.value FROM meal_reactions r WHERE r.order_id = o.order_id"
+        " AND r.user_id = %(user)s)"
+        " FROM orders o JOIN households h ON h.household_id = o.household_id"
+        " WHERE o.household_id = %(household)s AND o.kind = 'dinner'"
+        " AND o.state = 'delivered' ORDER BY o.updated_at DESC LIMIT %(limit)s",
+        user=session.user_id,
+        limit=MEALS_SHOWN,
+    )
+    totals = visibility.can_see(viewer, "reaction_totals", None)
+    token = csrf_token(session, FORM_REACTION)
+    return [
+        {
+            "order_id": str(order_id),
+            "title": items or "Dinner",
+            "delivered": _day(at.astimezone(ZoneInfo(tz))),
+            "totals": {"up": int(up), "down": int(down)} if totals else None,
+            "mine": None if mine is None else int(mine),
+            "csrf": token,
+        }
+        for order_id, at, tz, items, up, down, mine in rows
+    ]
+
+
+async def _people(q: scope.Scoped, viewer: visibility.Member) -> list[dict[str, Any]]:
+    """Each person whose allergies and diets the viewer may see (§4): an admin everyone,
+    children included; an adult or a child only themselves. Dislikes are not shown."""
+    rows = await q.fetch(
+        "SELECT m.user_id, u.display_name, m.role, c.kind, c.value FROM household_members m"
+        " JOIN users u ON u.user_id = m.user_id"
+        " LEFT JOIN member_constraints c ON c.user_id = m.user_id"
+        " AND c.kind IN ('allergy', 'diet')"
+        " WHERE m.household_id = %(household)s"
+        " ORDER BY m.role, u.display_name, m.user_id, c.kind, c.value"
+    )
+    people: dict[UUID, dict[str, Any]] = {}
+    for user_id, name, role, kind, value in rows:
+        data = "child_data" if role == "child" else "own_constraints"
+        if not visibility.can_see(viewer, data, user_id):
+            continue
+        person = people.setdefault(user_id, {"name": name, "allergies": [], "diets": []})
+        if kind == "allergy":
+            person["allergies"].append(_code_text(value))
+        elif kind == "diet":
+            person["diets"].append(_code_text(value))
+    return list(people.values())
+
+
+async def household_page(request: Request) -> Response:
+    """`GET /me/household` (§8, EX-I36): every read through `scope.scoped` and
+    `visibility.can_see`."""
+    session = _session(request)
+    if session is None:
+        return _signed_out()
+    async with _connect(request) as conn:
+        viewer = await _viewer(conn, session)
+        if viewer is None:
+            return _signed_out()
+        q = scope.scoped(conn, scope.from_session(session))
+        context = await _frame(q, session, "household")
+        wide = visibility.can_see(viewer, "plan", None)
+        context["household_wide"] = wide
+        context["people"] = await _people(q, viewer)
+        if wide:
+            context["order"] = await _this_week_order(q)
+            context["spending"] = await _spending(q)
+            rules = await q.fetch(
+                "SELECT take_turns FROM household_rules WHERE household_id = %(household)s"
+            )
+            context["take_turns"] = {
+                "on": bool(rules[0][0]) if rules else False,
+                "can_switch": viewer.is_approver,
+                "csrf": csrf_token(session, FORM_TAKE_TURNS),
+            }
+            context["meals"] = await _meals(q, session, viewer)
+    return _render(request, "household.html", context)
+
+
 # --- agents ---------------------------------------------------------------------------
 
 
@@ -389,33 +709,41 @@ async def agents(request: Request) -> Response:
             (f"user:{session.user_id}", f"household:{session.household_id}"),
         )
         cards = await cur.fetchall()
-        rows = await scope.scoped(conn, q_scope).fetch(
+        q = scope.scoped(conn, q_scope)
+        rows = await q.fetch(
             "SELECT agent_id, user_id, expires_at FROM agent_grants"
             " WHERE household_id = %(household)s AND status = 'active'"
             " AND (user_id = %(user)s OR agent_kind = 'household')",
             user=session.user_id,
         )
+        my_role = await _role(q, session.user_id)
+        context = await _frame(q, session, None)
     active = {r[0]: r for r in rows}
-    items = []
-    for agent_id, _cls in cards:
-        name = html.escape(agent_id)
+    token = csrf_token(session, FORM_REVOKE)
+    listed = []
+    for agent_id, cls in cards:
         grant = active.get(agent_id)
-        if grant is None:
-            items.append(f"<li>{name}: no consent</li>")
-            continue
-        action = html.escape(f"/me/agents/{agent_id}/revoke", quote=True)
-        items.append(
-            f"<li>{name}: consented until {grant[2]:%Y-%m-%d}"
-            f"<form method='post' action='{action}'><button type='submit'>Revoke</button>"
-            "</form></li>"
+        listed.append(
+            {
+                "agent_id": agent_id,
+                "label": "Household agent" if cls == "household" else agent_id,
+                "until": None if grant is None else f"{grant[2]:%Y-%m-%d}",
+                # §11: the grant holder, or any admin for the household agent.
+                "can_revoke": grant is not None
+                and (grant[1] == session.user_id or (cls == "household" and my_role == "admin")),
+                "csrf": token,
+            }
         )
-    return _page("Your agents", f"<ul>{''.join(items)}</ul>")
+    context["agents"] = listed
+    return _render(request, "agents.html", context)
 
 
 async def revoke(request: Request) -> Response:
     session = _session(request)
     if session is None:
         return _signed_out()
+    if not csrf_ok(session, FORM_REVOKE, await _posted_token(request)):
+        return _csrf_refused()
     agent_id = request.path_params["agent_id"]
     async with _connect(request) as conn:
         q = scope.scoped(conn, scope.from_session(session))
@@ -451,12 +779,60 @@ async def revoke(request: Request) -> Response:
 # --- history and band -----------------------------------------------------------------
 
 
+async def _spending_history(q: scope.Scoped, viewer: visibility.Member) -> list[dict[str, Any]]:
+    """Spending per budget week, for the last weeks: every adult sees the totals; the
+    orders listed are those `visibility.can_see` allows (an admin every order, others the
+    orders whose run they started)."""
+    if not visibility.can_see(viewer, "spending_total", None):
+        return []
+    rows = await q.fetch(
+        "SELECT (date_trunc('week', o.created_at AT TIME ZONE h.timezone))::date,"
+        " o.created_at, h.timezone, o.kind, o.total_minor, o.currency,"
+        " r.trigger->>'user_id' FROM orders o"
+        " JOIN households h ON h.household_id = o.household_id"
+        " JOIN runs r ON r.run_id = o.run_id"
+        " WHERE o.household_id = %(household)s AND o.state = ANY(%(states)s)"
+        " AND o.total_minor IS NOT NULL"
+        " AND o.created_at >= (date_trunc('week', now() AT TIME ZONE h.timezone)"
+        " AT TIME ZONE h.timezone) - make_interval(weeks => %(weeks)s)"
+        " ORDER BY o.created_at DESC",
+        states=list(PLACED_OR_LATER),
+        weeks=SPENDING_WEEKS - 1,
+    )
+    weeks: dict[Any, dict[str, Any]] = {}
+    for week, at, tz, kind, total, currency, starter in rows:
+        entry = weeks.setdefault(
+            week, {"week": f"Week of {week.day} {week:%b}", "sum": 0, "cur": currency, "orders": []}
+        )
+        entry["sum"] += int(total)
+        try:
+            starter_id = UUID(starter) if starter else None
+        except ValueError:
+            starter_id = None
+        if visibility.can_see(viewer, "spending_per_order", starter_id):
+            entry["orders"].append(
+                {
+                    "at": _day(at.astimezone(ZoneInfo(tz))),
+                    "amount": _money(total, currency),
+                    "label": "Groceries" if kind == "grocery" else "Dinner",
+                }
+            )
+    return [
+        {"week": e["week"], "total": _money(e["sum"], e["cur"]), "orders": e["orders"]}
+        for e in weeks.values()
+    ]
+
+
 async def history(request: Request) -> Response:
     session = _session(request)
     if session is None:
         return _signed_out()
     async with _connect(request) as conn:
+        viewer = await _viewer(conn, session)
+        if viewer is None:
+            return _signed_out()
         q = scope.scoped(conn, scope.from_session(session))
+        context = await _frame(q, session, "history")
         events = await q.fetch(
             "SELECT ts, kind, agent_id FROM audit_events WHERE household_id = %(household)s"
             " AND (actor_user_id = %(user)s OR subject_user_id = %(user)s)"
@@ -471,20 +847,16 @@ async def history(request: Request) -> Response:
             " ORDER BY a.requested_at DESC LIMIT 100",
             user=session.user_id,
         )
-    event_items = "".join(
-        f"<li>{ts:%Y-%m-%d %H:%M} {html.escape(kind)}"
-        f"{' ' + html.escape(agent) if agent else ''}</li>"
+        context["spending"] = await _spending_history(q, viewer)
+    context["events"] = [
+        {"at": f"{ts:%Y-%m-%d %H:%M}", "text": kind + (f" {agent}" if agent else "")}
         for ts, kind, agent in events
-    )
-    approval_items = "".join(
-        f"<li>{ts:%Y-%m-%d %H:%M} {amount / 100:.2f} {html.escape(currency)}"
-        f" {html.escape(status)}</li>"
+    ]
+    context["approvals"] = [
+        {"at": f"{ts:%Y-%m-%d %H:%M}", "amount": _money(amount, currency), "status": status}
         for ts, amount, currency, status in approvals
-    )
-    return _page(
-        "History",
-        f"<h2>Events</h2><ul>{event_items}</ul><h2>Approvals</h2><ul>{approval_items}</ul>",
-    )
+    ]
+    return _render(request, "history.html", context)
 
 
 def _band_value(body: Any) -> tuple[bool, int | None]:
@@ -498,18 +870,55 @@ def _band_value(body: Any) -> tuple[bool, int | None]:
     return True, value
 
 
+def _band_form_value(raw: Any) -> tuple[bool, int | None]:
+    """The band page's form field: empty for no band, else digits only."""
+    if not isinstance(raw, str):
+        return False, None
+    text = raw.strip()
+    if text == "":
+        return True, None
+    if not text.isascii() or not text.isdigit():
+        return False, None
+    return True, int(text)
+
+
+def _wants_html(request: Request) -> bool:
+    return "text/html" in request.headers.get("accept", "")
+
+
 async def band(request: Request) -> Response:
+    """The approval band: HTML for a browser (`Accept: text/html`), JSON otherwise.
+
+    A POST is the page's form (`per_order_minor`, empty for none; CSRF in the field, then
+    a redirect back) or identity-authz's JSON `{per_order_minor}` (CSRF in the header)."""
     session = _session(request)
+    page = _wants_html(request)
     if session is None:
+        if page:
+            return _signed_out()
         return JSONResponse({"error": "signed_out"}, status_code=401)
     household_id = session.household_id
+    is_form = False
     if request.method == "POST":
-        try:
-            body = await request.json()
-        except ValueError:
-            body = None
-        ok, value = _band_value(body)
+        if not csrf_ok(session, FORM_BAND, await _posted_token(request)):
+            if request.headers.get("content-type", "").startswith("application/json"):
+                return JSONResponse({"error": "csrf"}, status_code=403)
+            return _csrf_refused()
+        kind = request.headers.get("content-type", "")
+        is_form = kind.startswith(("application/x-www-form-urlencoded", "multipart/form-data"))
+        if is_form:
+            ok, value = _band_form_value((await request.form()).get("per_order_minor"))
+        else:
+            try:
+                body = await request.json()
+            except ValueError:
+                body = None
+            ok, value = _band_value(body)
         if not ok:
+            if is_form:
+                return _error(
+                    "Not saved", "Enter a whole number of minor units, or leave it empty.", 400
+                )
             return JSONResponse({"error": "per_order_minor must be an integer >= 0 or null"}, 400)
     async with _connect(request) as conn:
         q = scope.scoped(conn, scope.from_session(session))
@@ -518,12 +927,32 @@ async def band(request: Request) -> Response:
             " FOR UPDATE",
         )
         if not rows:
+            if page:
+                return _error("Not set up", "This household has no approval rules yet.", 404)
             return JSONResponse({"error": "no_approval_rules"}, status_code=404)
         current = rows[0][0]
+        role = await _role(q, session.user_id)
         if request.method != "POST":
+            if page:
+                context = await _frame(q, session, None)
+                currency = await q.fetch(
+                    "SELECT currency FROM households WHERE household_id = %(household)s"
+                )
+                code = str(currency[0][0]).strip() if currency else ""
+                context.update(
+                    band=None
+                    if current is None
+                    else {"amount": _money(current, code), "per_order_minor": current},
+                    currency=code,
+                    can_set=role == "admin",
+                    csrf=csrf_token(session, FORM_BAND),
+                )
+                return _render(request, "band.html", context)
             return JSONResponse({"household_id": household_id, "per_order_minor": current})
         # §9: only an admin may set the band.
-        if await _role(q, session.user_id) != "admin":
+        if role != "admin":
+            if is_form:
+                return _error("Not allowed", "Only an admin can change this.", 403)
             return JSONResponse({"error": "admins_only"}, status_code=403)
         await q.execute(
             "UPDATE approval_rules SET per_order_minor = %(band)s"
@@ -537,6 +966,8 @@ async def band(request: Request) -> Response:
             household_id=household_id,
             detail={"from": current, "to": value},
         )
+    if is_form:
+        return RedirectResponse("/me/household/band", status_code=303)
     return JSONResponse({"household_id": household_id, "per_order_minor": value})
 
 
@@ -545,11 +976,14 @@ async def home(request: Request) -> Response:
 
 
 routes = [
+    # The stylesheet first, before identity-authz's routes (EX-I36).
+    Mount("/me/static", app=StaticFiles(directory=str(STATIC_DIR)), name="me_static"),
     Route("/me", home, methods=["GET"]),
     Route("/me/", home, methods=["GET"]),
     Route("/me/l/{token}", link, methods=["GET", "POST"]),
     Route("/me/callback", callback, methods=["GET"]),
     Route("/me/consent/done", consent_done, methods=["GET"]),
+    Route("/me/household", household_page, methods=["GET"]),
     Route("/me/agents", agents, methods=["GET"]),
     Route("/me/agents/{agent_id}/revoke", revoke, methods=["POST"]),
     Route("/me/history", history, methods=["GET"]),

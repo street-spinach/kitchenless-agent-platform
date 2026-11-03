@@ -18,6 +18,8 @@ BASE: dict[str, Any] = {
 }
 CONTEXTS: dict[str, dict[str, Any]] = {
     "household": {
+        "household_wide": True,
+        "people": [{"name": "Maya", "allergies": ["tree nuts"], "diets": ["vegetarian"]}],
         "order": {
             "summary": "Groceries from Store B, Thursday 6:00 pm-7:00 pm",
             "state": "Courier booked",
