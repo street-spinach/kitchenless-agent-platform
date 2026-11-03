@@ -1005,3 +1005,183 @@ def test_add_child_bad_value_refused(world: dict[str, Any], value: Any) -> None:
         _reset_setup(world["pg"], {"add_child": value})
     with psycopg.connect(world["pg"]) as conn:
         assert _children(conn) == []
+
+
+# --- experience setup keys and tables (experience.md §14, EX-I51) ----------------------------
+
+EVAL_PHONE_B = "+15550100102"  # us-1-b-eval
+JOINER_PHONE = "+15550109999"
+
+
+def _last_inbound_hours(conn: psycopg.Connection, phone: str) -> float:
+    row = conn.execute(
+        "SELECT extract(epoch FROM now() - last_inbound_at) / 3600 FROM channel_identities"
+        " WHERE phone_e164 = %s",
+        (phone,),
+    ).fetchone()
+    assert row is not None and row[0] is not None
+    return float(row[0])
+
+
+def _has_budget(conn: psycopg.Connection, household_id: str) -> bool:
+    return bool(_count(conn, "SELECT count(*) FROM budgets WHERE household_id = %s", household_id))
+
+
+@pytest.mark.db
+def test_experience_setup_keys_undone(world: dict[str, Any]) -> None:
+    """`last_inbound_hours_ago`, `setup_incomplete` and `join_code` apply to one eval
+    household, and the next reset undoes each (EX-A14)."""
+    pg = world["pg"]
+    seeded = seeded_limits()[EVAL]["weekly_budget_minor"]
+    assert seeded is not None
+
+    # One phone (the case form is a number for every phone of the household).
+    _reset_setup(pg, {"last_inbound_hours_ago": {EVAL_PHONE: 30}})
+    with psycopg.connect(pg) as conn:
+        assert 29.9 < _last_inbound_hours(conn, EVAL_PHONE) < 30.1
+        assert _last_inbound_hours(conn, EVAL_PHONE_B) < 0.1
+    _reset_setup(pg, {"last_inbound_hours_ago": 30, "setup_incomplete": True})
+    with psycopg.connect(pg) as conn:
+        assert _last_inbound_hours(conn, EVAL_PHONE) > 29.9
+        assert _last_inbound_hours(conn, EVAL_PHONE_B) > 29.9
+        assert not _has_budget(conn, EVAL)
+        assert _has_budget(conn, "us-2-eval")
+        assert _has_budget(conn, LIVE)
+
+    _reset_setup(
+        pg, {"join_code": {"phone": JOINER_PHONE, "allergies": ["peanuts"], "diets": ["vegan"]}}
+    )
+    with psycopg.connect(pg) as conn:
+        # The previous reset's keys are undone before this one's apply.
+        assert _last_inbound_hours(conn, EVAL_PHONE) < 0.1
+        assert _budget(conn, EVAL) == seeded
+        rows = conn.execute(
+            "SELECT j.household_id, j.phone_e164, j.pending, j.used_at,"
+            " j.expires_at > now() + interval '6 days', j.created_by = r.approver_user_id"
+            " FROM join_codes j JOIN approval_rules r ON r.household_id = j.household_id"
+        ).fetchall()
+    assert rows == [
+        (EVAL, JOINER_PHONE, {"allergies": ["peanuts"], "diets": ["vegan"]}, None, True, True)
+    ]
+
+    _reset(pg, "eval")
+    with psycopg.connect(pg) as conn:
+        assert _count(conn, "SELECT count(*) FROM join_codes") == 0
+        assert _budget(conn, EVAL) == seeded
+        assert _last_inbound_hours(conn, EVAL_PHONE) < 0.1
+
+
+@pytest.mark.db
+@pytest.mark.parametrize(
+    "setup",
+    [
+        {"last_inbound_hours_ago": -1},
+        {"last_inbound_hours_ago": True},
+        {"last_inbound_hours_ago": "30"},
+        {"last_inbound_hours_ago": {LIVE_PHONE: 30}},  # not a phone of the eval household
+        {"setup_incomplete": 1},
+        {"join_code": {"allergies": ["peanuts"]}},
+        {"join_code": {"phone": "555", "allergies": []}},
+        {"join_code": {"phone": JOINER_PHONE, "allergies": ["nuts"]}},
+        {"join_code": {"phone": JOINER_PHONE, "extra": 1}},
+    ],
+)
+def test_experience_setup_keys_refused(world: dict[str, Any], setup: dict[str, Any]) -> None:
+    pg = world["pg"]
+    with pytest.raises(control.ControlRefused):
+        _reset_setup(pg, setup)
+    with psycopg.connect(pg) as conn:
+        assert _count(conn, "SELECT count(*) FROM join_codes") == 0
+        assert _has_budget(conn, EVAL)
+
+
+def _experience_household_rows(conn: psycopg.Connection, household: str) -> None:
+    """A reminder, an onboarding proposal, a join code, and a held message and a send from a
+    household-less reminder run, for one household's first member."""
+    [user_id] = conn.execute(
+        "SELECT user_id FROM household_members WHERE household_id = %s LIMIT 1", (household,)
+    ).fetchone() or (None,)
+    run_id = uuid.uuid4()
+    conn.execute(
+        "INSERT INTO runs (run_id, household_id, kind, trigger, modes)"
+        " VALUES (%s, NULL, 'chat', %s, '{}')",
+        (run_id, Jsonb({"source": "reminder"})),
+    )
+    sent, held = uuid.uuid4(), uuid.uuid4()
+    for message_id in (sent, held):
+        conn.execute(
+            "INSERT INTO agent_messages (message_id, run_id, from_agent, to_agent, to_host, type,"
+            " body) VALUES (%s, %s, 'system:api', %s, 'agents', 'test', '{}')",
+            (message_id, run_id, GROCERY),
+        )
+    conn.execute(
+        "INSERT INTO whatsapp_sends (message_id, user_id, outcome) VALUES (%s, %s, 'sent')",
+        (sent, user_id),
+    )
+    conn.execute(
+        "INSERT INTO held_messages (message_id, user_id, body, ref_kind, ref_id)"
+        " VALUES (%s, %s, '{}', 'reminder', '1')",
+        (held, user_id),
+    )
+    conn.execute(
+        "INSERT INTO reminders (household_id, user_id, kind, ref_id, status)"
+        " VALUES (%s, %s, 'delivery_today', %s, 'sent')",
+        (household, user_id, str(uuid.uuid4())),
+    )
+    conn.execute(
+        "INSERT INTO onboarding_proposals (proposal_id, household_id, proposed_by, answer,"
+        " expires_at) VALUES (%s, %s, %s, '{}', now() + interval '1 day')",
+        (uuid.uuid4(), household, user_id),
+    )
+    conn.execute(
+        "INSERT INTO join_codes (code, household_id, phone_e164, display_name, pending,"
+        " created_by, expires_at) VALUES (%s, %s, %s, 'Sam', '{}', %s, now() + interval '7 days')",
+        (
+            ids.new_join_code(),
+            household,
+            "+15550109001" if household == EVAL else "+15550109002",
+            user_id,
+        ),
+    )
+
+
+@pytest.mark.db
+def test_reset_clears_experience_tables(world: dict[str, Any]) -> None:
+    """The eval reset clears the experience tables of eval households, including rows from
+    household-less reminder runs, and leaves live households' rows."""
+    pg = world["pg"]
+    tables = ("reminders", "onboarding_proposals", "join_codes", "held_messages", "whatsapp_sends")
+    with psycopg.connect(pg) as conn:
+        _experience_household_rows(conn, EVAL)
+        _experience_household_rows(conn, LIVE)
+        for table in tables:
+            assert _count(conn, f"SELECT count(*) FROM {table}") == 2, table  # noqa: S608
+
+    deleted = _reset(pg, "eval")
+
+    assert {t: deleted[t] for t in tables} == dict.fromkeys(tables, 1)
+    with psycopg.connect(pg) as conn:
+        for table in tables:
+            assert _count(conn, f"SELECT count(*) FROM {table}") == 1, table  # noqa: S608
+        live_user = conn.execute(
+            "SELECT user_id FROM household_members WHERE household_id = %s LIMIT 1", (LIVE,)
+        ).fetchone()
+        assert live_user is not None
+        for table in ("held_messages", "whatsapp_sends"):
+            assert (
+                _count(
+                    conn,
+                    f"SELECT count(*) FROM {table} WHERE user_id = %s",
+                    live_user[0],  # noqa: S608
+                )
+                == 1
+            )
+        for table in ("reminders", "onboarding_proposals", "join_codes"):
+            assert (
+                _count(
+                    conn,
+                    f"SELECT count(*) FROM {table} WHERE household_id = %s",
+                    LIVE,  # noqa: S608
+                )
+                == 1
+            )

@@ -35,6 +35,7 @@ from psycopg.types.json import Jsonb
 from services.common import directory, dislikes, ids, pantry, vendors
 from services.common.config import get_settings
 from services.common.modes import ALWAYS_MOCK, VENDORS
+from services.common.protocol.schemas import AllergenCode, DietCode
 from services.identity import grants
 from services.safety.scope import unscoped
 from services.seed import (
@@ -76,24 +77,39 @@ SELECT r.run_id FROM runs r JOIN households h ON h.household_id = r.household_id
 WHERE h.env = 'eval'
 """
 
+# Every statement is limited to eval households in SQL as well as in Python.
+_EVAL_ONLY = "household_id IN (SELECT household_id FROM households WHERE env = 'eval')"
+
+_EVAL_MEMBERS = (
+    "SELECT hm.user_id FROM household_members hm JOIN households h"
+    " ON h.household_id = hm.household_id WHERE h.env = 'eval'"
+)
+
 # Children first (§7, amended 2026-11-02). %(runs)s is the eval run ids.
 _RESET_SQL: tuple[tuple[str, str], ...] = (
     # Children of agent_messages and orders from migration 0015 (experience).
     (
         "whatsapp_sends",
         "DELETE FROM whatsapp_sends WHERE message_id IN"
-        " (SELECT message_id FROM agent_messages WHERE run_id = ANY(%(runs)s))",
+        " (SELECT message_id FROM agent_messages WHERE run_id = ANY(%(runs)s))"
+        f" OR user_id IN ({_EVAL_MEMBERS})",
     ),
     (
         "held_messages",
         "DELETE FROM held_messages WHERE message_id IN"
-        " (SELECT message_id FROM agent_messages WHERE run_id = ANY(%(runs)s))",
+        " (SELECT message_id FROM agent_messages WHERE run_id = ANY(%(runs)s))"
+        f" OR user_id IN ({_EVAL_MEMBERS})",
     ),
     (
         "meal_reactions",
         "DELETE FROM meal_reactions WHERE order_id IN"
         " (SELECT order_id FROM orders WHERE run_id = ANY(%(runs)s))",
     ),
+    # The other experience tables of eval households (experience.md §14, EX-I51). Reminder
+    # runs have no household, so their sends and holds go by user above.
+    ("reminders", f"DELETE FROM reminders WHERE {_EVAL_ONLY}"),
+    ("onboarding_proposals", f"DELETE FROM onboarding_proposals WHERE {_EVAL_ONLY}"),
+    ("join_codes", f"DELETE FROM join_codes WHERE {_EVAL_ONLY}"),
     ("agent_messages", "DELETE FROM agent_messages WHERE run_id = ANY(%(runs)s)"),
     ("idempotency_keys", "DELETE FROM idempotency_keys WHERE run_id = ANY(%(runs)s)"),
     ("timers", "DELETE FROM timers WHERE run_id = ANY(%(runs)s)"),
@@ -155,10 +171,6 @@ class SetupKey:
     # Checks the value's shape before anything is written; returns it normalized or raises
     # `ControlRefused`. `None` means the type check alone is enough.
     check: Callable[[str, Any], Any] | None = None
-
-
-# Every statement is limited to eval households in SQL as well as in Python.
-_EVAL_ONLY = "household_id IN (SELECT household_id FROM households WHERE env = 'eval')"
 
 
 async def _apply_budget(conn: AsyncConnection, household_id: str, value: int) -> None:
@@ -428,6 +440,147 @@ async def _undo_add_child(
         await q.execute(sql, params)
 
 
+# --- experience setup keys (experience.md §14, EX-I51) ---------------------------------------
+
+_HOUSEHOLD_PHONES_SQL = (
+    "SELECT ci.phone_e164 FROM channel_identities ci"
+    " JOIN household_members hm ON hm.user_id = ci.user_id"
+    f" WHERE hm.household_id = %s AND hm.{_EVAL_ONLY}"
+)
+
+
+def _check_last_inbound(name: str, value: Any) -> dict[str, float] | float:
+    """A number of hours (every phone of the household), or `{phone: hours}`."""
+
+    def hours(v: Any) -> float:
+        if isinstance(v, bool) or not isinstance(v, int | float) or not math.isfinite(v) or v < 0:
+            raise ControlRefused(f"setup key {name!r} hours must be a number >= 0")
+        return float(v)
+
+    if isinstance(value, Mapping):
+        if not value or not all(isinstance(k, str) and k for k in value):
+            raise ControlRefused(f"setup key {name!r} must map phones to hours")
+        return {phone: hours(v) for phone, v in value.items()}
+    return hours(value)
+
+
+async def _apply_last_inbound(
+    conn: AsyncConnection, household_id: str, value: Mapping[str, float] | float
+) -> None:
+    """Moves `last_inbound_at` back, so the phone is outside the WhatsApp window (§5)."""
+    q = unscoped(conn, "control.reset")
+    cur = await q.execute(_HOUSEHOLD_PHONES_SQL, (household_id,))
+    phones = {row[0] for row in await cur.fetchall()}
+    targets = dict(value) if isinstance(value, Mapping) else dict.fromkeys(phones, value)
+    unknown = sorted(set(targets) - phones)
+    if unknown or not targets:
+        raise ControlRefused(f"last_inbound_hours_ago: not phones of {household_id}: {unknown}")
+    for phone, hours in targets.items():
+        await q.execute(
+            "UPDATE channel_identities"
+            " SET last_inbound_at = now() - make_interval(secs => %s * 3600)"
+            " WHERE phone_e164 = %s",
+            (hours, phone),
+        )
+
+
+async def _undo_last_inbound(
+    conn: AsyncConnection, household_id: str, seeded: Mapping[str, int | None]
+) -> None:
+    # Every eval phone is set back inside the window by `_RESTORE_WINDOW_SQL` in `reset`.
+    return None
+
+
+async def _apply_setup_incomplete(conn: AsyncConnection, household_id: str, value: bool) -> None:
+    """Setup not finished: the household has no weekly budget row (§14)."""
+    if value:
+        await unscoped(conn, "control.reset").execute(
+            f"DELETE FROM budgets WHERE household_id = %s AND period = 'weekly' AND {_EVAL_ONLY}",
+            (household_id,),
+        )
+
+
+async def _undo_setup_incomplete(
+    conn: AsyncConnection, household_id: str, seeded: Mapping[str, int | None]
+) -> None:
+    """Puts the seeded weekly budget row back if it is missing."""
+    value = seeded["weekly_budget_minor"]
+    if value is None:
+        return
+    await unscoped(conn, "control.reset").execute(
+        "INSERT INTO budgets (household_id, period, amount_minor, currency)"
+        " SELECT household_id, 'weekly', %s, currency FROM households"
+        " WHERE household_id = %s AND env = 'eval'"
+        " ON CONFLICT (household_id, period) DO NOTHING",
+        (value, household_id),
+    )
+
+
+JOIN_CODE_DAYS = 7  # EX-OD15
+_JOIN_CODE_KEYS = frozenset({"phone", "allergies", "diets", "display_name"})
+_ALLERGENS = frozenset(a.value for a in AllergenCode)
+_DIETS = frozenset(d.value for d in DietCode)
+
+
+def _check_join_code(name: str, value: Mapping[Any, Any]) -> dict[str, Any]:
+    """`{phone, allergies?: [code], diets?: [code], display_name?}`."""
+    if not set(value) <= _JOIN_CODE_KEYS or "phone" not in value:
+        raise ControlRefused(
+            f"setup key {name!r} needs phone, and may have allergies, diets and display_name"
+        )
+    phone = value["phone"]
+    if not isinstance(phone, str) or not phone.startswith("+") or not phone[1:].isdigit():
+        raise ControlRefused(f"setup key {name!r}: phone must be E.164")
+    out: dict[str, Any] = {"phone": phone}
+    for field, allowed in (("allergies", _ALLERGENS), ("diets", _DIETS)):
+        codes = value.get(field, [])
+        if not isinstance(codes, list) or not all(c in allowed for c in codes):
+            raise ControlRefused(f"setup key {name!r}: {field} must be a list of known codes")
+        out[field] = sorted(set(codes))
+    display_name = value.get("display_name", "New member")
+    if not isinstance(display_name, str) or not display_name.strip():
+        raise ControlRefused(f"setup key {name!r}: display_name must be a non-empty string")
+    out["display_name"] = display_name
+    return out
+
+
+async def _apply_join_code(
+    conn: AsyncConnection, household_id: str, value: Mapping[str, Any]
+) -> None:
+    """An open join code for that phone, made by the household's approver. `pending` is
+    `{allergies: [...], diets: [...]}`."""
+    q = unscoped(conn, "control.reset")
+    cur = await q.execute(
+        f"SELECT approver_user_id FROM approval_rules WHERE household_id = %s AND {_EVAL_ONLY}",
+        (household_id,),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        raise ControlRefused(f"join_code: {household_id} has no approver")
+    await q.execute(
+        "INSERT INTO join_codes (code, household_id, phone_e164, display_name, pending,"
+        " created_by, expires_at)"
+        " VALUES (%s, %s, %s, %s, %s, %s, now() + make_interval(days => %s))",
+        (
+            ids.new_join_code(),
+            household_id,
+            value["phone"],
+            value["display_name"],
+            Jsonb({"allergies": value["allergies"], "diets": value["diets"]}),
+            row[0],
+            JOIN_CODE_DAYS,
+        ),
+    )
+
+
+async def _undo_join_code(
+    conn: AsyncConnection, household_id: str, seeded: Mapping[str, int | None]
+) -> None:
+    await unscoped(conn, "control.reset").execute(
+        f"DELETE FROM join_codes WHERE household_id = %s AND {_EVAL_ONLY}", (household_id,)
+    )
+
+
 SETUP_KEYS: Mapping[str, SetupKey] = {
     "budget_minor": SetupKey(int, _apply_budget, _undo_budget),
     "per_order_minor": SetupKey(int, _apply_per_order, _undo_per_order),
@@ -435,6 +588,11 @@ SETUP_KEYS: Mapping[str, SetupKey] = {
     "take_turns": SetupKey(bool, _apply_take_turns, _undo_take_turns),
     "pantry": SetupKey(dict, _apply_pantry, _undo_pantry, _check_pantry),
     "add_child": SetupKey(dict, _apply_add_child, _undo_add_child, _check_add_child),
+    "last_inbound_hours_ago": SetupKey(
+        object, _apply_last_inbound, _undo_last_inbound, _check_last_inbound
+    ),
+    "setup_incomplete": SetupKey(bool, _apply_setup_incomplete, _undo_setup_incomplete),
+    "join_code": SetupKey(dict, _apply_join_code, _undo_join_code, _check_join_code),
 }
 
 
