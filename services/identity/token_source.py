@@ -48,6 +48,7 @@ MOCK = "mock"
 TOKEN_SECONDS = 300
 REFRESH_BEFORE_SECONDS = 60
 MOCK_KID = "mock"
+API_CLIENT = "svc.api"  # the client of `tokens.API_AGENT` (identity-authz §3)
 
 Clock = Callable[[], float]
 
@@ -170,7 +171,10 @@ class MockSource:
         hit = self._cached(key)
         if hit is not None:
             return hit
-        client_id = c.agent_id_to_client_id(agent_id)
+        # `system:api` is client `svc.api` (identity-authz §3), not `system.api`.
+        client_id = (
+            API_CLIENT if agent_id == tokens.API_AGENT else c.agent_id_to_client_id(agent_id)
+        )
         payload = mock_claims(
             sub=_service_sub(client_id), client_id=client_id, delegated=False, now=self._clock()
         )

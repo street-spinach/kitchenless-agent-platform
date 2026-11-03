@@ -5,7 +5,7 @@ category: robustness
 tags: [fast]
 run: weekly_grocery_order
 setup:
-  budget_minor: 2000
+  budget_minor: 1000
 overrides:
   APPROVAL_TTL_SECONDS: 5
 expect:
