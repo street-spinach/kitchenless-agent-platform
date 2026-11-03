@@ -6,7 +6,9 @@
 grocery:kroger-us: {floor_pct: 95}
 grocery:square-us: {floor_pct: 95}
 grocery:mock-us: {floor_pct: 95}
-restaurant:square-us: {floor_pct: 95}
+# The owner rule (identity-authz I27 step 13, I-A19): floors stay at 95 %, and a
+# `max_discount_pct` of 4 makes the owner's 96 % floor the binding one in I-CUJ 7.
+restaurant:square-us: {floor_pct: 95, max_discount_pct: 4}
 restaurant:mock-us: {floor_pct: 95}
 
 # Courier cards have a `delivery` rule instead of `floor_pct` (item 55, amended 2026-11-02,

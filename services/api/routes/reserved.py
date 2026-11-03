@@ -1,7 +1,8 @@
 """Reserved `/app/*` routes (architecture item 38).
 
-They hold the paths for the owner app and return 501 until identity-authz's `app.py`
-lands (I32). `/me/*` is no longer reserved: `me.py` serves it (identity-authz I-A14).
+They hold the paths for the owner app and return 501. `app.py` serves `/app/rules`
+(identity-authz I32) and is mounted first; the other paths wait for the experience design.
+`/me/*` is no longer reserved: `me.py` serves it (identity-authz I-A14).
 """
 
 from starlette.requests import Request
