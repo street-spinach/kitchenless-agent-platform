@@ -48,6 +48,8 @@ The setup tools (experience §9, EX-I26), for the consumer agent:
 *   `get_setup_state()` *guarded*: `{role, has_budget, has_proposal}` for the person.
 *   `propose_setup(answer)` *guarded*, admins only: the validated `SetupAnswer` stored as
     the household's `pending` proposal, with `phones_taken`.
+*   `apply_setup(proposal_id, answer, removal, child_user_ids, user_id)` *guarded*, `api`
+    service token, admins only: "Yes, save", "No", and each removal's second tap (EX-I27).
 
 The household is always the run's household (`runs.household_id`), never an argument.
 """
@@ -93,6 +95,7 @@ __all__ = [
     "SETTABLE_STATES",
     "MoneyArg",
     "advance_turn",
+    "apply_setup",
     "authorize_amendment",
     "authorize_spend",
     "choose_shortfall_option",
@@ -114,6 +117,7 @@ __all__ = [
     "server",
     "set_order_state",
     "set_take_turns",
+    "setup_removals",
 ]
 
 AREA = "household"
@@ -151,6 +155,11 @@ _DISLIKE_ACTIONS = frozenset({"add", "remove"})
 NOT_ADMIN = "not_admin"
 # `propose_setup`: the answer does not match `SetupAnswer` once unknown codes are moved.
 INVALID_ANSWER = "invalid_answer"
+# `apply_setup`: the proposal expired, was superseded or was discarded (§9 `setup_expired`).
+SETUP_EXPIRED = "setup_expired"
+_SETUP_ANSWERS = frozenset({"yes", "no", "remove", "keep"})
+_REMOVAL_ANSWERS = frozenset({"remove", "keep"})
+_JOIN_CODE_TRIES = 3
 
 server = MCPServer(name=AREA)
 
@@ -1623,6 +1632,263 @@ async def propose_setup(ctx: CallContext, *, answer: Mapping[str, Any]) -> dict[
     )
 
 
+def setup_removals(answer: Mapping[str, Any]) -> list[dict[str, str]]:
+    """The proposal's removals, numbered by position (§9 "Removals"): for each person
+    matched to a member (`user_id`), in answer order, `remove_allergies` then
+    `remove_diets`. A removal for someone who is not yet a member has no row to remove and
+    is not numbered. The restate and the confirm buttons use the same numbering."""
+    out: list[dict[str, str]] = []
+    for person in answer.get("people") or []:
+        member = person.get("user_id")
+        if not member:
+            continue
+        for field, kind in (("remove_allergies", "allergy"), ("remove_diets", "diet")):
+            for code in person.get(field) or []:
+                out.append(
+                    {"user_id": str(member), "name": person["name"], "kind": kind, "value": code}
+                )
+    return out
+
+
+def _new_children(answer: Mapping[str, Any]) -> list[str]:
+    """Names of the children the answer adds (no `user_id`): ingest creates each one."""
+    return [
+        p["name"] for p in answer.get("people") or [] if p.get("child") and not p.get("user_id")
+    ]
+
+
+async def _proposal(
+    conn: AsyncConnection, household: str | None, proposal_id: uuid.UUID, *, lock: bool = False
+) -> tuple[str, bool, dict[str, Any]] | None:
+    """`(status, expired, answer)` of the household's proposal, or None."""
+    rows = await _scoped(conn, household).fetch(
+        "SELECT status, expires_at <= now(), answer FROM onboarding_proposals"
+        " WHERE proposal_id = %(proposal)s AND household_id = %(household)s"
+        + (" FOR UPDATE" if lock else ""),
+        proposal=proposal_id,
+    )
+    if not rows:
+        return None
+    status, expired, stored = rows[0]
+    return str(status), bool(expired), dict(stored)
+
+
+async def apply_setup(
+    ctx: CallContext,
+    *,
+    proposal_id: uuid.UUID,
+    answer: str,
+    removal: int | None,
+    child_user_ids: Mapping[str, uuid.UUID],
+    user_id: uuid.UUID,
+) -> dict[str, Any]:
+    """An admin's tap on a setup proposal (§9 "Yes, save", "Removals"), from `api` with its
+    service token. `user_id` is the tapper (the run trigger's person), checked to be an
+    admin of the run's household (else `not_admin`).
+
+    *   `yes` (proposal `pending`, unexpired; else `setup_expired`): in one transaction,
+        the additions to `member_constraints` (`source = 'setup'`) for matched members and
+        for each new child (`child_user_ids`, keyed by the name as written; every new child
+        must be there and be a child of the household, else `invalid_answer`), the weekly
+        budget in the household currency, one join code per new adult with a phone
+        (holding that adult's codes), and the status `applied`, or `awaiting_remove` when
+        there are removals. A new adult with no phone is listed in `saved.not_saved`.
+    *   `no`: `discarded`.
+    *   `remove` / `keep` with `removal` (an index of `setup_removals`): deletes that
+        member's row, or leaves it; the last answer makes the proposal `applied`.
+
+    A repeated tap returns `outcome: already_decided` and writes nothing. `saved` is what
+    the `yes` saved (stored on the proposal, so a repeat returns the same), else None.
+    """
+    household = await _run_household(ctx)
+    decision = answer
+
+    async def check(conn: AsyncConnection) -> None:
+        if ctx.agent_id != API_AGENT:
+            raise GuardRefused(AUTHZ_DENIED)
+        if decision not in _SETUP_ANSWERS or (decision in _REMOVAL_ANSWERS) != (
+            removal is not None
+        ):
+            raise GuardRefused(INVALID_ANSWER)
+        if await _role(conn, household, user_id) != "admin":
+            raise GuardRefused(NOT_ADMIN)
+        found = await _proposal(conn, household, proposal_id)
+        if found is None:
+            raise GuardRefused(AUTHZ_DENIED)
+        status, expired, stored = found
+        if decision in ("yes", "no"):
+            if status == "pending" and expired:
+                raise GuardRefused(SETUP_EXPIRED)
+            if status == "superseded" or (status == "discarded" and decision == "yes"):
+                raise GuardRefused(SETUP_EXPIRED)
+            if decision == "yes" and status == "pending":
+                for name in _new_children(stored):
+                    child = child_user_ids.get(name)
+                    if child is None or await _role(conn, household, child) != "child":
+                        raise GuardRefused(INVALID_ANSWER)
+            return
+        # `remove` / `keep`: only after "Yes, save".
+        if status in ("superseded", "discarded"):
+            raise GuardRefused(SETUP_EXPIRED)
+        if status == "pending":
+            raise GuardRefused(INVALID_ANSWER)
+        if not isinstance(removal, int) or not 0 <= removal < len(setup_removals(stored)):
+            raise GuardRefused(INVALID_ANSWER)
+
+    def result(status: str, outcome: str, stored: Mapping[str, Any]) -> dict[str, Any]:
+        decided = stored.get("removal_decisions") or {}
+        count = len(setup_removals(stored)) if stored.get("applied") is not None else 0
+        return {
+            "proposal_id": str(proposal_id),
+            "status": status,
+            "outcome": outcome,
+            "saved": stored.get("applied"),
+            "removals_pending": [n for n in range(count) if str(n) not in decided],
+        }
+
+    async def save(conn: AsyncConnection, stored: dict[str, Any]) -> dict[str, Any]:
+        q = _scoped(conn, household)
+        constraints: list[dict[str, str]] = []
+        join_codes: list[dict[str, str]] = []
+        not_saved: list[str] = []
+        for person in stored.get("people") or []:
+            codes = [("allergy", c) for c in person.get("add_allergies") or []] + [
+                ("diet", c) for c in person.get("add_diets") or []
+            ]
+            target = person.get("user_id") or (
+                child_user_ids.get(person["name"]) if person.get("child") else None
+            )
+            if target is not None:
+                for kind, value in codes:
+                    cur = await q.execute(
+                        "INSERT INTO member_constraints (user_id, kind, value, source)"
+                        " SELECT m.user_id, %(kind)s, %(value)s, 'setup'"
+                        " FROM household_members m"
+                        " WHERE m.household_id = %(household)s AND m.user_id = %(user)s"
+                        " AND NOT EXISTS (SELECT 1 FROM member_constraints c"
+                        " WHERE c.user_id = m.user_id AND c.kind = %(kind)s"
+                        " AND c.value = %(value)s)",
+                        user=target,
+                        kind=kind,
+                        value=value,
+                    )
+                    if cur.rowcount == 1:
+                        constraints.append({"user_id": str(target), "kind": kind, "value": value})
+            elif person.get("phone"):
+                pending = {
+                    "allergies": list(person.get("add_allergies") or []),
+                    "diets": list(person.get("add_diets") or []),
+                }
+                for _ in range(_JOIN_CODE_TRIES):
+                    code = ids.new_join_code()
+                    cur = await q.execute(
+                        "INSERT INTO join_codes (code, household_id, phone_e164, display_name,"
+                        " pending, created_by, expires_at)"
+                        " VALUES (%(code)s, %(household)s, %(phone)s, %(name)s, %(pending)s,"
+                        " %(user)s, now() + interval '7 days') ON CONFLICT DO NOTHING",
+                        code=code,
+                        phone=person["phone"],
+                        name=person["name"],
+                        pending=Jsonb(pending),
+                        user=user_id,
+                    )
+                    if cur.rowcount == 1:
+                        join_codes.append(
+                            {"name": person["name"], "phone": person["phone"], "code": code}
+                        )
+                        break
+                else:
+                    raise RuntimeError("no free join code")  # 40 bits: never in practice
+            else:
+                not_saved.append(person["name"])
+        budget_minor = stored.get("budget_minor")
+        budget_set = False
+        if budget_minor is not None:
+            had = await q.fetch("SELECT 1 FROM budgets WHERE household_id = %(household)s")
+            await q.execute(
+                "INSERT INTO budgets (household_id, period, amount_minor, currency)"
+                " SELECT household_id, 'weekly', %(amount)s, currency FROM households"
+                " WHERE household_id = %(household)s"
+                " ON CONFLICT (household_id, period) DO UPDATE"
+                " SET amount_minor = EXCLUDED.amount_minor, currency = EXCLUDED.currency",
+                amount=int(budget_minor),
+            )
+            budget_set = not had
+        return {
+            "constraints": constraints,
+            "budget_minor": budget_minor,
+            "budget_set": budget_set,
+            "join_codes": join_codes,
+            "not_saved": not_saved,
+        }
+
+    async def call() -> dict[str, Any]:
+        async with db.get_pool().connection() as conn, conn.transaction():
+            q = _scoped(conn, household)
+            found = await _proposal(conn, household, proposal_id, lock=True)
+            if found is None:  # checked by the limits; never in practice
+                return result("missing", "expired", {})
+            status, expired, stored = found
+            if decision == "yes":
+                if status in ("applied", "awaiting_remove"):
+                    return result(status, "already_decided", stored)
+                if status != "pending" or expired:
+                    return result(status, "expired", stored)
+                stored = {**stored, "applied": await save(conn, stored), "removal_decisions": {}}
+                status = "awaiting_remove" if setup_removals(stored) else "applied"
+            elif decision == "no":
+                if status != "pending":
+                    return result(status, "already_decided", stored)
+                status = "discarded"
+            else:
+                assert removal is not None
+                decided = dict(stored.get("removal_decisions") or {})
+                if status != "awaiting_remove" or str(removal) in decided:
+                    return result(status, "already_decided", stored)
+                target = setup_removals(stored)[removal]
+                if decision == "remove":
+                    await q.execute(
+                        "DELETE FROM member_constraints WHERE user_id = %(user)s"
+                        " AND user_id IN (SELECT user_id FROM household_members"
+                        " WHERE household_id = %(household)s)"
+                        " AND kind = %(kind)s AND value = %(value)s",
+                        user=uuid.UUID(target["user_id"]),
+                        kind=target["kind"],
+                        value=target["value"],
+                    )
+                decided[str(removal)] = decision
+                stored = {**stored, "removal_decisions": decided}
+                if len(decided) == len(setup_removals(stored)):
+                    status = "applied"
+            await q.execute(
+                "UPDATE onboarding_proposals SET status = %(status)s, answer = %(answer)s,"
+                " decided_by = %(user)s, decided_at = now()"
+                " WHERE proposal_id = %(proposal)s AND household_id = %(household)s",
+                status=status,
+                answer=Jsonb(stored),
+                user=user_id,
+                proposal=proposal_id,
+            )
+        return result(status, "done", stored)
+
+    return await run_guarded(
+        ctx,
+        tool=f"{AREA}.apply_setup",
+        relation=None,
+        limits=check,
+        key=None,
+        request={
+            "proposal_id": str(proposal_id),
+            "answer": decision,
+            "removal": removal,
+            "child_user_ids": {str(k): str(v) for k, v in child_user_ids.items()},
+            "user_id": str(user_id),
+        },
+        call=call,
+        apply=None,
+    )
+
+
 # --- MCP registration -----------------------------------------------------------------
 
 
@@ -1783,6 +2049,26 @@ async def _get_setup_state_tool(ctx: Context) -> CallToolResult:
 @server.tool(name="propose_setup")
 async def _propose_setup_tool(answer: dict[str, Any], ctx: Context) -> CallToolResult:
     return await _serve(ctx, propose_setup, answer=answer)
+
+
+@server.tool(name="apply_setup")
+async def _apply_setup_tool(
+    proposal_id: uuid.UUID,
+    answer: Literal["yes", "no", "remove", "keep"],
+    removal: int | None,
+    child_user_ids: dict[str, uuid.UUID],
+    user_id: uuid.UUID,
+    ctx: Context,
+) -> CallToolResult:
+    return await _serve(
+        ctx,
+        apply_setup,
+        proposal_id=proposal_id,
+        answer=answer,
+        removal=removal,
+        child_user_ids=child_user_ids,
+        user_id=user_id,
+    )
 
 
 @server.tool(name="authorize_amendment")

@@ -105,6 +105,7 @@ def test_scope_table_matches_design() -> None:
         "set_take_turns": ("service", {"system"}, None),
         "get_setup_state": ("delegated", {"consumer"}, None),
         "propose_setup": ("delegated", {"consumer"}, "constraints:write"),
+        "apply_setup": ("service", {"system"}, None),
     }
     actual = {
         tool: (row.caller, set(row.agent_classes), row.scope)
