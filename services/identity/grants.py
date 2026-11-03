@@ -10,14 +10,15 @@
     household grant. Its writes are in the caller's transaction: a caller that refuses
     on `GrantExpired` commits first, so the mark is kept.
 *   `revoke` is §11 step 1: one row update and `consent_revoked`, in one transaction.
+*   `after_revoke` is §11 step 2: after the commit, one best-effort Keycloak per-client
+    consent revoke; a failure writes `keycloak_revoke_failed` and is not retried. The
+    revoke notice (step 3) lands with the WhatsApp texts (I26, build step 9).
 *   `mark_refused` handles Keycloak's `invalid_grant` (§12 failures).
 *   `client_assertion` is the `private_key_jwt` assertion for the token endpoint.
-
-`after_revoke` (§11 steps 2 and 3) needs the Keycloak Admin API (I22) and the revoke
-notice; it lands with them, not in build step 5.
 """
 
 import base64
+import logging
 import os
 import time
 from dataclasses import dataclass
@@ -43,6 +44,7 @@ __all__ = [
     "GrantExpired",
     "GrantMissing",
     "GrantRevoked",
+    "after_revoke",
     "client_assertion",
     "create",
     "decrypt",
@@ -51,6 +53,8 @@ __all__ = [
     "mark_refused",
     "revoke",
 ]
+
+log = logging.getLogger(__name__)
 
 GRANT_DAYS = 30
 NONCE_BYTES = 12
@@ -279,6 +283,40 @@ async def revoke(
             grant_id=grant_id,
             detail={"reason": revoke_reason},
         )
+    return True
+
+
+async def after_revoke(conn: AsyncConnection, grant_id: UUID) -> bool:
+    """§11 step 2, after `revoke` has committed: remove the grant holder's stored consent
+    for the agent's client in Keycloak, once. Any failure writes `keycloak_revoke_failed`
+    (the `consent_revoked` row is never updated) and returns False."""
+    from services.identity import keycloak_admin  # it imports this module
+
+    cur = await unscoped(conn, "grants").execute(
+        "SELECT g.agent_id, g.user_id, g.household_id, u.keycloak_sub FROM agent_grants g"
+        " JOIN users u ON u.user_id = g.user_id WHERE g.grant_id = %s AND g.status = 'revoked'",
+        (grant_id,),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        raise ValueError("after_revoke needs a revoked grant")
+    agent_id, user_id, household_id, keycloak_sub = row
+    try:
+        if not keycloak_sub:
+            raise RuntimeError("the grant holder has no Keycloak user id")
+        await keycloak_admin.revoke_consent(keycloak_sub, ids.keycloak_client_id(agent_id))
+    except Exception as exc:  # best effort (§11): every failure is audited, none retried
+        log.warning("keycloak consent revoke failed: %s", type(exc).__name__)
+        await audit.record(
+            conn,
+            "keycloak_revoke_failed",
+            subject_user_id=user_id,
+            agent_id=agent_id,
+            household_id=household_id,
+            grant_id=grant_id,
+            detail={"error": type(exc).__name__},
+        )
+        return False
     return True
 
 

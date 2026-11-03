@@ -7,6 +7,9 @@ for SQL that names a household-owned table. A file that has some must be in `ALL
     must route its queries through `unscoped(conn, "<reason>")`.
 *   `not moved`: a caller not yet moved to `scope.scoped` (identity-authz I39, step 12).
     This list only shrinks; by step 12 it holds no `not moved` entries.
+*   `scoped`: a file whose household SQL all goes through `scope.scoped`. Every string
+    in it that names a household table must bind `%(household)s`, and it never calls
+    `unscoped`.
 """
 
 import ast
@@ -26,17 +29,21 @@ from tests.unit import identity_world as w
 
 ROOTS = ("services", "evals")
 NOT_MOVED = "not moved"
+SCOPED = "scoped"
 
 ALLOWLIST: dict[str, str] = {
     # §8: callers without a household context, `unscoped(conn, reason)` from the start.
     "services/identity/grants.py": "unscoped:grants",
     "services/identity/audit.py": "unscoped:audit.record",
     "services/identity/fga.py": "unscoped:fga.reconcile",
+    "services/identity/links.py": "unscoped:links",
     "services/seed/__main__.py": "unscoped:seed",
     "services/common/runs.py": "unscoped:runs",
     "services/agents/sweeper.py": "unscoped:sweeper",
     "services/api/ingest.py": "unscoped:ingest",
     "services/mocks/control.py": "unscoped:control.reset",
+    # Every household query through `scope.scoped` with the session's scope (I24).
+    "services/api/routes/me.py": SCOPED,
     # Not yet moved to `scope.scoped` (I39, step 12).
     "services/agents/a2a/demo.py": NOT_MOVED,
     "services/agents/common/seller.py": NOT_MOVED,
@@ -139,6 +146,15 @@ def test_scoped_tables_only_via_helper() -> None:
         if entry.startswith("unscoped:"):
             reason = entry.removeprefix("unscoped:")
             assert reason in unscoped_reasons(Path(path).read_text()), (path, reason)
+        elif entry == SCOPED:
+            source = Path(path).read_text()
+            assert not unscoped_reasons(source), path
+            unbound = [
+                s
+                for s in _strings(ast.parse(source))
+                if _HOUSEHOLD_SQL.search(s) and scope._HOUSEHOLD_PLACEHOLDER not in s
+            ]
+            assert unbound == [], (path, unbound)
         else:
             assert entry == NOT_MOVED, (path, entry)
 

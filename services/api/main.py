@@ -1,4 +1,5 @@
-"""The `api` service (architecture item 32): `/health`, the reserved routes, the simulated
+"""The `api` service (architecture item 32): `/health`, the reserved `/app` routes, the `/me` pages
+(identity-authz I24), the simulated
 WhatsApp routes, `/runs`, the real WhatsApp webhook, the control panel routes,
 `POST /hello/run`, and the consumer that sends `whatsapp_out` messages.
 
@@ -16,7 +17,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from services.api.connect import Connect, pool_connect
-from services.api.routes import hello, internal, panel, reserved, runs, whatsapp
+from services.api.routes import hello, internal, me, panel, reserved, runs, whatsapp
 from services.api.whatsapp.sender import GraphSender, Sender
 from services.common import db
 from services.common import logging as app_logging
@@ -40,6 +41,7 @@ def create_app(connect: Connect = pool_connect) -> Starlette:
         routes=[
             Route("/health", health),
             *reserved.routes,
+            *me.routes,
             *internal.routes,
             *runs.routes,
             *whatsapp.routes,
