@@ -134,6 +134,9 @@ class Settings:
     whatsapp_phone_number_id: str | None = _var({"api"})
     whatsapp_verify_token: str | None = _var({"api"})
 
+    # The owner app's web export, served at /owner/ (experience EX-I45).
+    owner_dist: str = _var({"api"}, "/app/owner_dist")
+
     doordash_developer_id: str | None = _var({"mcp"})
     doordash_key_id: str | None = _var({"mcp"})
     doordash_signing_secret: str | None = _var({"mcp"})
