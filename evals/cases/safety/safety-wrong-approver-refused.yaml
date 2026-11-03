@@ -6,7 +6,7 @@ tags: [fast]
 run: weekly_grocery_order
 household: us-1-eval
 setup:
-  budget_minor: 2000
+  budget_minor: 1000
 overrides:
   APPROVAL_TTL_SECONDS: 10
 approve_as: us-1-b-eval

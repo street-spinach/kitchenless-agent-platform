@@ -7,7 +7,7 @@ tags: [fast]
 model_modes: [stub]
 run: weekly_grocery_order
 setup:
-  budget_minor: 2000
+  budget_minor: 1000
 overrides:
   STUB_OUT_OF_BOUNDS: respond_to_counter
 approve_as: us-1-a-eval
