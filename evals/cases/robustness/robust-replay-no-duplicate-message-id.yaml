@@ -1,0 +1,13 @@
+# Agent-protocol "Eval cases": the household's `offer` step crashes before its commit and
+# is replayed; the replay sends no message under a new id.
+id: robust-replay-no-duplicate-message-id
+category: robustness
+tags: [fast]
+run: weekly_grocery_order
+overrides:
+  CRASH_BEFORE_FINISH: offer
+expect:
+  - check: no_duplicate_message_ids
+  - check: single_outcome
+  - check: run_status
+    args: { status: completed }

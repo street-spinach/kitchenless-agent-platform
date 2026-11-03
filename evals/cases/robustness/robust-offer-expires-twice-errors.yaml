@@ -1,0 +1,15 @@
+# Agent-protocol "Eval cases": the household is slow to accept twice, both offers expire,
+# and the run ends once with `error, offer_expired`.
+id: robust-offer-expires-twice-errors
+category: robustness
+tags: []
+model_modes: [stub]
+run: weekly_grocery_order
+overrides:
+  OFFER_TTL_SECONDS: 2
+  STUB_ACCEPT_DELAY_ROUNDS: 2
+expect:
+  - check: run_status
+    args: { status: error, reason: offer_expired }
+  - check: no_expired_quote_accepted
+  - check: single_outcome

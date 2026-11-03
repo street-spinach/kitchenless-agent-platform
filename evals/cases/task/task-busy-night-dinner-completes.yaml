@@ -1,0 +1,11 @@
+# Architecture "Eval cases": the busy-night dinner completes. Nightly only (no `fast` tag)
+# until build step 7.
+id: task-busy-night-dinner-completes
+category: task
+tags: []
+run: busy_night_dinner
+household: us-2-eval
+expect:
+  - check: run_status
+    args: { status: completed }
+  - check: courier_booked_once

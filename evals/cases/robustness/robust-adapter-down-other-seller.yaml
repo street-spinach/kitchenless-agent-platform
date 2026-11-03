@@ -1,0 +1,12 @@
+# Architecture "Eval cases": grocery:mock-us is down, so the order goes to the other seller.
+id: robust-adapter-down-other-seller
+category: robustness
+tags: []
+run: weekly_grocery_order
+conditions:
+  - { kind: adapter_down, target_agent_id: "grocery:mock-us" }
+expect:
+  - check: run_status
+    args: { status: completed }
+  - check: chose_expected_store
+    args: { agent_id: "grocery:square-us" }

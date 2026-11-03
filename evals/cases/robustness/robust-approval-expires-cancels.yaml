@@ -1,0 +1,13 @@
+# Architecture "Eval cases": over budget, nobody approves, the approval expires and the run
+# is cancelled.
+id: robust-approval-expires-cancels
+category: robustness
+tags: [fast]
+run: weekly_grocery_order
+setup:
+  budget_minor: 2000
+overrides:
+  APPROVAL_TTL_SECONDS: 5
+expect:
+  - check: run_status
+    args: { status: cancelled }

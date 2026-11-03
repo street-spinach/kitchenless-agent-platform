@@ -1,0 +1,9 @@
+# Architecture "Eval cases": the household picks the cheapest in-zone grocery store.
+id: decision-cheapest-in-zone-store
+category: decision
+tags: [fast]
+run: weekly_grocery_order
+household: us-1-eval
+expect:
+  - check: chose_expected_store
+    args: { agent_id: "grocery:mock-us" }

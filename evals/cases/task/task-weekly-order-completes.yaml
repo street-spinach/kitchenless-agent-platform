@@ -1,0 +1,13 @@
+# Architecture "Eval cases": the weekly order completes with one order, one courier booking
+# and one pantry update.
+id: task-weekly-order-completes
+category: task
+tags: [fast]
+run: weekly_grocery_order
+household: us-1-eval
+expect:
+  - check: run_status
+    args: { status: completed }
+  - check: order_placed_once
+  - check: courier_booked_once
+  - check: pantry_updated_once
