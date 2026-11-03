@@ -43,6 +43,12 @@ The shortfall tools (agent-protocol §10 and P25, #68):
 *   `authorize_amendment(order_id, shortfall_id, picks)` *guarded*: the
     `limits.authorize_amendment` result `{picks, refused}`.
 
+The setup tools (experience §9, EX-I26), for the consumer agent:
+
+*   `get_setup_state()` *guarded*: `{role, has_budget, has_proposal}` for the person.
+*   `propose_setup(answer)` *guarded*, admins only: the validated `SetupAnswer` stored as
+    the household's `pending` proposal, with `phones_taken`.
+
 The household is always the run's household (`runs.household_id`), never an argument.
 """
 
@@ -65,7 +71,14 @@ from services.common import db, dislikes, ids, orders, outbox, pantry, runs
 from services.common.config import get_settings
 from services.common.money import Money
 from services.common.money import format as money_format
-from services.common.protocol.schemas import Currency, OrderLine, ShortfallLine
+from services.common.protocol.schemas import (
+    AllergenCode,
+    Currency,
+    DietCode,
+    OrderLine,
+    SetupAnswer,
+    ShortfallLine,
+)
 from services.common.trace import TraceStore
 from services.identity import audit
 from services.mcp.knowledge.adapters.neo4j_knowledge import AllergenCheck
@@ -74,6 +87,7 @@ from services.mcp.meta import CallContext, tool_error, tool_errors
 from services.mcp.traced import Tool, traced
 from services.safety import limits, scope
 from services.safety.guard import GuardRefused, run_guarded
+from services.safety.scope import unscoped
 
 __all__ = [
     "SETTABLE_STATES",
@@ -90,8 +104,10 @@ __all__ = [
     "get_household_allergens",
     "get_household_rules",
     "get_pantry",
+    "get_setup_state",
     "get_shortfall",
     "open_shortfall",
+    "propose_setup",
     "record_delivery",
     "record_dislike",
     "request_approval",
@@ -131,6 +147,10 @@ INVALID_VALUE = "invalid_value"
 # `advance_turn`: the order is not the household's delivered dinner (agents §10).
 WRONG_ORDER_STATE = "wrong_order_state"
 _DISLIKE_ACTIONS = frozenset({"add", "remove"})
+# `propose_setup` (experience §9): the person is a member but not an admin.
+NOT_ADMIN = "not_admin"
+# `propose_setup`: the answer does not match `SetupAnswer` once unknown codes are moved.
+INVALID_ANSWER = "invalid_answer"
 
 server = MCPServer(name=AREA)
 
@@ -1392,6 +1412,217 @@ async def get_shortfall(ctx: CallContext, *, shortfall_id: str) -> dict[str, Any
     }
 
 
+# --- setup tools (experience §9, EX-I26) -----------------------------------------------
+
+_SETUP_CODES = {
+    "add_allergies": frozenset(c.value for c in AllergenCode),
+    "remove_allergies": frozenset(c.value for c in AllergenCode),
+    "add_diets": frozenset(c.value for c in DietCode),
+    "remove_diets": frozenset(c.value for c in DietCode),
+}
+
+
+def _acting_user(ctx: CallContext) -> uuid.UUID | None:
+    """The person a consumer agent acts for (`on_behalf_of = "user:<id>"`), else None."""
+    kind, _, value = (ctx.on_behalf_of or "").partition(":")
+    if kind != "user":
+        return None
+    try:
+        return uuid.UUID(value)
+    except ValueError:
+        return None
+
+
+def _user_relation(user: uuid.UUID | None) -> tuple[str, str] | None:
+    # With no person there is nothing to check; the limits then refuse `authz_denied`.
+    return None if user is None else ("acts_for", f"user:{user}")
+
+
+async def _role(conn: AsyncConnection, household: str | None, user: uuid.UUID) -> str | None:
+    rows = await _scoped(conn, household).fetch(
+        "SELECT role FROM household_members"
+        " WHERE household_id = %(household)s AND user_id = %(user)s",
+        user=user,
+    )
+    return None if not rows else str(rows[0][0])
+
+
+def _sort_codes(raw: Any) -> dict[str, Any]:
+    """§9 step 4, first part: codes outside the enums move to `unmatched`, then the answer
+    must match `SetupAnswer` (else `invalid_answer`)."""
+    if not isinstance(raw, Mapping):
+        raise GuardRefused(INVALID_ANSWER)
+    unmatched = raw.get("unmatched") or []
+    people = raw.get("people") or []
+    if not isinstance(unmatched, list) or not isinstance(people, list):
+        raise GuardRefused(INVALID_ANSWER)
+    unmatched = [str(word) for word in unmatched]
+    sorted_people: list[dict[str, Any]] = []
+    for person in people:
+        if not isinstance(person, Mapping):
+            raise GuardRefused(INVALID_ANSWER)
+        out = dict(person)
+        for field, known in _SETUP_CODES.items():
+            values = out.get(field) or []
+            if not isinstance(values, list):
+                raise GuardRefused(INVALID_ANSWER)
+            kept: list[str] = []
+            for value in values:
+                if isinstance(value, str) and value in known:
+                    if value not in kept:
+                        kept.append(value)
+                elif str(value) not in unmatched:
+                    unmatched.append(str(value))
+            out[field] = kept
+        sorted_people.append(out)
+    try:
+        parsed = SetupAnswer.model_validate(
+            {**raw, "people": sorted_people, "unmatched": unmatched}
+        )
+    except ValidationError:
+        raise GuardRefused(INVALID_ANSWER) from None
+    return parsed.model_dump(mode="json")
+
+
+async def get_setup_state(ctx: CallContext) -> dict[str, Any]:
+    """`{role, has_budget, has_proposal}` for the person the consumer agent acts for, in the
+    run's household (§9 step 1). Relation `agent acts_for user:<that person>`; read only.
+
+    `has_proposal` is whether the household has ever had a proposal, whatever its status.
+    """
+    household = await _run_household(ctx)
+    user = _acting_user(ctx)
+
+    async def check(conn: AsyncConnection) -> None:
+        _require_household(household)
+        if user is None or await _role(conn, household, user) is None:
+            raise GuardRefused(AUTHZ_DENIED)
+
+    async def call() -> dict[str, Any]:
+        assert user is not None
+        async with db.get_pool().connection() as conn:
+            q = _scoped(conn, household)
+            role = await _role(conn, household, user)
+            budget = await q.fetch(
+                "SELECT 1 FROM budgets WHERE household_id = %(household)s LIMIT 1"
+            )
+            proposal = await q.fetch(
+                "SELECT 1 FROM onboarding_proposals WHERE household_id = %(household)s LIMIT 1"
+            )
+        return {"role": role, "has_budget": bool(budget), "has_proposal": bool(proposal)}
+
+    return await run_guarded(
+        ctx,
+        tool=f"{AREA}.get_setup_state",
+        relation=_user_relation(user),
+        limits=check,
+        key=None,
+        request={},
+        call=call,
+        apply=None,
+    )
+
+
+async def propose_setup(ctx: CallContext, *, answer: Mapping[str, Any]) -> dict[str, Any]:
+    """Store the validated setup answer as the household's `pending` proposal (§9 step 4).
+
+    The caller must act for an admin of the run's household (else `not_admin`). Codes
+    outside the enums move to `unmatched`; a name matching a member (case-insensitive)
+    gets that member's `user_id`; a phone already in another household is dropped and
+    returned in `phones_taken` (a yes/no lookup only). The row id is
+    `ids.proposal_id(run_id)`, so a replayed run stores nothing new and returns the stored
+    answer; a new row makes earlier `pending` proposals `superseded`. Expires in 1 h.
+    """
+    household = await _run_household(ctx)
+    user = _acting_user(ctx)
+    proposal = ids.proposal_id(ctx.run_id)
+    sorted_answer: dict[str, Any] = {}
+
+    async def check(conn: AsyncConnection) -> None:
+        _require_household(household)
+        if user is None:
+            raise GuardRefused(AUTHZ_DENIED)
+        role = await _role(conn, household, user)
+        if role is None:
+            raise GuardRefused(AUTHZ_DENIED)
+        if role != "admin":
+            raise GuardRefused(NOT_ADMIN)
+        sorted_answer.update(_sort_codes(answer))
+
+    async def call() -> dict[str, Any]:
+        stored = dict(sorted_answer)
+        async with db.get_pool().connection() as conn, conn.transaction():
+            q = _scoped(conn, household)
+            members = {
+                str(name).strip().lower(): str(member)
+                for member, name in await q.fetch(
+                    "SELECT m.user_id, u.display_name FROM household_members m"
+                    " JOIN users u ON u.user_id = m.user_id"
+                    " WHERE m.household_id = %(household)s"
+                )
+            }
+            taken: list[str] = []
+            people: list[dict[str, Any]] = []
+            for person in stored["people"]:
+                person = dict(person)
+                member = members.get(person["name"].strip().lower())
+                if member is not None:
+                    person["user_id"] = member
+                phone = person.get("phone")
+                if phone is not None:
+                    cur = await unscoped(conn, "setup_phone_check").execute(
+                        "SELECT EXISTS (SELECT 1 FROM channel_identities c"
+                        " WHERE c.phone_e164 = %(phone)s AND NOT EXISTS (SELECT 1"
+                        " FROM household_members m WHERE m.user_id = c.user_id"
+                        " AND m.household_id = %(household)s))",
+                        {"phone": phone, "household": household},
+                    )
+                    row = await cur.fetchone()
+                    if row is None or row[0]:
+                        person["phone"] = None
+                        if phone not in taken:
+                            taken.append(phone)
+                people.append(person)
+            stored = {**stored, "people": people, "phones_taken": taken}
+            cur = await q.execute(
+                "INSERT INTO onboarding_proposals"
+                " (proposal_id, household_id, proposed_by, answer, expires_at)"
+                " VALUES (%(proposal)s, %(household)s, %(user)s, %(answer)s,"
+                " now() + interval '1 hour') ON CONFLICT DO NOTHING",
+                proposal=proposal,
+                user=user,
+                answer=Jsonb(stored),
+            )
+            if cur.rowcount == 1:
+                await q.execute(
+                    "UPDATE onboarding_proposals SET status = 'superseded'"
+                    " WHERE household_id = %(household)s AND status = 'pending'"
+                    " AND proposal_id <> %(proposal)s",
+                    proposal=proposal,
+                )
+            found = await q.fetch(
+                "SELECT answer FROM onboarding_proposals"
+                " WHERE proposal_id = %(proposal)s AND household_id = %(household)s",
+                proposal=proposal,
+            )
+        if not found:
+            raise GuardRefused(AUTHZ_DENIED)
+        kept = dict(found[0][0])
+        phones_taken = list(kept.pop("phones_taken", []))
+        return {"proposal_id": str(proposal), "answer": kept, "phones_taken": phones_taken}
+
+    return await run_guarded(
+        ctx,
+        tool=f"{AREA}.propose_setup",
+        relation=_user_relation(user),
+        limits=check,
+        key=None,
+        request={"answer": dict(answer) if isinstance(answer, Mapping) else answer},
+        call=call,
+        apply=None,
+    )
+
+
 # --- MCP registration -----------------------------------------------------------------
 
 
@@ -1542,6 +1773,16 @@ async def _choose_shortfall_option_tool(
         pick=pick,
         user_id=user_id,
     )
+
+
+@server.tool(name="get_setup_state")
+async def _get_setup_state_tool(ctx: Context) -> CallToolResult:
+    return await _serve(ctx, get_setup_state)
+
+
+@server.tool(name="propose_setup")
+async def _propose_setup_tool(answer: dict[str, Any], ctx: Context) -> CallToolResult:
+    return await _serve(ctx, propose_setup, answer=answer)
 
 
 @server.tool(name="authorize_amendment")

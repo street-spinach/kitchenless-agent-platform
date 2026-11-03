@@ -107,6 +107,9 @@ TOOL_SCOPES: Mapping[str, ToolScope] = {
     "get_household_rules": _delegated("household", scope=None),
     "advance_turn": _delegated("household", scope="orders:place"),
     "set_take_turns": _service("system"),
+    # Experience EX-A11 (EX-I26): setup by chat, for the consumer agent.
+    "get_setup_state": _delegated("consumer", scope=None),
+    "propose_setup": _delegated("consumer", scope="constraints:write"),
 }
 
 
