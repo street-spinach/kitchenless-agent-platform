@@ -71,6 +71,9 @@ ALLOWLIST: dict[str, str] = {
     "services/safety/limits.py": "unscoped:limits",
 }
 
+# EX-I46: the owner API's files. Their SQL on `ORG_TABLES` goes through `scope.org_scoped`.
+ORG_FILES = ("services/api/routes/app.py", "services/api/owner_views.py")
+
 # SQL built from a table-name variable cannot be checked, so it fails the scan unless
 # listed here with the tables it can name (none of them household-owned, except the seed's
 # and the protocol check's, which are allowlisted above).
@@ -81,6 +84,10 @@ TABLE_VARIABLE_ALLOWLIST: dict[str, str] = {
     "services/mocks/stores.py": "catalog_items or menu_items",
 }
 
+_ORG_SQL = re.compile(
+    rf"\b(?:FROM|JOIN|INTO|UPDATE|TABLE)\s+(?:ONLY\s+)?({'|'.join(scope.ORG_TABLES)})\b",
+    re.IGNORECASE,
+)
 _TABLES = "|".join(sorted(scope.HOUSEHOLD_TABLES, key=len, reverse=True))
 _HOUSEHOLD_SQL = re.compile(
     rf"\b(?:FROM|JOIN|INTO|UPDATE|TABLE)\s+(?:ONLY\s+)?({_TABLES})\b", re.IGNORECASE
@@ -109,12 +116,14 @@ def _strings(tree: ast.AST) -> list[str]:
     return out
 
 
-def household_sql(source: str) -> list[str]:
-    """The household tables named by SQL in `source`."""
+def household_sql(source: str, org_bound_ok: bool = False) -> list[str]:
+    """The household tables named by SQL in `source`. With `org_bound_ok` (the owner API's
+    files, EX-I46), SQL bound to `%(org)s` is left to `test_org_tables_only_via_helper`."""
     return sorted(
         {
             m.group(1).lower()
             for s in _strings(ast.parse(source))
+            if not (org_bound_ok and scope._ORG_PLACEHOLDER in s)
             for m in _HOUSEHOLD_SQL.finditer(s)
         }
     )
@@ -142,7 +151,9 @@ def unscoped_reasons(source: str) -> set[str]:
 
 
 def test_scoped_tables_only_via_helper() -> None:
-    found = {p.as_posix(): household_sql(p.read_text()) for p in _py_files()}
+    found = {
+        p.as_posix(): household_sql(p.read_text(), p.as_posix() in ORG_FILES) for p in _py_files()
+    }
     found = {path: tables for path, tables in found.items() if tables}
     unlisted = {path: tables for path, tables in found.items() if path not in ALLOWLIST}
     assert unlisted == {}, "household tables outside scope.py; use scope.scoped or unscoped"
@@ -185,6 +196,46 @@ def test_table_name_variables_refused() -> None:
     ]
     found = sorted(p.as_posix() for p in _py_files() if table_variables(p.read_text()))
     assert found == sorted(TABLE_VARIABLE_ALLOWLIST)
+
+
+def org_sql(source: str) -> list[str]:
+    """The string literals in `source` whose SQL names an `ORG_TABLES` table."""
+    return [s for s in _strings(ast.parse(source)) if _ORG_SQL.search(s)]
+
+
+def _calls(source: str, name: str) -> bool:
+    return any(
+        isinstance(node, ast.Call)
+        and getattr(node.func, "id", getattr(node.func, "attr", None)) == name
+        for node in ast.walk(ast.parse(source))
+    )
+
+
+def check_org_file(source: str) -> list[str]:
+    """What is wrong with an owner API file's org-table SQL (empty when it is fine)."""
+    found = org_sql(source)
+    problems = [f"not bound to %(org)s: {s!r}" for s in found if scope._ORG_PLACEHOLDER not in s]
+    if found and not _calls(source, "org_scoped"):
+        problems.append("names an org table but never calls scope.org_scoped")
+    if found and _calls(source, "unscoped"):
+        problems.append("names an org table and calls unscoped")
+    return problems
+
+
+def test_org_tables_only_via_helper() -> None:
+    """EX-I46: `ORG_TABLES` are read in the owner API's files only through `org_scoped`."""
+    for path in ORG_FILES:
+        if Path(path).exists():
+            assert check_org_file(Path(path).read_text()) == [], path
+    # The scan itself catches each way around the helper.
+    bound = "SELECT 1 FROM quotes WHERE " + scope.ORG_SELLER_FILTER
+    good = f"q = scope.org_scoped(conn, s)\nawait q.fetch({bound!r})\n"
+    assert check_org_file(good) == []
+    assert check_org_file('conn.execute("SELECT * FROM orders WHERE id = %s")\n')
+    assert check_org_file(f"await conn.execute({bound!r})\n")
+    assert check_org_file(f"q = unscoped(conn, 'x')\nscope.org_scoped(c, s)\nq({bound!r})\n")
+    assert check_org_file('q = scope.org_scoped(c, s)\nq.fetch("SELECT * FROM agent_traces")\n')
+    assert check_org_file('x = "SELECT agent_id FROM agent_cards"\n') == []
 
 
 # --- the helper ------------------------------------------------------------------------------
@@ -295,3 +346,63 @@ def test_forged_household_id_refused(pg: str, monkeypatch: pytest.MonkeyPatch) -
     assert reached == []
     assert asyncio.run(go("h-1")) == {}
     assert reached == ["fga", "adapter"]
+
+
+# --- the org helper (EX-I46) ------------------------------------------------------------------
+
+ORG = scope.OrgScope("o-1")
+SELLER = scope.ORG_SELLER_FILTER
+
+
+def test_org_scoped_binds_the_org() -> None:
+    conn = _Conn()
+    q = scope.org_scoped(conn, ORG)  # type: ignore[arg-type]
+    sql = f"SELECT id FROM quotes q WHERE q.{SELLER} AND q.status = %(s)s"
+    asyncio.run(q.execute(sql, s="won"))
+    assert conn.calls == [(sql, {"s": "won", "org": "o-1"})]
+    # Whitespace in the filter may differ (multi-line SQL).
+    split = "SELECT 1 FROM orders o\n WHERE o." + SELLER.replace(" FROM ", "\n    FROM ")
+    asyncio.run(q.execute(split))
+    # Tables with no seller column need only the org placeholder.
+    asyncio.run(q.execute("SELECT mode FROM adapter_modes WHERE vendor = %(org)s"))
+    assert [c[1] for c in conn.calls[1:]] == [{"org": "o-1"}, {"org": "o-1"}]
+
+
+@pytest.mark.parametrize(
+    ("sql", "params"),
+    [
+        # Quotes or orders without the seller filter, even with %(org)s elsewhere.
+        ("SELECT 1 FROM quotes WHERE %(org)s IS NOT NULL", {}),
+        ("SELECT 1 FROM agent_traces t JOIN orders o ON true WHERE t.org = %(org)s", {}),
+        # A different filter that only looks similar.
+        (
+            "SELECT 1 FROM orders WHERE seller_agent_id IN "
+            "(SELECT agent_id FROM agent_cards WHERE owner_ref = %(org)s)",
+            {},
+        ),
+        # The household binder's rules hold too.
+        ("SELECT 1 FROM adapter_modes", {}),
+        (f"SELECT 1 FROM quotes WHERE {SELLER} AND x = %s", {}),
+        (f"SELECT 1 FROM quotes WHERE {SELLER}", {"org": "o-2"}),
+        (f"SELECT 1 FROM quotes WHERE {SELLER} AND h = %(household)s", {"household": "h-1"}),
+    ],
+)
+def test_org_scoped_requires_seller_filter(sql: str, params: dict[str, Any]) -> None:
+    conn = _Conn()
+    q = scope.org_scoped(conn, ORG)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        asyncio.run(q.execute(sql, **params))
+    with pytest.raises(ValueError):
+        asyncio.run(q.fetch(sql, **params))
+    assert conn.calls == []
+
+
+def test_org_scope_needs_an_org() -> None:
+    with pytest.raises(TypeError):
+        scope.org_scoped(_Conn(), "o-1")  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        scope.org_scoped(_Conn(), scope.OrgScope(""))  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        scope.org_scoped(_Conn(), scope.from_ctx(_Run("h-1")))  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        scope.scoped(_Conn(), ORG)  # type: ignore[arg-type]
