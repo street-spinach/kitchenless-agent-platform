@@ -90,3 +90,13 @@ def test_eval_results_upload_and_summary_run_always() -> None:
     summary = next(s for s in steps if "GITHUB_STEP_SUMMARY" in str(s.get("run", "")))
     assert "always()" in summary["if"]
     assert "evals/results/*.md" in summary["run"]
+
+
+def test_owner_app_job() -> None:
+    """experience EX-I24: the owner-app job runs app-lint and app-test in node:22."""
+    job = _workflow()["jobs"]["owner-app"]
+    assert job["container"] == "node:22"
+    steps = job["steps"]
+    assert steps[0]["uses"] == "actions/checkout@v4"
+    assert _run_lines(job) == ["make app-lint app-test"]
+    assert not SECRET_REF.search(yaml.safe_dump(job))
