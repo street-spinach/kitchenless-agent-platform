@@ -437,6 +437,83 @@ def test_no_courier_rejects_accepted_quote(pg: str) -> None:
     assert w.seller.of("place_order") == []
 
 
+WINDOW = {"start": "2026-11-03T16:00:00+00:00", "end": "2026-11-03T18:00:00+00:00"}
+
+
+def _seller_decisions(w: World, node: str) -> list[str]:
+    rows = w.query(
+        "SELECT payload FROM agent_traces WHERE run_id = %s AND kind = 'decision'"
+        " AND payload->>'node' = %s",
+        (w.run_id, node),
+    )
+    return [r["payload"]["choice"] for r in rows]
+
+
+def _courier_quote(w: World, courier: str = COURIERS[0]) -> dict[str, Any]:
+    """What a courier does on `delivery_quote_request`: store its quote row, then reply."""
+    quote_id = uuid.uuid4()
+    w.execute(
+        "INSERT INTO quotes (quote_id, run_id, order_id, conversation_id, seller_agent_id,"
+        " buyer_agent_id, items, total_minor, currency, expires_at) VALUES"
+        " (%s, %s, %s, %s, %s, %s, %s, 499, 'USD', now() + interval '10 min')",
+        (quote_id, w.run_id, w.order_id, uuid.uuid4(), courier, GROCERY, Jsonb({"window": WINDOW})),
+    )
+    return {
+        "order_id": str(w.order_id),
+        "quote_id": str(quote_id),
+        "window": WINDOW,
+        "price_minor": 499,
+        "currency": "USD",
+        "expires_at": "2099-01-01T00:00:00+00:00",
+        "rationale": "",
+    }
+
+
+def test_courier_quote_during_round_needs_no_action(pg: str) -> None:
+    # #59: the store got `delivery_quote` (agent-protocol message 14) and had no handler, so
+    # the weekly-order scenario poisoned. Inside the round the courier's row is already
+    # stored; the round reads it when it closes.
+    w = World(pg)
+    w.request()
+    w.authorize()
+    w.accept()
+    mid = w.step("delivery_quote", _courier_quote(w), from_agent=COURIERS[0])
+    assert w.message(mid)["status"] == "processed"
+    assert _seller_decisions(w, "delivery_quote") == []
+    assert w.query("SELECT 1 FROM agent_messages WHERE causation_id = %s", (mid,)) == []
+    assert w.quote()["status"] == "accepted"
+
+
+def test_courier_quote_after_round_closed_is_late(pg: str) -> None:
+    # The §6 arrival table: after the round closed, ignore it with `late_courier_quote`.
+    w = World(pg)
+    w.request()
+    w.authorize()
+    w.accept()
+    w.execute("UPDATE orders SET state = 'placed' WHERE order_id = %s", (w.order_id,))
+    mid = w.step("delivery_quote", _courier_quote(w), from_agent=COURIERS[0])
+    assert w.message(mid)["status"] == "processed"
+    assert _seller_decisions(w, "delivery_quote") == ["late_courier_quote"]
+    assert w.query("SELECT 1 FROM agent_messages WHERE causation_id = %s", (mid,)) == []
+
+
+def test_delivery_booked_to_store_is_processed(pg: str) -> None:
+    # agent-protocol message 16 goes to the store too; the store takes no action.
+    w = World(pg)
+    w.execute(
+        "UPDATE orders SET delivery_agent_id = %s WHERE order_id = %s", (COURIERS[0], w.order_id)
+    )
+    body = {
+        "order_id": str(w.order_id),
+        "state": "courier_booked",
+        "delivery_agent_id": COURIERS[0],
+        "window": WINDOW,
+    }
+    mid = w.step("delivery_booked", body, from_agent=COURIERS[0])
+    assert w.message(mid)["status"] == "processed"
+    assert w.query("SELECT 1 FROM agent_messages WHERE causation_id = %s", (mid,)) == []
+
+
 def test_closed_by_recorded(pg: str) -> None:
     w = World(pg, answers={"respond_to_counter": {"action": "reject"}})
     w.request()
