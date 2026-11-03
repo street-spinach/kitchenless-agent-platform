@@ -11,6 +11,7 @@ import yaml
 from psycopg.rows import dict_row
 
 from evals import run
+from evals import select as case_order
 from evals.run import CaseError, RunResult
 from services.agents.common.trace import read_trace
 from services.common import ids, outbox
@@ -290,6 +291,7 @@ def main_on(
         monkeypatch.setattr(run, "take_lock", lambda dsn, **kw: object())
         monkeypatch.setattr(run, "release_lock", lambda conn: None)
         monkeypatch.setattr(run, "History", FakeHistory)
+        monkeypatch.setattr(run, "last_real_attempts", lambda dsn: [])
     return run.main(argv)
 
 
@@ -1210,3 +1212,26 @@ def test_db_snapshot_holds_only_the_runs_rows_and_is_read_only(pg: str) -> None:
     assert snapshot["orders"] == ()
     with pytest.raises(TypeError):
         snapshot["orders"] = ()  # type: ignore[index]
+
+
+# --- coverage (evals.md EG9, build step 6) --------------------------------------------------
+
+# evals.md EG9: every agents goal a model run can show. AG13 and AG14 are unit tests only.
+AGENTS_GOALS = {f"AG{n}" for n in range(1, 13)} | {"AG15"}
+
+
+def test_agents_goals_covered() -> None:
+    coverage = case_order.load_coverage()
+    goals = coverage["goals"]["agents"]
+    assert set(goals) >= AGENTS_GOALS
+    categories = set(run.load_thresholds()["categories"])
+    on_disk = {p.stem: p for p in run.CASES_DIR.glob("*/*.yaml")}
+    for goal in sorted(AGENTS_GOALS):
+        mapped = goals[goal]
+        assert isinstance(mapped, list) and mapped, f"{goal} maps to no case"
+        for case_id in mapped:
+            assert isinstance(case_id, str) and case_id
+            assert case_order.source_design(case_id, coverage["prefixes"]) == "agents", case_id
+            if case_id in on_disk:
+                path = on_disk[case_id]
+                run.validate_case(yaml.safe_load(path.read_text()), str(path), categories)

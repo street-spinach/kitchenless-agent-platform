@@ -12,7 +12,12 @@ codes: 0 pass or budget exhausted, 1 regression, 2 invalid cases, 3 infra or mod
 Cases follow the format of evals.md §4 and are validated before any attempt (exit 2). Flags
 (evals.md §5): `--tag`, `--category`, `--case`, `--cases-file`, `--all`, `--repeats`,
 `--mode stub|real` (default `stub`; only cases whose `model_modes` include it run, each its
-category's `repeats[mode]` times) and `--trigger`.
+category's `repeats[mode]` times), `--trigger` and `--list` (every case's id, category, tags,
+model modes and source design from `evals/coverage.yaml`; runs nothing).
+
+Order (evals.md §7, `evals/select.py`): stub mode runs cases in id order; real mode runs the
+cases least recently attempted in real mode with their current `case_hash` first, read from
+`eval_results`. Each case runs all its repeats before the next.
 
 Budget, deadline, lock and history (evals.md §5, §7; build step 5c):
 
@@ -58,6 +63,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from evals import outcome
+from evals import select as case_order
 from evals.checks import CHECKS
 from services.agents.common.trace import read_trace
 from services.common import directory, ids, orders
@@ -1266,6 +1272,46 @@ class History:
         )
 
 
+# The last real attempt per case and `case_hash` (evals.md §7). Attempts that never started an
+# agent run (`budget_skipped`, `infra`) don't count, so a failed night loses nothing.
+_LAST_REAL_SQL = """
+SELECT case_id, case_hash, max(created_at) AS created_at FROM eval_results
+WHERE model_mode = 'real' AND error_kind NOT IN ('budget_skipped', 'infra')
+GROUP BY case_id, case_hash
+"""
+
+
+def last_real_attempts(dsn: str) -> list[dict[str, Any]]:
+    """The history rows `evals/select.py` orders real mode by. A failed read (no history
+    tables, no database) is logged and gives no rows, so every case counts as never run and
+    the order falls back to id order."""
+    try:
+        with psycopg.connect(dsn, row_factory=dict_row) as conn:
+            return list(conn.execute(_LAST_REAL_SQL).fetchall())
+    except Exception as err:
+        log.warning("eval history read for the case order failed: %s", err)
+        return []
+
+
+def list_cases(cases: list[dict[str, Any]], prefixes: Mapping[str, str]) -> list[str]:
+    """`--list` (evals.md §5): one tab-separated line per case, in id order: id, category,
+    tags, model modes and source design (`unmapped` when no prefix matches)."""
+    lines = ["id\tcategory\ttags\tmodes\tsource"]
+    for c in case_order.order(cases, [], "stub"):
+        lines.append(
+            "\t".join(
+                [
+                    c["id"],
+                    c["category"],
+                    ",".join(c["tags"]) or "-",
+                    ",".join(model_modes(c)),
+                    case_order.source_design(c["id"], prefixes) or "unmapped",
+                ]
+            )
+        )
+    return lines
+
+
 def run_attempts(
     selected: list[dict[str, Any]],
     thresholds: dict[str, Any],
@@ -1309,7 +1355,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cases-file", type=Path, help="a YAML list of case ids")
     parser.add_argument("--mode", choices=MODEL_MODES, default="stub")
     parser.add_argument("--trigger", choices=TRIGGERS, default=None)
+    parser.add_argument("--list", dest="list_cases", action="store_true", help="list cases only")
     args = parser.parse_args(argv)
+    if args.list_cases:
+        return args
     if not (args.all_cases or args.tag or args.category or args.case_id or args.cases_file):
         parser.error("choose cases with --tag, --category, --case, --cases-file or --all")
     if args.repeats is not None and args.repeats < 1:
@@ -1331,9 +1380,23 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def run_list() -> int:
+    """`--list`: prints every case and its source design; runs nothing. Invalid cases exit 2."""
+    try:
+        cases = load_cases(set(load_thresholds()["categories"]))
+    except CaseError as err:
+        print(f"Invalid eval case: {err}", file=sys.stderr)
+        return outcome.EXIT_CODES[outcome.INVALID_CASES]
+    for line in list_cases(cases, case_order.load_coverage()["prefixes"]):
+        print(line)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     started = time.monotonic()
     args = parse_args(argv)
+    if args.list_cases:
+        return run_list()
     run_info: dict[str, Any] = {
         "eval_run_id": str(ids.new_eval_run_id()),
         "trigger": args.trigger,
@@ -1384,8 +1447,6 @@ def main(argv: list[str] | None = None) -> int:
         deadline=float(os.environ.get("EVAL_DEADLINE_SECONDS") or DEFAULT_DEADLINE_SECONDS),
         started=started,
     )
-    selection = [c["id"] for c in selected]
-
     # Eval-run-level checks, before any attempt (evals.md §5).
     run_error = None
     if args.trigger is not None and run_info["git_sha"] is None:
@@ -1399,6 +1460,11 @@ def main(argv: list[str] | None = None) -> int:
         lock = take_lock(dsn, wait=LOCK_WAIT_SECONDS, poll=LOCK_POLL_SECONDS)
         if lock is None:
             run_error = LOCK_TIMEOUT
+
+    # evals.md §7: real mode reads the history (under the lock, with `--trigger`).
+    last = last_real_attempts(dsn) if run_error is None and args.mode == "real" else []
+    selected = case_order.order(selected, last, args.mode, hashes=CASE_HASHES)
+    selection = [c["id"] for c in selected]
 
     results: list[RunResult] = []
     history = None

@@ -1,0 +1,86 @@
+# Eval coverage map (evals.md §5 `--list`, §12, EG9; E-OD10, E-ALT16).
+#
+# prefixes: case id prefix -> the design the case comes from. The longest matching prefix
+#   wins, so a whole id can override a shorter prefix. `python -m evals.run --list` prints it.
+# goals: per design, goal -> the case ids that cover it. `goals.agents` is the "Covers"
+#   column of evals.md §12; tests/unit/test_eval_runner.py::test_agents_goals_covered reads it.
+#
+# This file holds only the static maps; the coverage index itself is computed on demand.
+
+prefixes:
+  # architecture
+  hello-: architecture
+  task-weekly-order-: architecture
+  task-busy-night-dinner-completes: architecture
+  decision-cheapest-in-zone-store: architecture
+  robust-adapter-down-other-seller: architecture
+  robust-approval-expires-cancels: architecture
+  robust-business-model-down-uses-rules: architecture
+  robust-model-unavailable-errors-cleanly: architecture
+  robust-no-offers-errors-cleanly: architecture
+  robust-out-of-stock-substitution: architecture
+  safety-address-only-in-data-share: architecture
+  safety-business-model-cannot-break-floor: architecture
+  safety-business-substitute-allergen-checked: architecture
+  safety-nut-allergy-weekly-order: architecture
+  safety-over-budget-needs-approval: architecture
+  safety-two-households: architecture
+  safety-wrong-approver-refused: architecture
+  tools-no-duplicate-place-order: architecture
+  # agent-protocol
+  robust-first-attempt-failure-keeps-order: agent-protocol
+  robust-offer-expires-twice-errors: agent-protocol
+  robust-replay-no-duplicate-message-id: agent-protocol
+  robust-shortfall-: agent-protocol
+  safety-a2a-: agent-protocol
+  safety-address-ref-only-in-delivery-request: agent-protocol
+  safety-expired-offer-never-accepted: agent-protocol
+  safety-shortfall-: agent-protocol
+  safety-summaries-no-profile-values: agent-protocol
+  safety-wrong-party-refused: agent-protocol
+  safety-wrong-sender-class-refused: agent-protocol
+  task-a2a-: agent-protocol
+  task-shortfall-: agent-protocol
+  tools-a2a-: agent-protocol
+  tools-redelivered-accept-no-second-order: agent-protocol
+  # identity-authz
+  safety-child-agent-never-spends: identity-authz
+  safety-no-tokens-persisted: identity-authz
+  safety-over-band-needs-approval: identity-authz
+  safety-revoked-agent-no-spend: identity-authz
+  safety-unconsented-member-allergies-applied: identity-authz
+  tools-guarded-calls-have-identity: identity-authz
+  # agents (evals.md §12)
+  safety-learned-dislike-never-allergy: agents
+  task-learn-dislike-saved: agents
+  safety-off-topic-refused: agents
+  safety-chat-no-safety-claim: agents
+  safety-solo-order-household-allergens: agents
+  task-instant-order-completes: agents
+  decision-full-offer-beats-cheaper-partial: agents
+  safety-counter-never-costs-items: agents
+  decision-counter-at-remaining-budget: agents
+  explanation-store-choice: agents
+  safety-dislikes-never-to-business: agents
+  task-solo-dislike-dropped: agents
+  task-take-turns-offer-once: agents
+  safety-child-request-needs-approval: agents
+  tools-agents-decisions-traced: agents
+  decision-delivery-earliest-window: agents
+
+goals:
+  # evals.md §12 "Covers". AG13 and AG14 are unit tests only (agents.md).
+  agents:
+    AG1: [safety-solo-order-household-allergens]
+    AG2: [decision-full-offer-beats-cheaper-partial]
+    AG3: [safety-counter-never-costs-items, decision-counter-at-remaining-budget]
+    AG4: [explanation-store-choice]
+    AG5: [task-learn-dislike-saved, safety-dislikes-never-to-business, task-solo-dislike-dropped]
+    AG6: [safety-learned-dislike-never-allergy, task-learn-dislike-saved]
+    AG7: [task-take-turns-offer-once]
+    AG8: [safety-solo-order-household-allergens, task-instant-order-completes]
+    AG9: [safety-off-topic-refused, safety-chat-no-safety-claim]
+    AG10: [safety-child-request-needs-approval]
+    AG11: [safety-child-request-needs-approval]
+    AG12: [decision-delivery-earliest-window]
+    AG15: [tools-agents-decisions-traced]
