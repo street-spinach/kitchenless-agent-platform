@@ -103,6 +103,14 @@ def test_unknown_name_is_none(vocab: pantry.Vocabulary, text: str) -> None:
     assert pantry.match(vocab, text) is None
 
 
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [("eval", True), ("live", False), ("", False), ("EVAL", False), (" eval", False)],
+)
+def test_is_enabled(env: str, expected: bool) -> None:
+    assert pantry.is_enabled(env) is expected
+
+
 def test_normalize() -> None:
     assert pantry.normalize("  Whole \t  MILK\n") == "whole milk"
 

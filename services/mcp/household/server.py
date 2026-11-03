@@ -1093,7 +1093,7 @@ async def get_pantry(ctx: CallContext) -> dict[str, Any]:
     load, this raises, and the agent records `pantry_unavailable`.
     """
     household = _require_household(await _run_household(ctx))
-    enabled = ctx.env == "eval"
+    enabled = pantry.is_enabled(ctx.env)
     vocab = pantry.load_vocabulary() if enabled else None
     async with db.get_pool().connection() as conn:
         cur = await conn.execute(

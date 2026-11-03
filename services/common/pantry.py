@@ -29,6 +29,7 @@ __all__ = [
     "Vocabulary",
     "decide",
     "estimate",
+    "is_enabled",
     "load_vocabulary",
     "match",
     "normalize",
@@ -40,6 +41,11 @@ THETA = 0.7
 VOCABULARY_PATH = Path(__file__).resolve().parents[1] / "seed" / "data" / "pantry_items.yaml"
 
 _PRESENT_KINDS = ("add", "verify")
+
+
+def is_enabled(env: str) -> bool:
+    """Whether pantry estimates are on for a household with this `env` (PT-OD4, EX-A17)."""
+    return env == "eval"
 
 
 def normalize(text: str) -> str:
