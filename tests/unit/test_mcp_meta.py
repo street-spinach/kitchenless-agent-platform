@@ -133,6 +133,36 @@ def test_from_meta_refuses_agent_without_card(pg: str, monkeypatch: pytest.Monke
     assert e.value.reason == meta.META_REFUSED
 
 
+def _client(pg: str, agent_id: str, kind: str) -> None:
+    with psycopg.connect(pg) as conn:
+        conn.execute(
+            "INSERT INTO agent_clients (agent_id, client_id, kind) VALUES (%s, %s, %s)",
+            (agent_id, f"svc.{agent_id}", kind),
+        )
+
+
+@pytest.mark.db
+def test_from_meta_accepts_service_client_without_card(
+    pg: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `api` calls decide_approval as `system:api`, which has no card (identity-authz §3).
+    run_id = _seed(pg)
+    _client(pg, "system:api", "service")
+    ctx = _from_meta(pg, monkeypatch, {"run_id": str(run_id), "agent_id": "system:api"})
+    assert (ctx.agent_id, ctx.on_behalf_of, ctx.env) == ("system:api", None, "eval")
+
+
+@pytest.mark.db
+def test_from_meta_refuses_people_client_without_card(
+    pg: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = _seed(pg)
+    _client(pg, "household:nobody", "people")
+    with pytest.raises(GuardRefused) as e:
+        _from_meta(pg, monkeypatch, {"run_id": str(run_id), "agent_id": "household:nobody"})
+    assert e.value.reason == meta.META_REFUSED
+
+
 @pytest.mark.db
 @pytest.mark.parametrize(
     ("owner_ref", "expected"), [("household:us-1", "household:us-1"), ("system", None)]

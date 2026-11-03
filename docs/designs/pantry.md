@@ -1,7 +1,8 @@
 # Kitchenless pantry: estimated inventory and the code-only skip
 
 *   **Author:** madushankaf
-*   **Status:** Approved
+*   **Status:** Approved; amended 2026-11-03 (`SQ-RICE-2LB`, for the eval low-budget
+    condition in architecture "Eval cases")
 *   **Date:** 2026-11-02
 *   **Path:** `docs/designs/pantry.md`
 *   **Issue:** #251
@@ -702,7 +703,7 @@ SKU to `pantry_item` in `catalog_mock.yaml`:
 | `MOCK-BANANAS-2LB`, `SQ-BANANAS-2LB` | `bananas` |
 | `MOCK-APPLES-3LB` | `apples` |
 | `MOCK-CHICKEN-BREAST` | `chicken breast` |
-| `MOCK-RICE-2LB` | `rice` |
+| `MOCK-RICE-2LB`, `SQ-RICE-2LB` | `rice` |
 | `MOCK-GRANOLA-NUT` | `granola` |
 | `SQ-PASTA-1LB` | `pasta` |
 | `SQ-ALMONDS-1LB` | `almonds` |

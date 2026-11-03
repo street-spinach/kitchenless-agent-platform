@@ -5,6 +5,7 @@
     amended 2026-10-31 (agent-protocol); amended 2026-10-31 (build step 1 ports and smoke);
     amended 2026-11-01 (MCP client contract); amended 2026-11-01 (identity-authz);
     amended 2026-11-01 (tool_errors signature); amended 2026-11-02 (adapters, #146); amended 2026-11-02 (agents, #186);
+    amended 2026-11-03 (service callers and the eval low-budget condition);
     amended 2026-11-03 (PR eval gate: safety cases only)
 *   **Date:** 2026-10-31
 *   **Path:** `docs/designs/architecture.md`
@@ -2368,6 +2369,10 @@ and values; none of these may be renamed or dropped.
     identifiers table). Every trace row the MCP side writes (guard, `@traced`,
     `tool_errors`) uses `ctx.on_behalf_of`. An `agent_id` with no card is refused like a
     missing `agent_id`.
+*   **Amended 2026-11-03 (service callers).** The exception is a `service` row in
+    `agent_clients`: `system:api` has no card (identity-authz §3) and calls
+    `decide_approval` and `choose_shortfall_option` with its service token. `from_meta`
+    accepts it with `on_behalf_of = None`. A `people` row with no card is still refused.
 
 ##### 42. `services/mcp/traced.py` (Create)
 
@@ -3156,8 +3161,11 @@ Only the fields a case needs are present.
 | `robust-business-model-down-uses-rules` | robustness | fast | low-budget condition, `STUB_FAIL_NODE: respond_to_counter`, `approve_as: us-1-a-eval` | `run_status(completed)`, `business_choices_within_allowed`, `business_fallback_occurred(respond_to_counter, model_unavailable)` |
 | `explanation-store-choice` | explanation | | `us-1-eval` | `model_judge(store_choice)` (nightly, not gated) |
 
-The "low-budget condition" is a seed override in `setup` (`budget_minor: 2000`), applied by
-`/panel/reset` for that case only. Safety cases live in `evals/cases/safety/` (critical) and
+The "low-budget condition" is a seed override in `setup` (`budget_minor: 1000`), applied by
+`/panel/reset` for that case only. *Amended 2026-11-03:* it was 2000, above the cheapest
+weekly basket in the mock catalogs ($14.25), so no case went over budget. At 1000 the best
+offer is over budget, and `grocery:square-us` (with `SQ-RICE-2LB`, pantry §2) covers the
+same five items as the runner-up, so the household counters once and then asks for approval. Safety cases live in `evals/cases/safety/` (critical) and
 go in their own PR. This design does not change `evals/thresholds.yaml`.
 
 ### Verification Plan

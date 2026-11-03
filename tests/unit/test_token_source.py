@@ -41,6 +41,17 @@ def test_cache_reuses_until_60s_left() -> None:
     assert _claims(second)["exp"] == int(clock.now) + token_source.TOKEN_SECONDS
 
 
+def test_api_service_token_is_client_svc_api() -> None:
+    # `system:api` is client `svc.api` in `agent_clients` (identity-authz §3). The derived
+    # `system.api` has no client row, so validation refused every approval tap.
+    token = asyncio.run(token_source.MockSource(clock=Clock()).service_token("system:api"))
+    claims = _claims(token)
+    assert (claims["azp"], claims["sub"]) == ("svc.api", "service-account-svc.api")
+    assert "act" not in claims
+    seller = _claims(asyncio.run(token_source.MockSource(clock=Clock()).service_token(SELLER)))
+    assert seller["azp"] == "grocery.mock-us"
+
+
 def test_new_token_after_refusal_once() -> None:
     clock = Clock()
     source = token_source.MockSource(clock=clock)
