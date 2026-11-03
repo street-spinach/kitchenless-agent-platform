@@ -1,7 +1,7 @@
 # Kitchenless experience: WhatsApp, the /me pages, onboarding, reminders and the owner app
 
 *   **Author:** madushankaf
-*   **Status:** Approved
+*   **Status:** Approved; amended 2026-11-03 (owner app CSP allows inline styles, EX-I45)
 *   **Date:** 2026-11-03
 *   **Path:** `docs/designs/experience.md`
 *   **Issue:** #271
@@ -1689,8 +1689,11 @@ X2, X3, X5, X6, X19.
     web` in `apps/owner/`, and the final image (one image for every service) copies `dist/`
     to `/app/owner_dist`. The route serves files under `/owner/` from `OWNER_DIST` (default
     `/app/owner_dist`) and falls back to `index.html`, with `Content-Security-Policy:
-    default-src 'self'; connect-src 'self'`. Caddy adds `redir /owner /owner/` and
-    `handle /owner/* { reverse_proxy api:8000 }`.
+    default-src 'self'; connect-src 'self'; style-src 'self' 'unsafe-inline'`. Caddy adds
+    `redir /owner /owner/` and `handle /owner/* { reverse_proxy api:8000 }`.
+    *Amended 2026-11-03:* `style-src` allows inline styles, because React Native Web injects
+    every component style through a `<style>` element and the export's `index.html` has an
+    inline reset style. Scripts stay `'self'` only.
 *   **Tests**: `tests/unit/test_owner_static.py` (Create): `test_owner_static_fallback`,
     `test_csp_header`; `tests/unit/test_caddyfile.py` (Create): `test_owner_route`.
 
