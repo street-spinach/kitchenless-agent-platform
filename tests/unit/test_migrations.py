@@ -1,13 +1,15 @@
-"""Migrations 0001-0014 apply in order to an empty database (issues #25, #26, #27, #112, #196,
-#226, #254)."""
+"""Migrations 0001-0015 apply in order to an empty database (issues #25, #26, #27, #112, #196,
+#226, #254, #278)."""
 
 import re
 import shutil
 import uuid
+from datetime import date
 from pathlib import Path
 
 import psycopg
 import pytest
+from psycopg.types.json import Jsonb
 
 from migrations.apply import MIGRATIONS_DIR, apply
 
@@ -53,7 +55,17 @@ TABLES = {
     "household_rules",
     "eval_runs",
     "eval_results",
+    "whatsapp_sends",
+    "held_messages",
+    "reminders",
+    "onboarding_proposals",
+    "join_codes",
+    "meal_reactions",
+    "experience_weekly_asks",
+    "experience_weekly_guards",
 }
+# Views carry no rows of their own, so no created_at.
+VIEWS = {"experience_weekly_asks", "experience_weekly_guards"}
 # Tables whose own time column records creation (architecture, Migrations preamble).
 OWN_TIME_COLUMN = {
     "agent_traces",
@@ -92,6 +104,7 @@ def test_applies_in_order_on_empty_database(empty_schema_dsn: str) -> None:
     assert done[9:11] == ["0010_identity.sql", "0011_approval_band.sql"]
     assert done[11:13] == ["0012_agents.sql", "0013_eval_history.sql"]
     assert done[13:14] == ["0014_pantry.sql"]
+    assert done[14:15] == ["0015_experience.sql"]
     assert apply(empty_schema_dsn) == []
     with psycopg.connect(empty_schema_dsn) as conn:
         rows = conn.execute(
@@ -106,7 +119,7 @@ def test_every_new_table_has_created_at(pg: str) -> None:
             "SELECT table_name FROM information_schema.columns"
             " WHERE table_schema = current_schema() AND column_name = 'created_at'"
         ).fetchall()
-    assert TABLES - OWN_TIME_COLUMN <= {r[0] for r in rows}
+    assert TABLES - OWN_TIME_COLUMN - VIEWS <= {r[0] for r in rows}
 
 
 def test_agent_cards_accept_external(pg: str) -> None:
@@ -677,7 +690,8 @@ def test_0014_applies_over_existing_rows(empty_schema_dsn: str, tmp_path: Path) 
             "INSERT INTO catalog_items (agent_id, sku, name, ingredients, price_minor, currency)"
             " VALUES ('grocery:1', 'sku-milk', 'Milk', 'milk', 199, 'USD')"
         )
-    assert apply(empty_schema_dsn) == ["0014_pantry.sql"]
+    shutil.copy(PANTRY_SQL, tmp_path / PANTRY_SQL.name)  # 0014 alone, not the later ones
+    assert apply(empty_schema_dsn, tmp_path) == ["0014_pantry.sql"]
     with psycopg.connect(empty_schema_dsn) as conn:
         event = conn.execute("SELECT item, pantry_item, kind, run_id FROM pantry_events").fetchone()
         sku = conn.execute("SELECT pantry_item FROM catalog_items").fetchone()
@@ -701,3 +715,85 @@ def test_0014_applies_over_existing_rows(empty_schema_dsn: str, tmp_path: Path) 
     assert event == ("sku-milk", None, "add", None)
     assert sku == (None,)
     assert kinds == [("add",), ("add",), ("receipt",)]
+
+
+EXPERIENCE_SQL = MIGRATIONS_DIR / "0015_experience.sql"
+
+
+def test_0015_additive(empty_schema_dsn: str, tmp_path: Path) -> None:
+    text = EXPERIENCE_SQL.read_text().upper()
+    words = set(re.findall(r"[A-Z]+", text))
+    assert not words & {"DROP", "RENAME", "CHECK"}
+    assert not re.search(r"ALTER\s+TYPE", text)
+    for sql in MIGRATIONS_DIR.glob("*.sql"):
+        if sql.name < EXPERIENCE_SQL.name:
+            shutil.copy(sql, tmp_path / sql.name)
+    apply(empty_schema_dsn, tmp_path)
+    assert apply(empty_schema_dsn) == ["0015_experience.sql"]
+    assert apply(empty_schema_dsn) == []
+
+
+def test_0015_indexes(pg: str) -> None:
+    with psycopg.connect(pg) as conn:
+        defs = [
+            r[0]
+            for r in conn.execute(
+                "SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema()"
+            ).fetchall()
+        ]
+    for expected in (
+        "held_messages USING btree (user_id, status, held_id)",
+        "reminders USING btree (household_id, kind)",
+        "onboarding_proposals USING btree (household_id, status)",
+        "join_codes USING btree (household_id) WHERE (used_at IS NULL)",
+        "whatsapp_sends USING btree (user_id, created_at)",
+    ):
+        assert any(expected in d for d in defs), expected
+
+
+def _send(
+    conn: psycopg.Connection,
+    run_id: uuid.UUID,
+    user_id: uuid.UUID,
+    payload: str,
+    outcome: str = "sent",
+    status: str | None = None,
+) -> None:
+    message_id = uuid.uuid4()
+    conn.execute(
+        "INSERT INTO agent_messages (message_id, run_id, from_agent, to_agent, to_host, type,"
+        " body) VALUES (%s, %s, 'consumer:1', 'channel:whatsapp', 'api', 'out', %s)",
+        (message_id, run_id, Jsonb({"buttons": [{"payload": payload}]})),
+    )
+    conn.execute(
+        "INSERT INTO whatsapp_sends (message_id, user_id, outcome, status, created_at)"
+        " VALUES (%s, %s, %s, %s, '2026-11-04 12:00+00')",
+        (message_id, user_id, outcome, status),
+    )
+
+
+def test_0015_weekly_views(pg: str) -> None:
+    with psycopg.connect(pg) as conn:
+        user_id = _household_with_user(conn)
+        conn.execute(
+            "INSERT INTO household_members (household_id, user_id, role)"
+            " VALUES ('hh:1', %s, 'admin')",
+            (user_id,),
+        )
+        run_id = _run(conn, "chat")  # household_id = NULL: the send still counts
+        _send(conn, run_id, user_id, "ap:1")
+        _send(conn, run_id, user_id, "ob:1", outcome="template")
+        _send(conn, run_id, user_id, "tt:1", status="failed")
+        _send(conn, run_id, user_id, "me:page")
+        _send(conn, run_id, user_id, "sf:1", outcome="held")
+        _send(conn, run_id, user_id, "sf:2", outcome="skipped")
+        asks = conn.execute(
+            "SELECT household_id, user_id, week, asks FROM experience_weekly_asks"
+        ).fetchall()
+        guards = conn.execute(
+            "SELECT household_id, week, sends_not_delivered, approvals_expired"
+            " FROM experience_weekly_guards"
+        ).fetchall()
+    week = date(2026, 11, 2)
+    assert asks == [("hh:1", user_id, week, 2)]
+    assert guards == [("hh:1", week, 1, 0)]
