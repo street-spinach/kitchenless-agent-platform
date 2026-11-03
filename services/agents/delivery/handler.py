@@ -37,7 +37,6 @@ from services.common.directory import AgentCard
 from services.common.mcp_client import ToolRefused
 from services.common.protocol.schemas import Window
 from services.common.run_context import RunContext
-from services.identity.tokens import MockIssuer
 
 __all__ = [
     "AREA",
@@ -99,13 +98,7 @@ class TraceSink(Protocol):
 
 
 CallTool = Callable[..., Awaitable[dict[str, Any]]]
-IssueToken = Callable[[str, str, Sequence[str]], str]
 Clock = Callable[[], datetime]
-
-
-def _mock_token(sub: str, act: str, scopes: Sequence[str]) -> str:
-    # Every run uses the mock issuer until identity-authz replaces the token source (Q4).
-    return MockIssuer().issue(sub, act, list(scopes))
 
 
 def _now() -> datetime:
@@ -168,8 +161,7 @@ class DeliveryHandler:
         model: Chooser,
         traces: TraceSink,
         store: CourierStore,
-        call_tool: CallTool = mcp_client.call_tool,
-        issue_token: IssueToken = _mock_token,
+        call_tool: CallTool = mcp_client.call_tool_as,
         clock: Clock = _now,
         quote_ttl_seconds: int | None = None,
     ) -> None:
@@ -177,7 +169,6 @@ class DeliveryHandler:
         self.traces = traces
         self.store = store
         self.call_tool = call_tool
-        self.issue_token = issue_token
         self.clock = clock
         self.quote_ttl = timedelta(
             seconds=quote_ttl_seconds
@@ -205,9 +196,9 @@ class DeliveryHandler:
         )
 
     async def _tool(self, step: _Step, name: str, args: dict[str, Any]) -> dict[str, Any]:
-        # A courier acts for its own org with a service token, as sellers do.
-        token = self.issue_token(step.card.owner_ref, step.card.agent_id, ())
-        return await self.call_tool(AREA, name, args, ctx=self._ctx(step), token=token)
+        # A courier acts for its own org with a service token, as sellers do;
+        # `call_tool_as` obtains it.
+        return await self.call_tool(AREA, name, args, ctx=self._ctx(step))
 
     async def _decision(self, step: _Step, node: str, choice: str) -> None:
         await self.traces.write(

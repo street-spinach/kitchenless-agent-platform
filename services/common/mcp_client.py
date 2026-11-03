@@ -28,9 +28,11 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError
 from mcp.types import CallToolResult
 
+from services.common import db
 from services.common.run_context import RunContext
+from services.identity import errors, token_source
 
-__all__ = ["AdapterUnavailable", "ToolRefused", "call_tool"]
+__all__ = ["AdapterUnavailable", "ToolRefused", "call_tool", "call_tool_as"]
 
 BASE_URL = "http://mcp:8002"
 TIMEOUT_SECONDS = 15.0
@@ -158,3 +160,80 @@ async def call_tool(
         except _Retry as retry:
             reason = retry.reason
     raise AdapterUnavailable(reason)
+
+
+# --- call_tool_as (identity-authz I6) ---------------------------------------------------------
+
+_TOKEN_REFUSALS = ("token_", "act_")
+_UNAVAILABLE = {
+    "identity_unavailable": errors.IdentityUnavailable,
+    "authz_unavailable": errors.AuthzUnavailable,
+}
+
+
+async def _token(ctx: RunContext, *, fresh: bool = False) -> str:
+    """A token for `ctx.agent_id` in `ctx.run_id`: a people or a service token by
+    `agent_clients.kind`. An agent with no client is refused `unknown_agent`."""
+    async with db.get_pool().connection() as conn:
+        cur = await conn.execute(
+            "SELECT c.kind, COALESCE(h.env, 'live'), r.modes->>'token_source'"
+            " FROM agent_clients c"
+            " LEFT JOIN runs r ON r.run_id = %s"
+            " LEFT JOIN households h ON h.household_id = r.household_id"
+            " WHERE c.agent_id = %s",
+            (ctx.run_id, ctx.agent_id),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise errors.TokenRefused("unknown_agent")
+        kind, env, recorded = row
+        source = token_source.get_source(env, recorded)
+        if fresh:
+            source.invalidate(ctx.run_id if kind == "people" else None, ctx.agent_id)
+        if kind == "service":
+            return await source.service_token(ctx.agent_id)
+        try:
+            return await source.people_token(conn, ctx.run_id, ctx.agent_id)
+        except errors.GrantError:
+            await conn.commit()  # keep an expiry mark from `grants.load_active`
+            raise
+
+
+def _mapped(exc: ToolRefused) -> Exception:
+    if exc.reason.startswith("grant_"):
+        return errors.grant_error(exc.reason)()
+    return exc
+
+
+async def call_tool_as(
+    server: str, tool: str, args: Mapping[str, Any], *, ctx: RunContext
+) -> dict[str, Any]:
+    """`call_tool` with the token `TokenSource` gives `ctx.agent_id`. The one place that
+    obtains tokens (identity-authz I6).
+
+    *   A `token_*` or `act_*` refusal: one new token and one more call (the same `args`,
+        so the same idempotency key), then `TokenRefused`.
+    *   A `grant_*` refusal raises the matching `GrantError`.
+    *   `AdapterUnavailable` with `identity_unavailable` or `authz_unavailable` (after
+        `call_tool`'s own retry) raises the matching `DependencyUnavailable`.
+    *   Anything else is re-raised unchanged.
+    """
+    try:
+        try:
+            return await call_tool(server, tool, args, ctx=ctx, token=await _token(ctx))
+        except ToolRefused as refused:
+            if not refused.reason.startswith(_TOKEN_REFUSALS):
+                raise _mapped(refused) from None
+        try:
+            return await call_tool(
+                server, tool, args, ctx=ctx, token=await _token(ctx, fresh=True)
+            )
+        except ToolRefused as again:
+            if again.reason.startswith(_TOKEN_REFUSALS):
+                raise errors.TokenRefused(again.reason) from None
+            raise _mapped(again) from None
+    except AdapterUnavailable as unavailable:
+        mapped = _UNAVAILABLE.get(unavailable.reason)
+        if mapped is None:
+            raise
+        raise mapped() from None

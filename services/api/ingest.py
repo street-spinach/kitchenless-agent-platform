@@ -12,7 +12,7 @@
 3.  Buttons.
     *   A payload starting `sf:` (agent-protocol §10 and P29, #70) is parsed as
         `sf:<shortfall_id>:<line>:<sku | drop>` and calls the household tool
-        `choose_shortfall_option` with the `api` service token, in a `RunContext` for the
+        `choose_shortfall_option` with the `api` service token (obtained by `call_tool_as`), in a `RunContext` for the
         shortfall's run. On `already_decided` the member gets `already_decided`; nothing
         else is sent, because the tool sends `shortfall_closed` when the last line is
         picked. A malformed payload, an unknown shortfall or a refused call starts nothing.
@@ -46,9 +46,8 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from services.common import ids, mcp_client, outbox, runs
-from services.common.mcp_client import ToolRefused, call_tool
+from services.common.mcp_client import ToolRefused, call_tool_as
 from services.common.run_context import RunContext
-from services.identity.tokens import MockIssuer
 
 __all__ = [
     "ALREADY_DECIDED",
@@ -112,12 +111,6 @@ def parse_shortfall_button(payload: str) -> ShortfallPick | None:
     if not raw_line.isdecimal() or int(raw_line) < 1 or not pick:
         return None
     return ShortfallPick(shortfall_id, int(raw_line), pick)
-
-
-def _service_token() -> str:
-    # The `api` service token. Every caller uses the mock issuer until identity-authz
-    # moves `ingest` to `call_tool_as` (identity-authz Q4 and its `ingest.py` row).
-    return MockIssuer().issue(API_AGENT, API_AGENT, ())
 
 
 @dataclass(frozen=True)
@@ -221,7 +214,7 @@ async def ingest(
     kind: str = CHAT,
     overrides: dict[str, Any] | None = None,
     run_id: uuid.UUID | None = None,
-    call_tool: CallTool = mcp_client.call_tool,
+    call_tool: CallTool = mcp_client.call_tool_as,
 ) -> uuid.UUID | None:
     """Handle one inbound message in one transaction; return the run it started, if any
     (for an approval button, the approval's run).
@@ -326,9 +319,7 @@ async def _take_turns_tap(
     ctx = RunContext(run_id=run_id, agent_id=API_AGENT, conversation_id=None)
     reason: str | None = None
     try:
-        result = await call_tool(
-            HOUSEHOLD_SERVER, SET_TAKE_TURNS, args, ctx=ctx, token=_service_token()
-        )
+        result = await call_tool(HOUSEHOLD_SERVER, SET_TAKE_TURNS, args, ctx=ctx)
     except ToolRefused as refused:
         log.info("take-turns tap refused: %s", refused.reason)
         result, reason = {}, refused.reason
@@ -395,12 +386,6 @@ async def _approval(conn: AsyncConnection, approval_id: uuid.UUID) -> dict[str, 
         return await cur.fetchone()
 
 
-def _service_token() -> str:
-    # `api`'s own service token (identity-authz §8). Every caller uses the mock issuer
-    # until identity-authz replaces the token source (Q4).
-    return MockIssuer().issue(API_AGENT, API_AGENT, [])
-
-
 async def _approval_tap(
     conn: AsyncConnection,
     member: _Member,
@@ -432,9 +417,7 @@ async def _approval_tap(
     }
     ctx = RunContext(run_id=run_id, agent_id=API_AGENT, conversation_id=None)
     try:
-        result = await call_tool(
-            HOUSEHOLD_SERVER, "decide_approval", args, ctx=ctx, token=_service_token()
-        )
+        result = await call_tool(HOUSEHOLD_SERVER, "decide_approval", args, ctx=ctx)
         status = result.get("status")
     except ToolRefused as refused:
         if refused.reason == WRONG_APPROVER:
@@ -547,7 +530,7 @@ async def _shortfall_button(
         conversation_id=ids.shortfall_conversation_id(parsed.shortfall_id),
     )
     try:
-        result = await call_tool(
+        result = await call_tool_as(
             HOUSEHOLD_SERVER,
             CHOOSE_SHORTFALL_OPTION,
             {
@@ -557,7 +540,6 @@ async def _shortfall_button(
                 "user_id": str(member.user_id),
             },
             ctx=ctx,
-            token=_service_token(),
         )
     except ToolRefused as exc:
         log.info("shortfall pick refused", extra={"reason": exc.reason})

@@ -63,7 +63,6 @@ from services.common.directory import AgentCard
 from services.common.mcp_client import ToolRefused
 from services.common.protocol.schemas import AllergenCode, Constraints, DietCode
 from services.common.run_context import RunContext
-from services.identity.tokens import MockIssuer
 
 __all__ = [
     "CHAT_REPLY_TEMPLATE",
@@ -187,12 +186,6 @@ class RunInfo:
 
 LoadRun = Callable[[UUID], Awaitable[RunInfo]]
 CallTool = Callable[..., Awaitable[dict[str, Any]]]
-IssueToken = Callable[[str, str, Sequence[str]], str]
-
-
-def _mock_token(sub: str, act: str, scopes: Sequence[str]) -> str:
-    # Every run uses the mock issuer until identity-authz replaces the token source (Q4).
-    return MockIssuer().issue(sub, act, list(scopes))
 
 
 def _member_user_id(card: AgentCard) -> UUID:
@@ -242,7 +235,7 @@ def _parse_extract(text: str | None) -> tuple[str, str | None]:
 
 
 def build_graph(
-    model: ModelClient, call_tool: CallTool, issue_token: IssueToken, traces: TraceSink
+    model: ModelClient, call_tool: CallTool, traces: TraceSink
 ) -> StateGraph:
     """The consumer graph's nodes and edges, before `compile(checkpointer=...)`."""
 
@@ -267,9 +260,9 @@ def build_graph(
     async def own_constraints(state: ConsumerState) -> dict[str, Any]:
         """The member's own `get_constraints` rows, checked to be theirs."""
         member = state["member_user_id"]
-        token = issue_token(f"user:{member}", state["agent_id"], [CONSTRAINTS_SCOPE])
+        # `call_tool_as` obtains the member's grant token (identity-authz I6).
         rows = await call_tool(
-            HOUSEHOLD_SERVER, "get_constraints", {"user_id": member}, ctx=_ctx(state), token=token
+            HOUSEHOLD_SERVER, "get_constraints", {"user_id": member}, ctx=_ctx(state)
         )
         if str(rows.get("user_id")) != member:
             raise ConstraintsMismatch("get_constraints returned another person's rows")
@@ -368,14 +361,12 @@ def build_graph(
         if value is None:
             return await not_saved("invalid_value")
         member = state["member_user_id"]
-        token = issue_token(f"user:{member}", state["agent_id"], [DISLIKE_SCOPE])
         try:
             result_row = await call_tool(
                 HOUSEHOLD_SERVER,
                 "record_dislike",
                 {"user_id": member, "value": value, "action": action},
                 ctx=_ctx(state),
-                token=token,
             )
         except ToolRefused as refused:
             return await not_saved(f"refused_{refused.reason}")
@@ -500,15 +491,14 @@ class ConsumerGraph:
         model: ModelClient,
         checkpointer: BaseCheckpointSaver,
         load_run: LoadRun,
-        call_tool: CallTool = mcp_client.call_tool,
-        issue_token: IssueToken = _mock_token,
+        call_tool: CallTool = mcp_client.call_tool_as,
         traces: TraceSink | None = None,
     ) -> None:
         self._load_run = load_run
         # Without a sink of its own, code decisions go to the model client's sink, so they are
         # never dropped.
         sink = traces if traces is not None else model.traces
-        self.graph = build_graph(model, call_tool, issue_token, sink).compile(
+        self.graph = build_graph(model, call_tool, sink).compile(
             checkpointer=checkpointer
         )
 
