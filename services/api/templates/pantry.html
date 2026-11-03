@@ -1,0 +1,45 @@
+{#- /me/pantry (experience.md §8, EX-OD6, EX-A17).
+
+Context, besides base.html's:
+  enabled     bool                                   pantry.is_enabled(households.env)
+  items       [{name, state, checked, csrf}]         state: "at_home" | "unsure" | "out";
+              checked: the "last checked" age as text, or none
+  can_correct bool                                   the viewer is an adult
+A correction posts `kind` ("verify" or "out") to /me/pantry/<name>. -#}
+{% extends "base.html" %}
+{% from "base.html" import csrf_field %}
+{% block title %}Pantry{% endblock %}
+{% block content %}
+{% if not enabled %}
+<p class="card">Pantry tracking isn't on for your household yet.</p>
+{% else %}
+{% for state, heading in [("at_home", "At home"), ("unsure", "Not sure"), ("out", "Out")] %}
+{% set group = items | selectattr("state", "equalto", state) | list %}
+{% if group %}
+<section class="card">
+  <h2{% if state == "out" %} class="state-out"{% endif %}>{{ heading }}</h2>
+  <ul class="rows">
+    {% for item in group %}
+    <li>
+      <div class="row">
+        <div>
+          <strong>{{ item.name }}</strong>
+          <div class="muted">{% if item.checked %}Last checked {{ item.checked }}{% else %}Never checked{% endif %}</div>
+        </div>
+        {% if can_correct %}
+        <form class="inline" method="post" action="/me/pantry/{{ item.name | urlencode }}">
+          {{ csrf_field(item.csrf) }}
+          <button type="submit" name="kind" value="verify">Still have it</button>
+          <button type="submit" name="kind" value="out">Ran out</button>
+        </form>
+        {% endif %}
+      </div>
+    </li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
+{% endfor %}
+{% if not items %}<p class="card muted">Nothing tracked yet.</p>{% endif %}
+{% endif %}
+{% endblock %}

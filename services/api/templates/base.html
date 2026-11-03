@@ -1,0 +1,34 @@
+{#- The /me page frame (experience.md §8, EX-I35).
+
+Context, set by every /me route:
+  person    {name}             the signed-in person
+  household {name}             their household
+  tab       "household" | "pantry" | "history" | none   the selected tab
+Child templates fill `title` and `content`. Every form includes `csrf_field(token)`, the
+route's itsdangerous token over the session id and that form's name (checked first). -#}
+{%- macro csrf_field(token) -%}
+<input type="hidden" name="csrf" value="{{ token }}">
+{%- endmacro -%}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}Kitchenless{% endblock %}</title>
+<link rel="stylesheet" href="/me/static/me.css">
+</head>
+<body>
+<header class="top">
+  <p class="who">{% if person %}<strong>{{ person.name }}</strong>{% endif %}{% if household %} · {{ household.name }}{% endif %}</p>
+  <nav class="tabs" aria-label="Pages">
+    <a href="/me/household"{% if tab == "household" %} aria-current="page"{% endif %}>Household</a>
+    <a href="/me/pantry"{% if tab == "pantry" %} aria-current="page"{% endif %}>Pantry</a>
+    <a href="/me/history"{% if tab == "history" %} aria-current="page"{% endif %}>History</a>
+  </nav>
+</header>
+<main>
+<h1>{{ self.title() }}</h1>
+{% block content %}{% endblock %}
+</main>
+</body>
+</html>

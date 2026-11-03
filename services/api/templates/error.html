@@ -1,0 +1,11 @@
+{#- An error page (experience.md §8 copy).
+
+Context, besides base.html's (person and household may be none):
+  heading  short title, for example "Session expired"
+  message  the page copy, for example "This page timed out. Write *my page* in WhatsApp for
+           a new link." -#}
+{% extends "base.html" %}
+{% block title %}{{ heading or "Something went wrong" }}{% endblock %}
+{% block content %}
+<p class="card error">{{ message }}</p>
+{% endblock %}
