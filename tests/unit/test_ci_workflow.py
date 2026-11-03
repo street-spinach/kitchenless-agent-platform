@@ -15,11 +15,12 @@ ROOT = Path(__file__).resolve().parents[2]
 CI_YML = ROOT / ".github" / "workflows" / "ci.yml"
 ARCHITECTURE = ROOT / "docs" / "designs" / "architecture.md"
 
-# Architecture item 63's eight paths, in its order.
+# Architecture item 63's nine paths, in its order (services/identity/ added 2026-11-03).
 ITEM_63_PATHS = [
     "services/agents/",
     "services/mcp/",
     "services/safety/",
+    "services/identity/",
     "services/common/",
     "services/api/",
     "services/seed/",
@@ -73,12 +74,14 @@ def test_eval_job_regex_is_architecture_item_63() -> None:
     assert f"`'{ITEM_63_REGEX}'`" in ARCHITECTURE.read_text()
 
 
-def test_eval_job_seeds_the_eval_households_before_eval_fast() -> None:
+def test_eval_job_seeds_the_eval_households_before_eval_safety() -> None:
     lines = _run_lines(_eval_job())
     seed = lines.index('make seed SEED_ARGS="--env eval"')
     up = next(i for i, line in enumerate(lines) if "up -d --wait" in line)
-    fast = lines.index("make eval-fast")
-    assert up < seed < fast
+    # PRs run the fast safety cases; every case runs nightly (architecture item 63, 2026-11-03).
+    safety = lines.index("make eval-safety")
+    assert up < seed < safety
+    assert "make eval-fast" not in lines
 
 
 def test_eval_results_upload_and_summary_run_always() -> None:
