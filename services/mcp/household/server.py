@@ -45,7 +45,8 @@ The shortfall tools (agent-protocol §10 and P25, #68):
 
 The setup tools (experience §9, EX-I26), for the consumer agent:
 
-*   `get_setup_state()` *guarded*: `{role, has_budget, has_proposal}` for the person.
+*   `get_setup_state()` *guarded*: `{role, has_budget, has_proposal, currency}` for the
+    person.
 *   `propose_setup(answer)` *guarded*, admins only: the validated `SetupAnswer` stored as
     the household's `pending` proposal, with `phones_taken`.
 
@@ -1485,10 +1486,13 @@ def _sort_codes(raw: Any) -> dict[str, Any]:
 
 
 async def get_setup_state(ctx: CallContext) -> dict[str, Any]:
-    """`{role, has_budget, has_proposal}` for the person the consumer agent acts for, in the
-    run's household (§9 step 1). Relation `agent acts_for user:<that person>`; read only.
+    """`{role, has_budget, has_proposal, currency}` for the person the consumer agent acts
+    for, in the run's household (§9 step 1). Relation `agent acts_for user:<that person>`;
+    read only.
 
     `has_proposal` is whether the household has ever had a proposal, whatever its status.
+    `currency` is the household's (`households.currency`): the setup prompt asks for the
+    budget in its minor units and the restate shows it (#296).
     """
     household = await _run_household(ctx)
     user = _acting_user(ctx)
@@ -1509,7 +1513,15 @@ async def get_setup_state(ctx: CallContext) -> dict[str, Any]:
             proposal = await q.fetch(
                 "SELECT 1 FROM onboarding_proposals WHERE household_id = %(household)s LIMIT 1"
             )
-        return {"role": role, "has_budget": bool(budget), "has_proposal": bool(proposal)}
+            currency = await q.fetch(
+                "SELECT currency FROM households WHERE household_id = %(household)s"
+            )
+        return {
+            "role": role,
+            "has_budget": bool(budget),
+            "has_proposal": bool(proposal),
+            "currency": str(currency[0][0]).strip() if currency else None,
+        }
 
     return await run_guarded(
         ctx,

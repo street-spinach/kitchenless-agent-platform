@@ -140,6 +140,7 @@ def test_setup_state(
         "role": "admin",
         "has_budget": False,
         "has_proposal": False,
+        "currency": "USD",
     }
     assert (
         fga.agent_object(world.house.consumer_agent),
@@ -161,6 +162,7 @@ def test_setup_state(
         "role": "admin",
         "has_budget": True,
         "has_proposal": True,
+        "currency": "USD",
     }
 
     # Someone outside the run's household, or no person at all, is refused.
