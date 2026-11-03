@@ -14,6 +14,11 @@ export type OrderRow = {
   rationale: string | null;
 };
 export type Notice = { kind: string; text: string; at: string };
+export type InsightCell =
+  | { metric: string; label: string; value: string; hidden?: undefined }
+  | { metric: string; hidden: true };
+export type Insights = { week: string; sample: boolean; cells: InsightCell[] };
+export type Connection = { vendor: string; mode: "real" | "mock"; set_at: string | null };
 
 export class SignedOut extends Error {}
 
@@ -39,6 +44,8 @@ export function orgOf(token: string): string | null {
   return null;
 }
 
+export class NotFound extends Error {}
+
 async function call<T>(path: string, init?: RequestInit): Promise<T> {
   const token = accessToken();
   const org = token ? orgOf(token) : null;
@@ -56,6 +63,7 @@ async function call<T>(path: string, init?: RequestInit): Promise<T> {
     signOut();
     throw new SignedOut("token refused");
   }
+  if (resp.status === 404) throw new NotFound(path);
   if (!resp.ok) throw new Error(`${path}: ${resp.status}`);
   return (await resp.json()) as T;
 }
@@ -71,6 +79,13 @@ export const api = {
   orders: () => call<{ orders: OrderRow[] }>("/app/orders").then((r) => r.orders),
   notices: (limit: number) =>
     call<{ notices: Notice[] }>(`/app/notices?limit=${limit}`).then((r) => r.notices),
+  insights: () => call<Insights>("/app/insights"),
+  // Null when the organisation has no store connected (404 `no_agents`).
+  connection: () =>
+    call<Connection>("/app/connection").catch((e) => {
+      if (e instanceof NotFound) return null;
+      throw e;
+    }),
 };
 
 export function money(minor: number | null, currency: string): string {

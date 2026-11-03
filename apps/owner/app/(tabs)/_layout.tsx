@@ -1,4 +1,5 @@
-// The owner app's bottom tabs (experience.md §11). Signed out, it shows only "Sign in".
+// The owner app's bottom tabs (experience.md §11): Home, Orders, Insights, Account. Signed
+// out, it shows only "Sign in".
 import { Tabs } from "expo-router";
 import { StyleSheet, Text, View } from "react-native";
 
@@ -24,6 +25,8 @@ export default function TabsLayout() {
     <Tabs screenOptions={{ tabBarActiveTintColor: colors.primary }}>
       <Tabs.Screen name="index" options={{ title: "Home" }} />
       <Tabs.Screen name="orders" options={{ title: "Orders" }} />
+      <Tabs.Screen name="insights" options={{ title: "Insights" }} />
+      <Tabs.Screen name="account" options={{ title: "Account" }} />
     </Tabs>
   );
 }
