@@ -171,9 +171,13 @@ async def _role(q: scope.Scoped, user_id: UUID) -> str | None:
 
 async def link(request: Request) -> Response:
     token = request.path_params["token"]
+    # The page to open after sign-in (experience EX-A15): only from the closed set.
+    raw_next = request.query_params.get("next")
+    next_page = raw_next if raw_next in links.NEXT_PAGES else None
     if request.method != "POST":
         # GET and HEAD never change state (§6).
-        action = html.escape(f"/me/l/{token}", quote=True)
+        suffix = "" if next_page is None else f"?{urlencode({'next': next_page})}"
+        action = html.escape(f"/me/l/{token}{suffix}", quote=True)
         return _page(
             "Sign in to Kitchenless",
             f"<form method='post' action='{action}'><button type='submit'>Continue</button></form>",
@@ -200,6 +204,7 @@ async def link(request: Request) -> Response:
             "i": None,
             "g": [],
             "k": [],
+            "x": next_page,
         },
     )
     try:
@@ -275,7 +280,7 @@ async def _sign_in_callback(request: Request, state: dict[str, Any]) -> Response
     if state["p"] == "consent":
         resp: Response = _next(state, 0)
     else:
-        resp = RedirectResponse("/me/agents", status_code=302)
+        resp = RedirectResponse(links.next_path(state.get("x")), status_code=302)
     _set_session(resp, target, state["h"])
     return resp
 
