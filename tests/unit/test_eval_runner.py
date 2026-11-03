@@ -16,9 +16,9 @@ from tests.unit.protocol.conftest import SAMPLES
 
 THRESHOLDS = {
     "categories": {
-        "safety": {"gate": True, "min_pass_rate": 1.0, "repeats": 3},
-        "task": {"gate": True, "min_pass_rate": 0.9, "repeats": 2},
-        "explanation": {"gate": False, "min_pass_rate": 0.7, "repeats": 1},
+        "safety": {"gate": True, "min_pass_rate": 1.0, "repeats": {"stub": 3, "real": 5}},
+        "task": {"gate": True, "min_pass_rate": 0.9, "repeats": {"stub": 2, "real": 4}},
+        "explanation": {"gate": False, "min_pass_rate": 0.7, "repeats": {"stub": 1, "real": 1}},
     },
     "budget": {"max_tokens_per_suite": 100, "warn_seconds_per_scenario": 120},
 }
@@ -197,6 +197,164 @@ def test_main_runs_each_case_repeats_times(monkeypatch: pytest.MonkeyPatch) -> N
     assert calls == [("s1", 1), ("t1", 1)]
 
 
+# --- the case format and validation (evals.md §4, build step 5a) ----------------------------
+
+
+def validate(data: dict[str, Any]) -> dict[str, Any]:
+    return run.validate_case(data, f"cases/{data['category']}/{data['id']}.yaml", CATEGORIES)
+
+
+def main_on(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, argv: list[str]) -> int:
+    """`run.main` over the cases written under `tmp_path`, with no attempt run for real."""
+    load = LOAD_CASES
+    monkeypatch.setattr(run, "load_thresholds", lambda: THRESHOLDS)
+    monkeypatch.setattr(run, "load_cases", lambda categories: load(categories, tmp_path))
+    monkeypatch.setattr(run, "write_results", lambda summary, results, md: Path("r.json"))
+    monkeypatch.setattr(
+        run,
+        "run_case",
+        lambda c, repeat, dsn, timeout: RunResult(c["id"], c["category"], repeat, passed=True),
+    )
+    return run.main(argv)
+
+
+LOAD_CASES = run.load_cases
+
+
+def weekly(**overrides: Any) -> dict[str, Any]:
+    return case(run="weekly_grocery_order", **overrides)
+
+
+def test_stub_override_requires_stub_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    overrides = {"STUB_FAIL_NODE": "respond_to_counter"}
+    for modes in (None, ["stub", "real"], ["real"]):
+        data = (
+            weekly(overrides=overrides)
+            if modes is None
+            else weekly(overrides=overrides, model_modes=modes)
+        )
+        with pytest.raises(CaseError, match="need model_modes: \\[stub\\]"):
+            validate(data)
+    assert validate(weekly(overrides=overrides, model_modes=["stub"]))
+    # A non-stub override is fine on a real-capable case.
+    assert validate(weekly(overrides={"APPROVAL_TTL_SECONDS": 5}))
+    write_case(tmp_path, "task", weekly(overrides=overrides))
+    assert main_on(tmp_path, monkeypatch, ["--all"]) == 2
+
+
+def test_unknown_setup_key() -> None:
+    with pytest.raises(CaseError, match="unknown setup key 'made_up'"):
+        validate(weekly(setup={"made_up": 1}))
+    with pytest.raises(CaseError, match="must be int"):
+        validate(weekly(setup={"budget_minor": "1000"}))
+    with pytest.raises(CaseError, match="must be int"):
+        validate(weekly(setup={"budget_minor": True}))
+    with pytest.raises(CaseError, match="setup must be a mapping"):
+        validate(weekly(setup=["budget_minor"]))
+    assert validate(weekly(setup={"budget_minor": 1000, "take_turns": True}))
+
+
+def test_unknown_check_arg() -> None:
+    with pytest.raises(CaseError, match="unknown args \\['colour'\\] for check run_status"):
+        validate(weekly(expect=[{"check": "run_status", "args": {"colour": "red"}}]))
+    # `db` is supplied by the runner, never by the case.
+    with pytest.raises(CaseError, match="unknown args \\['db'\\]"):
+        validate(weekly(expect=[{"check": "order_placed_once", "args": {"db": {}}}]))
+    args = {"status": "error", "reason": "no_offers"}
+    assert validate(weekly(expect=[{"check": "run_status", "args": args}]))
+
+
+def test_input_only_for_member_message() -> None:
+    with pytest.raises(CaseError, match="input is only for member_message"):
+        validate(weekly(input={"member": "us-1-a-eval", "text": "hi"}))
+    with pytest.raises(CaseError, match="member_message needs input"):
+        validate(case(run="member_message"))
+    with pytest.raises(CaseError, match="member_message needs input"):
+        validate(case(run="member_message", input={"text": "hi"}))
+    with pytest.raises(CaseError, match="households is only for"):
+        validate(weekly(households=["us-1-eval", "us-2-eval"]))
+    with pytest.raises(CaseError, match="two different household ids"):
+        validate(case(run="weekly_grocery_order_pair", households=["us-1-eval", "us-1-eval"]))
+    assert validate(case(run="weekly_grocery_order_pair", households=["us-2-eval", "us-1-eval"]))
+    # `hello` keeps its body as `input` (the two existing hello cases).
+    assert validate(case(input={"text": "eval", "on_behalf_of": "eval-user"}))
+
+
+def test_stub_capable_safety_must_be_fast() -> None:
+    for modes in (None, ["stub"], ["stub", "real"]):
+        data = case(category="safety", tags=[])
+        if modes is not None:
+            data["model_modes"] = modes
+        with pytest.raises(CaseError, match="must carry the fast tag"):
+            validate(data)
+    assert validate(case(category="safety", tags=[], model_modes=["real"]))
+
+
+def test_unknown_fields_and_bad_model_modes_are_rejected() -> None:
+    with pytest.raises(CaseError, match="unknown fields \\['nightly_only'\\]"):
+        validate(case(nightly_only=True))
+    for modes in ([], ["stub", "stub"], ["fake"], "stub"):
+        with pytest.raises(CaseError, match="model_modes must be"):
+            validate(case(model_modes=modes))
+    with pytest.raises(CaseError, match="does not match its file name"):
+        run.validate_case(case(), "cases/task/other.yaml", CATEGORIES)
+    with pytest.raises(CaseError, match="expect entries take only"):
+        validate(case(expect=[{"check": "outcome_recorded", "arg": {}}]))
+
+
+def test_mode_filters_by_model_modes_and_picks_repeats(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_case(tmp_path, "task", case(id="both"))
+    write_case(tmp_path, "task", case(id="stub-only", model_modes=["stub"]))
+    write_case(tmp_path, "task", case(id="real-only", model_modes=["real"]))
+    cases = run.load_cases(CATEGORIES, tmp_path)
+    assert [c["id"] for c in run.select(cases, all_cases=True, mode="stub")] == [
+        "both",
+        "stub-only",
+    ]
+    assert [c["id"] for c in run.select(cases, tag="fast", mode="real")] == ["both", "real-only"]
+    assert run.parse_args(["--all"]).mode == "stub"
+    assert run.repeats_for(case(category="safety"), THRESHOLDS, None, "real") == 5
+    calls: list[tuple[str, int]] = []
+    load = LOAD_CASES
+    monkeypatch.setattr(run, "load_thresholds", lambda: THRESHOLDS)
+    monkeypatch.setattr(run, "load_cases", lambda categories: load(categories, tmp_path))
+    monkeypatch.setattr(run, "write_results", lambda summary, results, md: Path("r.json"))
+
+    def fake_run(c: dict[str, Any], repeat: int, dsn: str, timeout: float) -> RunResult:
+        calls.append((c["id"], repeat))
+        return RunResult(c["id"], c["category"], repeat, passed=True)
+
+    monkeypatch.setattr(run, "run_case", fake_run)
+    assert run.main(["--all", "--mode", "real"]) == 0
+    assert calls == [(i, r) for i in ("both", "real-only") for r in (1, 2, 3, 4)]
+
+
+def test_flags(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    write_case(tmp_path, "task", case(id="a"))
+    write_case(tmp_path, "task", case(id="b", tags=[]))
+    write_case(tmp_path, "task", case(id="c"))
+    listed = tmp_path / "list.yaml"
+    listed.write_text(yaml.safe_dump(["c", "b"]))
+    args = run.parse_args(["--cases-file", str(listed), "--trigger", "manual", "--mode", "real"])
+    assert (args.cases_file, args.trigger, args.mode) == (listed, "manual", "real")
+    assert run.parse_args(["--tag", "fast"]).trigger is None
+    for bad in (["--all", "--mode", "fake"], ["--all", "--trigger", "weekly"]):
+        with pytest.raises(SystemExit):
+            run.parse_args(bad)
+    ids_ = run.load_case_ids(listed, {"a", "b", "c"})
+    cases = run.load_cases(CATEGORIES, tmp_path)
+    assert [c["id"] for c in run.select(cases, case_ids=ids_)] == ["b", "c"]
+    assert main_on(tmp_path, monkeypatch, ["--cases-file", str(listed)]) == 0
+    # An id that is not a case, or a file that is not a list, is refused (exit 2).
+    listed.write_text(yaml.safe_dump(["c", "zzz"]))
+    assert main_on(tmp_path, monkeypatch, ["--cases-file", str(listed)]) == 2
+    listed.write_text("c: 1\n")
+    assert main_on(tmp_path, monkeypatch, ["--cases-file", str(listed)]) == 2
+    assert main_on(tmp_path, monkeypatch, ["--cases-file", str(tmp_path / "missing.yaml")]) == 2
+
+
 # --- scenarios, steps and the db snapshot (architecture item 65, agent-protocol P38) ---------
 
 
@@ -237,6 +395,32 @@ def test_reset_posts_setup_then_conditions(api: FakeApi) -> None:
     )
     reset = {"env": "eval", "household": "us-1-eval", "setup": {"budget_minor": 2000}}
     assert api.calls == [("/panel/reset", reset), ("/panel/events", {"env": "eval", **condition})]
+
+
+def test_run_case_sends_setup_to_reset(api: FakeApi, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replaces `test_run_case_refuses_setup_without_control_panel`: `setup` is supported
+    (evals.md §4), so `run_case` sends it with the case's household to `POST /panel/reset`
+    before it starts the run."""
+    monkeypatch.setattr(run, "read_trace", lambda dsn, rid: outcome_trace())
+    data = weekly(
+        household="us-2-eval",
+        setup={"budget_minor": 1000},
+        expect=[{"check": "run_status", "args": {"status": "completed"}}],
+    )
+    res = run.run_case(validate(data), 1, "dsn", timeout=1)
+    assert res.passed, res
+    reset = {"env": "eval", "household": "us-2-eval", "setup": {"budget_minor": 1000}}
+    assert [c[0] for c in api.calls] == ["/panel/reset", "/runs"]
+    assert api.calls[0][1] == reset
+    assert api.calls[1][1]["household_id"] == "us-2-eval"
+
+
+def test_pair_reset_uses_the_first_household(api: FakeApi) -> None:
+    run.reset_and_seed_mocks(
+        case(run="weekly_grocery_order_pair", households=["us-2-eval", "us-1-eval"])
+    )
+    run.reset_and_seed_mocks(case(run="weekly_grocery_order_pair"))
+    assert [b["household"] for _, b in api.calls] == ["us-2-eval", "us-1-eval"]
 
 
 def test_weekly_grocery_order_posts_runs(api: FakeApi) -> None:
