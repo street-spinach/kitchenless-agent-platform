@@ -1,4 +1,6 @@
 import asyncio
+import json
+import urllib.error
 import uuid
 from pathlib import Path
 from typing import Any
@@ -185,7 +187,9 @@ def test_main_runs_each_case_repeats_times(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(run, "write_results", lambda summary, results, md: Path("r.json"))
     calls: list[tuple[str, int]] = []
 
-    def fake_run(c: dict[str, Any], repeat: int, dsn: str, timeout: float) -> RunResult:
+    def fake_run(
+        c: dict[str, Any], repeat: int, dsn: str, timeout: float, mode: str = "stub"
+    ) -> RunResult:
         calls.append((c["id"], repeat))
         return RunResult(c["id"], c["category"], repeat, passed=True)
 
@@ -213,7 +217,9 @@ def main_on(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, argv: list[str]) ->
     monkeypatch.setattr(
         run,
         "run_case",
-        lambda c, repeat, dsn, timeout: RunResult(c["id"], c["category"], repeat, passed=True),
+        lambda c, repeat, dsn, timeout, mode="stub": RunResult(
+            c["id"], c["category"], repeat, passed=True
+        ),
     )
     return run.main(argv)
 
@@ -322,7 +328,10 @@ def test_mode_filters_by_model_modes_and_picks_repeats(
     monkeypatch.setattr(run, "load_cases", lambda categories: load(categories, tmp_path))
     monkeypatch.setattr(run, "write_results", lambda summary, results, md: Path("r.json"))
 
-    def fake_run(c: dict[str, Any], repeat: int, dsn: str, timeout: float) -> RunResult:
+    def fake_run(
+        c: dict[str, Any], repeat: int, dsn: str, timeout: float, mode: str = "stub"
+    ) -> RunResult:
+        assert mode == "real"
         calls.append((c["id"], repeat))
         return RunResult(c["id"], c["category"], repeat, passed=True)
 
@@ -561,6 +570,236 @@ def test_db_snapshot_passed_only_to_checks_that_take_it(monkeypatch: pytest.Monk
     snapshot = {"agent_messages": ()}
     assert all(c["passed"] for c in run.run_checks([], with_both, snapshot))
     assert seen["db"] is snapshot
+
+
+# --- verdicts, outcome and standard output (evals.md §5, build step 5b) ---------------------
+
+
+def _refused(path: str, body: dict[str, Any]) -> dict[str, Any]:
+    raise urllib.error.URLError(ConnectionRefusedError(61, "Connection refused"))
+
+
+def _http_error(code: int) -> Any:
+    def post(path: str, body: dict[str, Any]) -> dict[str, Any]:
+        if path == "/runs":
+            raise urllib.error.HTTPError(path, code, "error", {}, None)  # type: ignore[arg-type]
+        return {}
+
+    return post
+
+
+def test_connection_refused_is_infra(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(run, "post_json", _refused)
+    res = run.run_case(weekly(), 1, "dsn", timeout=1)
+    assert (res.verdict, res.error_kind, res.passed) == ("skipped", "infra", False)
+    assert res.run_id is None
+    # A 5xx from `api` before the run started is infra too; a 4xx from `/runs` is not.
+    monkeypatch.setattr(run, "post_json", _http_error(503))
+    assert run.run_case(weekly(), 1, "dsn", timeout=1).error_kind == "infra"
+    monkeypatch.setattr(run, "post_json", _http_error(422))
+    refused = run.run_case(weekly(), 1, "dsn", timeout=1)
+    assert (refused.verdict, refused.error_kind) == ("fail", "check_failed")
+    # More than half the attempts infra: the eval run ends infra (exit 3).
+    monkeypatch.setattr(run, "post_json", _refused)
+    summary = run.summarize([run.run_case(weekly(), 1, "dsn", 1)] * 2, THRESHOLDS)
+    assert summary["categories"]["task"]["pass_rate"] is None
+    assert (summary["outcome"], summary["exit_code"]) == ("infra", 3)
+
+
+def test_real_model_unavailable_completion_only_is_skipped(
+    api: FakeApi, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(run, "read_trace", lambda dsn, rid: outcome_trace("model_unavailable"))
+    data = weekly(expect=[{"check": "run_status", "args": {"status": "error"}}])
+    real = run.run_case(data, 1, "dsn", timeout=1, mode="real")
+    assert real.checks[0]["invariant"] is False and not real.checks[0]["passed"]
+    assert (real.verdict, real.error_kind) == ("skipped", "model_unavailable")
+    # In stub mode the same attempt is a failure.
+    stub = run.run_case(data, 1, "dsn", timeout=1, mode="stub")
+    assert (stub.verdict, stub.error_kind) == ("fail", "check_failed")
+    summary = run.summarize([real] * 3, THRESHOLDS, "real")
+    assert (summary["outcome"], summary["exit_code"]) == ("model_unavailable", 3)
+
+
+def _failing(invariant: bool | None) -> Any:
+    def check(trace: Any, case: Any) -> tuple[bool, str]:
+        return False, "peanuts ordered"
+
+    if invariant is not None:
+        check.invariant = invariant  # type: ignore[attr-defined]
+    return check
+
+
+def test_allergen_and_token_budget_is_fail(api: FakeApi, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(run, "read_trace", lambda dsn, rid: outcome_trace("token_budget"))
+    monkeypatch.setitem(run.CHECKS, "no_allergen_in_order", _failing(True))
+    data = weekly(
+        category="safety",
+        expect=[
+            {"check": "no_allergen_in_order"},
+            {"check": "run_status", "args": {"status": "error"}},
+        ],
+    )
+    res = run.run_case(data, 1, "dsn", timeout=1, mode="real")
+    assert (res.verdict, res.error_kind) == ("fail", "check_failed")
+    summary = run.summarize([res], THRESHOLDS, "real")
+    assert (summary["outcome"], summary["outcome_detail"], summary["exit_code"]) == (
+        "regression",
+        "safety",
+        1,
+    )
+
+
+def test_undeclared_check_is_invariant(api: FakeApi, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(run, "read_trace", lambda dsn, rid: outcome_trace("model_unavailable"))
+    monkeypatch.setitem(run.CHECKS, "undeclared", _failing(None))
+    monkeypatch.setitem(run.CHECKS, "completion", _failing(False))
+    [undeclared] = run.run_checks([], case(expect=[{"check": "undeclared"}]))
+    assert undeclared["invariant"] is True
+    data = weekly(expect=[{"check": "undeclared"}, {"check": "completion"}])
+    res = run.run_case(data, 1, "dsn", timeout=1, mode="real")
+    assert (res.verdict, res.error_kind) == ("fail", "check_failed")
+    only_completion = run.run_case(
+        weekly(expect=[{"check": "completion"}]), 1, "dsn", timeout=1, mode="real"
+    )
+    assert only_completion.verdict == "skipped"
+
+
+def test_all_skipped_category_has_no_rate() -> None:
+    skipped = RunResult("s", "safety", 1, passed=False, verdict="skipped", error_kind="infra")
+    summary = run.summarize([skipped, result("task", True), result("task", True)], THRESHOLDS)
+    safety = summary["categories"]["safety"]
+    assert (safety["pass"], safety["fail"], safety["skipped"]) == (0, 0, 1)
+    assert safety["pass_rate"] is None and safety["ok"] is None
+    assert summary["gate_failures"] == []
+    assert summary["categories"]["task"]["pass_rate"] == 1.0
+    assert (summary["outcome"], summary["exit_code"]) == ("pass", 0)
+    assert summary["error_kind_counts"] == {"infra": 1, "none": 2}
+    assert "n/a" in run.to_markdown(summary, [skipped])
+
+
+def _stdout_lines(capsys: pytest.CaptureFixture[str]) -> list[str]:
+    return capsys.readouterr().out.rstrip("\n").split("\n")
+
+
+def test_status_line_is_last(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    write_case(tmp_path, "task", case(id="a"))
+    monkeypatch.setenv("GIT_SHA", "abc123")
+    assert main_on(tmp_path, monkeypatch, ["--all", "--trigger", "manual"]) == 0
+    last = _stdout_lines(capsys)[-1]
+    assert last.startswith("EVAL_STATUS ")
+    status = json.loads(last.removeprefix("EVAL_STATUS "))
+    assert list(status) == [
+        "outcome",
+        "detail",
+        "exit_code",
+        "eval_run_id",
+        "mode",
+        "trigger",
+        "git_sha",
+        "last_green_sha",
+        "failed_cases",
+        "real_safety_failed",
+    ]
+    assert status["outcome"] == "pass" and status["exit_code"] == 0
+    assert (status["mode"], status["trigger"], status["git_sha"]) == ("stub", "manual", "abc123")
+    assert status["failed_cases"] == [] and status["real_safety_failed"] is False
+    assert uuid.UUID(status["eval_run_id"])
+    # Invalid cases end with the status line too (exit 2).
+    write_case(tmp_path, "task", case(id="b", expect=[]))
+    assert main_on(tmp_path, monkeypatch, ["--all"]) == 2
+    last = _stdout_lines(capsys)[-1]
+    assert json.loads(last.removeprefix("EVAL_STATUS "))["outcome"] == "invalid_cases"
+
+
+def test_summary_between_markers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    write_case(tmp_path, "safety", case(id="s1", category="safety"))
+    write_case(tmp_path, "task", case(id="t1"))
+    monkeypatch.setattr(run, "load_thresholds", lambda: THRESHOLDS)
+    monkeypatch.setattr(run, "load_cases", lambda categories: LOAD_CASES(categories, tmp_path))
+    written: dict[str, Any] = {}
+
+    def write(summary: dict[str, Any], results: list[RunResult], md: str) -> Path:
+        written["json"] = run.results_json(summary, results)
+        return Path("r.json")
+
+    monkeypatch.setattr(run, "write_results", write)
+    monkeypatch.setattr(
+        run,
+        "run_case",
+        lambda c, repeat, dsn, timeout, mode="stub": RunResult(
+            c["id"], c["category"], repeat, passed=c["id"] != "s1"
+        ),
+    )
+    assert run.main(["--all", "--repeats", "1"]) == 1
+    lines = _stdout_lines(capsys)
+    begin, end = lines.index(run.SUMMARY_BEGIN), lines.index(run.SUMMARY_END)
+    assert begin < end == len(lines) - 2
+    summary = "\n".join(lines[begin + 1 : end])
+    assert summary.startswith("# Eval results: regression (safety)")
+    assert "`s1` repeat 1" in summary
+    status = json.loads(lines[-1].removeprefix("EVAL_STATUS "))
+    assert (status["outcome"], status["exit_code"], status["failed_cases"]) == (
+        "regression",
+        1,
+        ["s1"],
+    )
+    payload = written["json"]
+    assert payload["schema"] == 1
+    assert payload["selection"] == ["s1", "t1"]
+    assert (payload["outcome"], payload["outcome_detail"], payload["exit_code"]) == (
+        "regression",
+        "safety",
+        1,
+    )
+    assert payload["categories"]["safety"] == {
+        "pass": 0,
+        "fail": 1,
+        "skipped": 0,
+        "pass_rate": 0.0,
+        "min_pass_rate": 1.0,
+        "gate": True,
+        "ok": False,
+    }
+    assert set(payload["attempts"][0]) == {
+        "case_id",
+        "repeat",
+        "agent_run_ids",
+        "verdict",
+        "error_kind",
+        "reason",
+        "seconds",
+        "tokens",
+        "checks",
+        "models_used",
+    }
+
+
+def test_timeout_runs_checks_over_partial_trace(
+    api: FakeApi, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real-mode timeout after a model error is skipped only when no invariant failed."""
+    model_error = {
+        "seq": 1,
+        "kind": "error",
+        "payload": {"where": "model:choose_offer", "reason": "timeout", "attempt": 1},
+        "tokens_in": None,
+        "tokens_out": None,
+        "model": "m-1",
+    }
+    monkeypatch.setattr(run, "read_trace", lambda dsn, rid: [model_error])
+    completion = weekly(expect=[{"check": "run_status", "args": {"status": "completed"}}])
+    res = run.run_case(completion, 1, "dsn", timeout=0, mode="real")
+    assert (res.verdict, res.error_kind, res.models_used) == ("skipped", "timeout", ["m-1"])
+    assert run.run_case(completion, 1, "dsn", timeout=0, mode="stub").verdict == "fail"
+    monkeypatch.setitem(run.CHECKS, "no_allergen_in_order", _failing(True))
+    allergen = weekly(expect=[{"check": "no_allergen_in_order"}])
+    res = run.run_case(allergen, 1, "dsn", timeout=0, mode="real")
+    assert (res.verdict, res.error_kind) == ("fail", "timeout")
 
 
 # --- inject (db) ----------------------------------------------------------------------------
