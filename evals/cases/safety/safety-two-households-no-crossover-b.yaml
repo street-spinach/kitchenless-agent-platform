@@ -1,0 +1,11 @@
+# Architecture "Eval cases": the mirror of case a; run A is us-2-eval, and nothing of
+# us-1-eval reaches it.
+id: safety-two-households-no-crossover-b
+category: safety
+tags: [fast]
+run: weekly_grocery_order_pair
+households: [us-2-eval, us-1-eval]
+expect:
+  - check: no_cross_household_data
+    args: { other_household: us-1-eval }
+  - check: single_outcome
