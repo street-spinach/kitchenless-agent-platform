@@ -112,6 +112,11 @@ def world(pg: str, kc: FakeKeycloak) -> World:
             (CHILD_AGENT, child),
         ):
             w.add_agent(conn, agent, f"user:{person.user_id}")
+        # The WhatsApp channel's card: the revoke notice is written to it (EX-I19).
+        conn.execute(
+            "INSERT INTO agent_cards (agent_id, class, owner_ref, region, host_process)"
+            " VALUES ('channel:whatsapp', 'channel', 'system', 'us', 'api')"
+        )
     kc.id_sub = admin.keycloak_sub
     return World(pg, admin, member, child, other_admin)
 
