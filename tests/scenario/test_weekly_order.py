@@ -48,6 +48,11 @@ def _wait_for_outcome(run_id: uuid.UUID) -> dict[str, Any]:
 
 
 def test_weekly_order_completes_in_mock_mode() -> None:
+    # Start from a clean eval household, as every eval case does (evals/run.py). The VM's
+    # database keeps the pantry an earlier deploy's run delivered, and with a full pantry the
+    # weekly order correctly skips the shop (`nothing_needed`, pantry §5), so the run would
+    # not test the order path at all.
+    _post("/panel/reset", {"env": "eval", "household": HOUSEHOLD})
     started = _post(
         "/runs",
         {
