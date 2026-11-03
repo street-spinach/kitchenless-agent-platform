@@ -1,0 +1,32 @@
+{#- /me/household/band (identity-authz I24), restyled: the per-order approval band.
+
+Context, besides base.html's:
+  band     none | {amount, per_order_minor}   amount: formatted money; none: no band
+  currency the household currency code
+  can_set  bool                                the viewer is an admin
+  csrf     the form's token
+Setting posts `per_order_minor` (integer minor units; empty for no band). -#}
+{% extends "base.html" %}
+{% from "base.html" import csrf_field %}
+{% block title %}Approval band{% endblock %}
+{% block content %}
+<section class="card">
+  {% if band %}
+  <p>Orders over <strong>{{ band.amount }}</strong> need the approver's OK.</p>
+  {% else %}
+  <p>No per-order band is set.</p>
+  {% endif %}
+  {% if can_set %}
+  <form method="post" action="/me/household/band">
+    {{ csrf_field(csrf) }}
+    <label for="per_order_minor">New band, in {{ currency }} minor units (empty for none)</label>
+    <div class="row">
+      <input id="per_order_minor" type="number" name="per_order_minor" min="0" step="1" inputmode="numeric" value="{{ band.per_order_minor if band else '' }}">
+      <button class="primary" type="submit">Save</button>
+    </div>
+  </form>
+  {% else %}
+  <p class="muted">Only an admin can change this.</p>
+  {% endif %}
+</section>
+{% endblock %}

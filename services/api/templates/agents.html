@@ -1,0 +1,34 @@
+{#- /me/agents (identity-authz I24), restyled.
+
+Context, besides base.html's:
+  agents [{agent_id, label, until, can_revoke, csrf}]   until: the consent's end date as
+         text, or none (no consent); revoking posts to /me/agents/<agent_id>/revoke -#}
+{% extends "base.html" %}
+{% from "base.html" import csrf_field %}
+{% block title %}Your agents{% endblock %}
+{% block content %}
+<section class="card">
+  {% if agents %}
+  <ul class="rows">
+    {% for agent in agents %}
+    <li>
+      <div class="row">
+        <div>
+          <strong>{{ agent.label }}</strong>
+          <div class="muted">{% if agent.until %}Consented until {{ agent.until }}{% else %}No consent{% endif %}</div>
+        </div>
+        {% if agent.until and agent.can_revoke %}
+        <form class="inline" method="post" action="/me/agents/{{ agent.agent_id | urlencode }}/revoke">
+          {{ csrf_field(agent.csrf) }}
+          <button type="submit">Revoke</button>
+        </form>
+        {% endif %}
+      </div>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="muted">No agents.</p>
+  {% endif %}
+</section>
+{% endblock %}

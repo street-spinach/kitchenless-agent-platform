@@ -1,0 +1,81 @@
+{#- /me/household (experience.md §8, EX-OD8, EX-OD9).
+
+Context, besides base.html's:
+  order      none | {summary, state, explanation}   this week's order; all text built by code
+  spending   {spent, budget}                          formatted money strings; budget may be none
+  take_turns {on, can_switch, csrf}                   can_switch: the viewer is the approver
+  meals      [{order_id, title, delivered, totals, mine, csrf}]   the last 7 delivered meals;
+             totals is {up, down} or none (hidden below 3 adults); mine is 1, -1 or none
+The switch posts `on` (present when ticked) to /me/household/take-turns; a reaction posts
+`value` (1 or -1) to /me/meals/<order_id>/reaction. -#}
+{% extends "base.html" %}
+{% from "base.html" import csrf_field %}
+{% block title %}Household{% endblock %}
+{% block content %}
+<section class="card">
+  <h2>This week</h2>
+  {% if order %}
+  <p><strong>{{ order.summary }}</strong></p>
+  <p class="muted">{{ order.state }}</p>
+  {% if order.explanation %}<p>{{ order.explanation }}</p>{% endif %}
+  {% else %}
+  <p class="muted">No order yet this week.</p>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>Spending</h2>
+  {% if spending.budget %}
+  <p>{{ spending.spent }} of {{ spending.budget }} this week</p>
+  {% else %}
+  <p>{{ spending.spent }} this week</p>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>Take turns</h2>
+  {% if take_turns.can_switch %}
+  <form method="post" action="/me/household/take-turns">
+    {{ csrf_field(take_turns.csrf) }}
+    <label class="switch">
+      <input type="checkbox" name="on" value="1"{% if take_turns.on %} checked{% endif %} onchange="this.form.submit()">
+      Take turns choosing dinner
+    </label>
+    <noscript><button type="submit">Save</button></noscript>
+  </form>
+  {% else %}
+  <label class="switch">
+    <input type="checkbox" disabled{% if take_turns.on %} checked{% endif %}>
+    Take turns choosing dinner
+  </label>
+  <p class="muted">Only the approver can change this.</p>
+  {% endif %}
+  <p>{% if take_turns.on %}Take turns is on.{% else %}Take turns is off.{% endif %}</p>
+</section>
+
+<section class="card">
+  <h2>Recent meals</h2>
+  {% if meals %}
+  <ul class="rows">
+    {% for meal in meals %}
+    <li>
+      <div class="row">
+        <div>
+          <strong>{{ meal.title }}</strong>
+          <div class="muted">{{ meal.delivered }}{% if meal.totals %} · 👍 {{ meal.totals.up }} · 👎 {{ meal.totals.down }}{% endif %}</div>
+        </div>
+        <form class="inline" method="post" action="/me/meals/{{ meal.order_id }}/reaction">
+          {{ csrf_field(meal.csrf) }}
+          <button type="submit" name="value" value="1" aria-label="Liked it" aria-pressed="{{ 'true' if meal.mine == 1 else 'false' }}">👍</button>
+          <button type="submit" name="value" value="-1" aria-label="Didn't like it" aria-pressed="{{ 'true' if meal.mine == -1 else 'false' }}">👎</button>
+        </form>
+      </div>
+    </li>
+    {% endfor %}
+  </ul>
+  {% if meals and not meals[0].totals %}<p class="muted">Totals show in households with 3 or more adults.</p>{% endif %}
+  {% else %}
+  <p class="muted">No delivered meals yet.</p>
+  {% endif %}
+</section>
+{% endblock %}

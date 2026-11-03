@@ -1,0 +1,58 @@
+{#- /me/history (identity-authz I24, with spending from experience.md §8).
+
+Context, besides base.html's:
+  spending   [{week, total, orders}]   per week; orders: [{at, amount, label}] (an admin sees
+             every order; others the orders they started), may be empty
+  approvals  [{at, amount, status}]
+  events     [{at, text}]              audit rows, as text built by code -#}
+{% extends "base.html" %}
+{% block title %}History{% endblock %}
+{% block content %}
+<section class="card">
+  <h2>Spending</h2>
+  {% if spending %}
+  <ul class="rows">
+    {% for week in spending %}
+    <li>
+      <div class="row"><strong>{{ week.week }}</strong><span>{{ week.total }}</span></div>
+      {% if week.orders %}
+      <ul class="rows">
+        {% for order in week.orders %}
+        <li class="row"><span class="muted">{{ order.at }} · {{ order.label }}</span><span>{{ order.amount }}</span></li>
+        {% endfor %}
+      </ul>
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="muted">No spending yet.</p>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>Approvals</h2>
+  {% if approvals %}
+  <ul class="rows">
+    {% for a in approvals %}
+    <li class="row"><span>{{ a.at }} · {{ a.amount }}</span><span class="muted">{{ a.status }}</span></li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="muted">No approvals yet.</p>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>Activity</h2>
+  {% if events %}
+  <ul class="rows">
+    {% for e in events %}
+    <li><span class="muted">{{ e.at }}</span> {{ e.text }}</li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="muted">Nothing yet.</p>
+  {% endif %}
+</section>
+{% endblock %}
