@@ -13,16 +13,24 @@ from services.agents import sweeper
 from services.api.ingest import (
     API_AGENT,
     APPROVAL_EXPIRED,
+    ME_LINK,
     MEDIA_NOT_SUPPORTED,
     NOT_APPROVER,
+    REMINDERS_OFF,
+    REMINDERS_ON,
     TAKE_TURNS_SAVED,
     Content,
     ingest,
 )
+from services.api.whatsapp import sender
 from services.common import db, ids, runs
+from services.common.config import Settings
+from services.common.consumer import Inbound
 from services.common.mcp_client import ToolRefused
+from services.common.protocol.a2a import AgentMessageRow
+from services.common.protocol.schemas import WhatsAppOut
 from services.common.run_context import RunContext
-from services.identity import fga
+from services.identity import fga, links
 from services.mcp.household import server as household
 from services.mcp.meta import CallContext
 from services.safety.guard import GuardRefused
@@ -698,3 +706,216 @@ def test_last_inbound_set_for_button_taps(world: str) -> None:
     assert _last_inbound(world, w.MEMBER_PHONE) == _received_at(world, "wamid.tap")
     assert _ingest(world, "wamid.sf", Content("button", button="sf:not-a-uuid:1:drop")) is None
     assert _last_inbound(world, w.MEMBER_PHONE) == _received_at(world, "wamid.sf")
+
+
+# Text commands and page taps (experience §7, §10; EX-I34) -------------------------------
+
+
+def _patch_links(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = Settings.from_env(
+        {
+            "SERVICE_NAME": "migrate",
+            "DATABASE_URL": "x",
+            "LOG_LEVEL": "info",
+            "OPENFGA_PRESHARED_KEY": "x",
+            "OPENFGA_API_URL": "x",
+        }
+    )
+    monkeypatch.setattr(links, "get_settings", lambda: settings)
+
+
+def _code_run_reply(pg: str, run_id: uuid.UUID, inbound: str) -> dict:
+    """The one `whatsapp_out` of a code-only run, after checking the run (experience §3)."""
+    run = _run_row(pg, run_id)
+    assert (run["kind"], run["household_id"], run["status"]) == ("chat", None, "completed")
+    assert run["trigger"] == {
+        "source": "code",
+        "user_id": str(w.MEMBER),
+        "inbound_id": str(ids.inbound_id(CHANNEL, inbound)),
+    }
+    [msg] = _messages(pg, run_id)
+    assert msg["message_id"] == ids.message_id(ids.inbound_id(CHANNEL, inbound), 0)
+    assert (msg["from_agent"], msg["to_agent"], msg["type"]) == (
+        API_AGENT,
+        w.WHATSAPP,
+        "whatsapp_out",
+    )
+    assert msg["body"]["user_id"] == str(w.MEMBER)
+    return msg
+
+
+def _send(pg: str, msg: dict) -> dict:
+    """Send one `whatsapp_out` through the sim sender; return its `sim_outbound` body."""
+    row = AgentMessageRow(
+        message_id=msg["message_id"],
+        run_id=msg["run_id"],
+        conversation_id=None,
+        causation_id=None,
+        from_agent=msg["from_agent"],
+        to_agent=msg["to_agent"],
+        type=msg["type"],
+        body=msg["body"],
+    )
+    inbound = Inbound(row=row, attempts=1, body=WhatsAppOut.model_validate(msg["body"]))
+    asyncio.run(sender.Sender(w.connect_to(pg))(inbound))
+    [out] = w.query(pg, "SELECT body FROM sim_outbound WHERE run_id = %s", msg["run_id"])
+    return out["body"]
+
+
+def _link_rows(pg: str) -> list[dict]:
+    return w.query(
+        pg, "SELECT purpose, target_user_id, sent_to_user_id, agent_ids FROM consent_links"
+    )
+
+
+def _me_link(next_page: str | None) -> dict:
+    link: dict = {"household_id": w.HOUSEHOLD_ID, "agent_ids": [], "purpose": "me"}
+    if next_page is not None:
+        link["next"] = next_page
+    return link
+
+
+@pytest.mark.parametrize(
+    ("text", "next_page"), [("my page", None), (" My Page ", None), ("MY AGENTS", "agents")]
+)
+def test_my_page_sends_link(
+    world: str, monkeypatch: pytest.MonkeyPatch, text: str, next_page: str | None
+) -> None:
+    _patch_links(monkeypatch)
+    run_id = _ingest(world, "wamid.page", Content("text", text=text))
+    assert run_id is not None
+    msg = _code_run_reply(world, run_id, "wamid.page")
+    assert msg["body"]["template"] == ME_LINK
+    assert msg["body"]["link"] == _me_link(next_page)
+    # No token is stored in the message (identity-authz I-G8): the sender issues it.
+    assert _link_rows(world) == []
+    sent = _send(world, msg)["graph"]["text"]["body"]
+    assert sent.startswith("Here's your page. The link works for 10 minutes: https://")
+    assert "/me/l/" in sent
+    assert ("?next=" in sent) == (next_page is not None)
+    assert _link_rows(world) == [
+        {
+            "purpose": "me",
+            "target_user_id": w.MEMBER,
+            "sent_to_user_id": w.MEMBER,
+            "agent_ids": [],
+        }
+    ]
+
+
+def test_my_household_sends_link(world: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_links(monkeypatch)
+    run_id = _ingest(world, "wamid.hh", Content("text", text="my household"))
+    assert run_id is not None
+    msg = _code_run_reply(world, run_id, "wamid.hh")
+    assert msg["body"]["template"] == ME_LINK
+    assert msg["body"]["link"] == _me_link("household")
+    assert _send(world, msg)["graph"]["text"]["body"].endswith("?next=household")
+    # Not a command: a longer text goes to the consumer agent as before.
+    other = _ingest(world, "wamid.hh2", Content("text", text="my household is hungry"))
+    assert other is not None
+    assert _run_row(world, other)["household_id"] == w.HOUSEHOLD_ID
+    [user_msg] = _messages(world, other)
+    assert user_msg["type"] == "user_message"
+
+
+def _reminders_off_at(pg: str, user_id: uuid.UUID = w.MEMBER) -> Any:
+    [row] = w.query(
+        pg, "SELECT reminders_off_at FROM channel_identities WHERE user_id = %s", user_id
+    )
+    return row["reminders_off_at"]
+
+
+def test_reminders_off_on(world: str) -> None:
+    assert _reminders_off_at(world) is None
+    off = _ingest(world, "wamid.off", Content("text", text="Reminders off"))
+    assert off is not None
+    msg = _code_run_reply(world, off, "wamid.off")
+    assert msg["body"] == {
+        "user_id": str(w.MEMBER),
+        "template": REMINDERS_OFF,
+        "params": {},
+        "buttons": [],
+    }
+    first = _reminders_off_at(world)
+    assert first is not None
+
+    # The "Stop these" tap does the same and keeps the first opt-out time.
+    tap = _ingest(world, "wamid.rs", Content("button", button=ids.REMINDER_STOP))
+    assert tap is not None
+    assert _code_run_reply(world, tap, "wamid.rs")["body"]["template"] == REMINDERS_OFF
+    assert _reminders_off_at(world) == first
+
+    on = _ingest(world, "wamid.on", Content("text", text="reminders on"))
+    assert on is not None
+    assert _code_run_reply(world, on, "wamid.on")["body"]["template"] == REMINDERS_ON
+    assert _reminders_off_at(world) is None
+    # Only the person who wrote is changed.
+    assert _reminders_off_at(world, w.ADMIN) is None
+    # A code-only run is never the retry target (experience EX-A16).
+    assert w.run(world, lambda conn: runs.retry_target(conn, w.MEMBER)) is None
+
+
+@pytest.mark.parametrize("page", ["household", "pantry"])
+def test_page_button_sends_link(world: str, monkeypatch: pytest.MonkeyPatch, page: str) -> None:
+    _patch_links(monkeypatch)
+    external_id = f"wamid.me.{page}"
+    run_id = _ingest(world, external_id, Content("button", button=ids.page_button(page)))
+    assert run_id is not None
+    msg = _code_run_reply(world, run_id, external_id)
+    assert msg["body"]["template"] == ME_LINK
+    assert msg["body"]["link"] == _me_link(page)
+    assert _send(world, msg)["graph"]["text"]["body"].endswith(f"?next={page}")
+    [link] = _link_rows(world)
+    assert link["purpose"] == "me"
+    [inbound] = w.query(world, "SELECT run_id FROM inbound_messages")
+    assert inbound["run_id"] == run_id
+
+
+@pytest.mark.parametrize("payload", ["me:", "me:agents", "me:renew:x", "rs:start", "rs:"])
+def test_malformed_page_or_stop_button_ignored(world: str, payload: str) -> None:
+    assert _ingest(world, "wamid.bad", Content("button", button=payload)) is None
+    assert w.query(world, "SELECT * FROM runs") == []
+    assert _reminders_off_at(world) is None
+
+
+@pytest.mark.parametrize(
+    ("phone", "user_id", "agent_ids"),
+    [
+        (w.MEMBER_PHONE, w.MEMBER, [w.MEMBER_CONSUMER]),
+        (w.ADMIN_PHONE, w.ADMIN, [w.ADMIN_CONSUMER, HOUSEHOLD_AGENT]),
+    ],
+)
+def test_renew_button_sends_consent_link(
+    world: str,
+    monkeypatch: pytest.MonkeyPatch,
+    phone: str,
+    user_id: uuid.UUID,
+    agent_ids: list[str],
+) -> None:
+    _patch_links(monkeypatch)
+    run_id = _ingest(world, "wamid.renew", Content("button", button="me:renew"), phone=phone)
+    assert run_id is not None
+    run = _run_row(world, run_id)
+    assert (run["household_id"], run["status"], run["trigger"]["source"]) == (
+        None,
+        "completed",
+        "code",
+    )
+    [msg] = _messages(world, run_id)
+    assert msg["body"]["user_id"] == str(user_id)
+    assert msg["body"]["template"] == ME_LINK
+    assert msg["body"]["link"] == {
+        "household_id": w.HOUSEHOLD_ID,
+        "agent_ids": agent_ids,
+        "purpose": "consent",
+    }
+    assert "?next=" not in _send(world, msg)["graph"]["text"]["body"]
+    assert _link_rows(world) == [
+        {
+            "purpose": "consent",
+            "target_user_id": user_id,
+            "sent_to_user_id": user_id,
+            "agent_ids": agent_ids,
+        }
+    ]

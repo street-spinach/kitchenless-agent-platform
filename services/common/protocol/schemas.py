@@ -305,10 +305,13 @@ class Ref(_Part):
 class LinkRequest(_Part):
     """A consent link for the message's person, issued by the sender at send time and
     passed to the text as `{link}`, so the link token is never stored in a message
-    (identity-authz §6, I26; I-G8)."""
+    (identity-authz §6, I26; I-G8). `purpose` and `next` (experience §7, EX-I34) are
+    additive with defaults: a `me` link to the /me pages, opening `next` after sign-in."""
 
     household_id: str
     agent_ids: list[str]
+    purpose: Literal["consent", "me"] = "consent"
+    next: Literal["household", "pantry", "history", "agents"] | None = None
 
 
 class WhatsAppOut(_Body):
