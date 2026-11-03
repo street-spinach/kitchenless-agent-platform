@@ -1,0 +1,9 @@
+# The labelled sample served by `GET /app/insights` when INSIGHTS_SAMPLE=1 (experience.md §11,
+# EX-CUJ 10). The response always says `sample: true`, and the app shows "Sample data".
+cells:
+  - metric: busiest_hour
+    value: "Thursday 18:00–19:00"
+  - metric: top_constraint
+    value: nut-free
+  - metric: quotes_won
+    value: "7 of 12"

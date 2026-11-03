@@ -5,7 +5,9 @@
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import psycopg
 import pytest
@@ -14,6 +16,7 @@ from starlette.testclient import TestClient
 
 from services.api import main as api
 from services.api import owner_views
+from services.api.routes import app as app_routes
 from services.common import ids
 from services.identity import claims as c
 from services.identity import fga, token_source
@@ -426,3 +429,170 @@ def test_notice_kinds_closed(world: str, market: dict[str, Any]) -> None:
     assert [n["kind"] for n in _get(world, "/app/notices?limit=1").json()["notices"]] == [
         notices[0]["kind"]
     ]
+
+
+# --- insights and connection (experience.md §11, EX-I48) -------------------------------------
+
+TZ = ZoneInfo("America/New_York")  # `identity_world.add_household`'s timezone
+
+
+@pytest.fixture
+def live_insights(monkeypatch: pytest.MonkeyPatch) -> None:
+    """INSIGHTS_SAMPLE off (the default)."""
+    monkeypatch.setattr(app_routes, "get_settings", lambda: SimpleNamespace(insights_sample=False))
+
+
+def _week_start(now: datetime) -> datetime:
+    return owner_views.iso_week(now)[1]
+
+
+def _buy(
+    pg: str,
+    n: int,
+    *,
+    at: datetime,
+    prefix: str,
+    env: str = "live",
+    status: str = "accepted",
+    constraints: dict[str, Any] | None = None,
+    seller: str = RESTAURANT,
+) -> None:
+    """`n` households each with one order from `seller` delivered at `at` and one quote
+    created at `at`."""
+    with psycopg.connect(pg) as conn:
+        for i in range(n):
+            world = iw.add_world(conn, f"{prefix}-{i}", env=env)
+            order = _order(conn, world.household_id, seller, "delivered", at)
+            conn.execute(
+                "UPDATE orders SET delivery_window = tstzrange(%s, %s) WHERE order_id = %s",
+                (at, at + timedelta(hours=1), order[0]),
+            )
+            _quote(conn, order, seller, world.household_agent, status, at=at, expires=at)
+            conn.execute(
+                "UPDATE quotes SET constraints = %s WHERE order_id = %s",
+                (Jsonb(constraints or {"allergens": ["tree_nuts"], "diets": []}), order[0]),
+            )
+
+
+def _cells(resp: Any) -> dict[str, dict[str, Any]]:
+    assert resp.status_code == 200, resp.text
+    return {c["metric"]: c for c in resp.json()["cells"]}
+
+
+def _this_week_hour(now: datetime) -> datetime:
+    """A delivery time inside this ISO week, on the hour, no later than now."""
+    return max(_week_start(now), now - timedelta(hours=1)).replace(
+        minute=0, second=0, microsecond=0
+    )
+
+
+@db
+def test_insights_suppressed_below_k(world: str, live_insights: None) -> None:
+    """XG14, EX-CUJ 10: a cell covering fewer than 5 households is hidden; eval households
+    never count."""
+    now = datetime.now(UTC)
+    at = _this_week_hour(now)
+    _buy(world, 4, at=at, prefix="h-live")
+    _buy(world, 3, at=at, prefix="h-eval", env="eval")
+    cells = _cells(_get(world, "/app/insights"))
+    assert set(cells) == {"busiest_hour", "top_constraint", "quotes_won"}
+    assert all(c == {"metric": m, "hidden": True} for m, c in cells.items())
+
+    _buy(world, 1, at=at, prefix="h-fifth", constraints={"allergens": [], "diets": ["vegan"]})
+    body = _get(world, "/app/insights").json()
+    assert body["sample"] is False and body["week"] == owner_views.iso_week(now)[0]
+    cells = _cells(_get(world, "/app/insights"))
+    local = at.astimezone(TZ)
+    assert cells["busiest_hour"] == {
+        "metric": "busiest_hour",
+        "label": "Busiest",
+        "value": f"{local:%A} {local.hour:02d}:00–{(local.hour + 1) % 24:02d}:00",
+    }
+    # tree_nuts covers only 4 households (the fifth asked for vegan): still hidden.
+    assert cells["top_constraint"] == {"metric": "top_constraint", "hidden": True}
+    assert cells["quotes_won"] == {"metric": "quotes_won", "label": "Quotes won", "value": "5 of 5"}
+
+    _buy(world, 1, at=at, prefix="h-sixth", status="rejected")
+    cells = _cells(_get(world, "/app/insights"))
+    assert cells["top_constraint"]["value"] == "no tree nuts"
+    assert cells["quotes_won"]["value"] == "5 of 6"
+    # Another org's owner sees nothing of this; the other org has no rows, so all hidden.
+    assert _get(world, "/app/insights", token_org=OTHER_ORG).status_code == 403
+
+
+@db
+def test_insights_weekly_only(world: str, owner_fga: FakeFga, live_insights: None) -> None:
+    """Only this ISO week counts, and there are no cumulative totals."""
+    now = datetime.now(UTC)
+    last_week = _week_start(now) - timedelta(days=1)
+    _buy(world, 6, at=last_week, prefix="h-last")
+    cells = _cells(_get(world, "/app/insights"))
+    assert all(c.get("hidden") for c in cells.values())
+
+    _buy(world, 5, at=_this_week_hour(now), prefix="h-now", status="rejected")
+    body = _get(world, "/app/insights").json()
+    assert set(body) == {"week", "sample", "cells"}
+    cells = _cells(_get(world, "/app/insights"))
+    assert cells["quotes_won"]["value"] == "0 of 5"
+    assert len(body["cells"]) == 3
+
+    # The other org's rows never count for this org.
+    owner_fga.tuples.add((f"user:{_owner_sub(OTHER_ORG)}", "owner", f"org:{OTHER_ORG}"))
+    _buy(world, 5, at=_this_week_hour(now), prefix="h-other", seller=OTHER_RESTAURANT)
+    assert _cells(_get(world, "/app/insights"))["quotes_won"]["value"] == "0 of 5"
+    theirs = _cells(_get(world, "/app/insights", org_id=OTHER_ORG, token_org=OTHER_ORG))
+    assert theirs["quotes_won"]["value"] == "5 of 5"
+
+
+@db
+def test_sample_mode_labelled(world: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """With INSIGHTS_SAMPLE=1 the fixed sample is served, always marked `sample: true`, and
+    still only to the org's owner."""
+    monkeypatch.setattr(app_routes, "get_settings", lambda: SimpleNamespace(insights_sample=True))
+    resp = _get(world, "/app/insights")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["sample"] is True
+    assert body["week"] == owner_views.iso_week(datetime.now(UTC))[0]
+    assert body["cells"] == [
+        {"metric": "busiest_hour", "label": "Busiest", "value": "Thursday 18:00–19:00"},
+        {"metric": "top_constraint", "label": "Most asked", "value": "nut-free"},
+        {"metric": "quotes_won", "label": "Quotes won", "value": "7 of 12"},
+    ]
+    assert _get(world, "/app/insights", token_org=OTHER_ORG).status_code == 403
+    monkeypatch.setattr(app_routes, "get_settings", lambda: SimpleNamespace(insights_sample=False))
+    assert _get(world, "/app/insights").json()["sample"] is False
+
+
+@db
+def test_connection(world: str, owner_fga: FakeFga, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`{vendor, mode, set_at}`: the org's vendor key, its resolved mode, and the panel
+    override's time (null without one). No probe is made."""
+    aw.patch_settings(monkeypatch)  # MODE=mock, no MODE_FORCE_MOCK
+    with psycopg.connect(world) as conn:
+        conn.execute("UPDATE agent_cards SET vendor = 'square' WHERE agent_id = %s", (RESTAURANT,))
+        conn.execute(
+            "UPDATE agent_cards SET vendor = 'mock' WHERE agent_id = %s", (OTHER_RESTAURANT,)
+        )
+    assert _get(world, "/app/connection").json() == {
+        "vendor": "square_restaurant",
+        "mode": "mock",
+        "set_at": None,
+    }
+    set_at = datetime(2026, 11, 3, 9, 30, tzinfo=UTC)
+    with psycopg.connect(world) as conn:
+        conn.execute(
+            "INSERT INTO adapter_modes (vendor, mode, set_by, set_at)"
+            " VALUES ('square_restaurant', 'real', 'panel', %s)",
+            (set_at,),
+        )
+    body = _get(world, "/app/connection").json()
+    assert body["vendor"] == "square_restaurant"
+    assert body["mode"] == "real"
+    assert datetime.fromisoformat(body["set_at"]) == set_at
+    # A mock store is always mock, whatever the overrides say.
+    owner_fga.tuples.add((f"user:{_owner_sub(OTHER_ORG)}", "owner", f"org:{OTHER_ORG}"))
+    other = _get(world, "/app/connection", org_id=OTHER_ORG, token_org=OTHER_ORG).json()
+    assert other == {"vendor": "mock", "mode": "mock", "set_at": None}
+    # Owners of another org are refused.
+    assert _get(world, "/app/connection", token_org=OTHER_ORG).status_code == 403

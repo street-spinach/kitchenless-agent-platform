@@ -12,22 +12,36 @@ person or address.
 *   `summary(conn, org)`: today's (UTC) quotes, quotes won (`accepted`) and orders.
 *   `notices(conn, org, limit)`: one fixed sentence per kind in `NOTICE_TEXT`, newest
     first.
+*   `insights(conn, org, now)`: this ISO week's busiest delivery hour, most-asked
+    constraint code and quotes won, from live households only (`env = 'live'`). A cell
+    covering fewer than `INSIGHTS_MIN_HOUSEHOLDS` distinct households is hidden. Text is
+    built by code. `sample_insights(now)` is the fixed, labelled sample.
+*   `connection(conn, org)`: the org's vendor key, its resolved mode and the panel
+    override's `set_at`. No health probe is made.
 """
 
+from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
+import yaml
 from psycopg import AsyncConnection
 
 from services.agents.common.model import check_rationale
-from services.common import ids
+from services.common import directory, ids, modes, vendors
+from services.common.protocol.schemas import AllergenCode, DietCode
 from services.safety import scope
 
 __all__ = [
+    "INSIGHTS_MIN_HOUSEHOLDS",
     "LIVE_QUOTE_STATUSES",
     "MAX_ROWS",
     "NOTICE_TEXT",
+    "connection",
+    "insights",
     "notices",
     "orders",
+    "sample_insights",
     "summary",
 ]
 
@@ -161,3 +175,156 @@ async def notices(conn: AsyncConnection, org: scope.OrgScope, limit: int) -> lis
     q = scope.org_scoped(conn, org)
     rows = await q.fetch(_NOTICES_SQL, limit=limit)
     return [{"kind": kind, "text": NOTICE_TEXT[kind], "at": at.isoformat()} for kind, at in rows]
+
+
+# --- insights (EX-OD12) ------------------------------------------------------------------------
+
+INSIGHTS_MIN_HOUSEHOLDS = 5
+SAMPLE_FILE = Path(__file__).with_name("insights_sample.yaml")
+DAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+LABELS = {"busiest_hour": "Busiest", "top_constraint": "Most asked", "quotes_won": "Quotes won"}
+_ALLERGENS = sorted(a.value for a in AllergenCode)
+_DIETS = sorted(d.value for d in DietCode)
+
+_HOURS_SQL = """
+SELECT extract(isodow FROM lower(o.delivery_window) AT TIME ZONE h.timezone)::int AS dow,
+       extract(hour FROM lower(o.delivery_window) AT TIME ZONE h.timezone)::int AS hour,
+       count(*) AS n, count(DISTINCT o.household_id) AS households
+  FROM orders o
+  JOIN households h ON h.household_id = o.household_id
+ WHERE o.seller_agent_id IN (SELECT agent_id FROM agent_cards
+                              WHERE owner_ref = 'org:' || %(org)s)
+   AND h.env = 'live' AND o.delivery_window IS NOT NULL
+   AND lower(o.delivery_window) >= %(start)s AND lower(o.delivery_window) < %(end)s
+ GROUP BY 1, 2
+ ORDER BY n DESC, households DESC, dow, hour
+ LIMIT 1
+"""
+
+_TAGS_SQL = """
+SELECT tag.kind, tag.code, count(DISTINCT o.household_id) AS households
+  FROM quotes q
+  JOIN orders o ON o.order_id = q.order_id
+  JOIN households h ON h.household_id = o.household_id
+  CROSS JOIN LATERAL (
+    SELECT 'allergen' AS kind, a AS code
+      FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(q.constraints -> 'allergens')
+                                     = 'array' THEN q.constraints -> 'allergens'
+                                     ELSE '[]'::jsonb END) a
+     WHERE a = ANY(%(allergens)s)
+    UNION ALL
+    SELECT 'diet', d
+      FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(q.constraints -> 'diets')
+                                     = 'array' THEN q.constraints -> 'diets'
+                                     ELSE '[]'::jsonb END) d
+     WHERE d = ANY(%(diets)s)
+  ) tag
+ WHERE q.seller_agent_id IN (SELECT agent_id FROM agent_cards
+                              WHERE owner_ref = 'org:' || %(org)s)
+   AND h.env = 'live' AND q.created_at >= %(start)s AND q.created_at < %(end)s
+ GROUP BY 1, 2
+ ORDER BY households DESC, tag.kind, tag.code
+ LIMIT 1
+"""
+
+_WON_SQL = """
+SELECT count(*) FILTER (WHERE q.status = 'accepted') AS won, count(*) AS total,
+       count(DISTINCT o.household_id) AS households
+  FROM quotes q
+  JOIN orders o ON o.order_id = q.order_id
+  JOIN households h ON h.household_id = o.household_id
+ WHERE q.seller_agent_id IN (SELECT agent_id FROM agent_cards
+                              WHERE owner_ref = 'org:' || %(org)s)
+   AND h.env = 'live' AND q.created_at >= %(start)s AND q.created_at < %(end)s
+"""
+
+
+def iso_week(now: datetime) -> tuple[str, datetime, datetime]:
+    """The ISO week of `now` (UTC): its label and its [start, end) bounds."""
+    year, week, weekday = now.isocalendar()
+    start = (now - timedelta(days=weekday - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return f"{year}-W{week:02d}", start, start + timedelta(days=7)
+
+
+def _cell(metric: str, households: int, value: str) -> dict[str, Any]:
+    if households < INSIGHTS_MIN_HOUSEHOLDS:
+        return {"metric": metric, "hidden": True}
+    return {"metric": metric, "label": LABELS[metric], "value": value}
+
+
+def _hour_text(dow: int, hour: int) -> str:
+    return f"{DAYS[dow - 1]} {hour:02d}:00–{(hour + 1) % 24:02d}:00"
+
+
+def _tag_text(kind: str, code: str) -> str:
+    words = code.replace("_", " ")
+    return f"no {words}" if kind == "allergen" else words
+
+
+async def insights(conn: AsyncConnection, org: scope.OrgScope, now: datetime) -> dict[str, Any]:
+    week, start, end = iso_week(now)
+    q = scope.org_scoped(conn, org)
+    hours = await q.fetch(_HOURS_SQL, start=start, end=end)
+    tags = await q.fetch(_TAGS_SQL, start=start, end=end, allergens=_ALLERGENS, diets=_DIETS)
+    ((won, total, won_households),) = await q.fetch(_WON_SQL, start=start, end=end)
+    cells = [
+        _cell("busiest_hour", hours[0][3], _hour_text(hours[0][0], hours[0][1]))
+        if hours
+        else _cell("busiest_hour", 0, ""),
+        _cell("top_constraint", tags[0][2], _tag_text(tags[0][0], tags[0][1]))
+        if tags
+        else _cell("top_constraint", 0, ""),
+        _cell("quotes_won", int(won_households), f"{int(won)} of {int(total)}"),
+    ]
+    return {"week": week, "sample": False, "cells": cells}
+
+
+def sample_insights(now: datetime) -> dict[str, Any]:
+    """The fixed sample (`INSIGHTS_SAMPLE=1`), always marked `sample: true`."""
+    data = yaml.safe_load(SAMPLE_FILE.read_text())
+    cells = [
+        {"metric": c["metric"], "label": LABELS[c["metric"]], "value": str(c["value"])}
+        for c in data["cells"]
+    ]
+    return {"week": iso_week(now)[0], "sample": True, "cells": cells}
+
+
+# --- connection ----------------------------------------------------------------------------
+
+_CARDS_SQL = """
+SELECT agent_id FROM agent_cards WHERE owner_ref = 'org:' || %(org)s ORDER BY agent_id LIMIT 1
+"""
+
+_SET_AT_SQL = """
+SELECT set_at FROM adapter_modes
+ WHERE vendor = %(vendor)s
+   AND EXISTS (SELECT 1 FROM agent_cards WHERE owner_ref = 'org:' || %(org)s)
+"""
+
+_FIRST_TOOL = {"delivery": "quote_delivery"}
+
+
+async def connection(conn: AsyncConnection, org: scope.OrgScope) -> dict[str, Any] | None:
+    """`{vendor, mode, set_at}` for the org's card, or None when it has none. A `mock` card,
+    or a vendor with no key, is `mock` (fail closed: never shown as real)."""
+    q = scope.org_scoped(conn, org)
+    rows = await q.fetch(_CARDS_SQL)
+    if not rows:
+        return None
+    from services.mcp.meta import AdapterFailure  # lazily, as `vendors` does
+
+    card = await directory.card(conn, rows[0][0])
+    area = card.agent_class
+    try:
+        key = vendors.card_vendor_key(area, card, _FIRST_TOOL.get(area, "quote"))
+    except AdapterFailure:
+        key = None
+    if key is None:
+        return {"vendor": card.vendor or vendors.MOCK_VENDOR, "mode": "mock", "set_at": None}
+    mode = (await modes.resolve_modes(conn))[key]
+    set_at = await q.fetch(_SET_AT_SQL, vendor=key)
+    return {
+        "vendor": key,
+        "mode": mode,
+        "set_at": set_at[0][0].isoformat() if set_at else None,
+    }
