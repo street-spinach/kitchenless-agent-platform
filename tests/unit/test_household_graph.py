@@ -15,6 +15,7 @@ import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
 from services.agents import host
+from services.agents.common.model import check_rationale
 from services.agents.household import graph as hg
 from services.agents.household import stubs
 from services.common import ids, pantry
@@ -431,6 +432,26 @@ def test_runs_draft_to_delivered_with_the_stub_model() -> None:
     [summary] = done.messages
     assert (summary.type, summary.to_agent) == ("whatsapp_out", "channel:whatsapp")
     assert summary.body["user_id"] == STARTER
+
+
+def test_choose_offer_explanation_row_carries_facts() -> None:
+    # Evals E-A12: the explanation decision row has the sentence and its facts object, and the
+    # sentence passes `check_rationale` against those facts (evals §12 case 10).
+    w = World()
+    w.to_quoting()
+    w.offer("grocery:mock-us", 2400)
+    w.offer("grocery:square-us", 2100)
+    w.round_closed()
+    [row] = [
+        r
+        for r in w.traces.of("decision")
+        if r["node"] == "choose_offer"
+        and r["choice"] in ("explanation_model", "explanation_template")
+    ]
+    facts = row["facts"]
+    assert isinstance(facts, dict) and facts["items_covered"] >= 1
+    assert facts["seller"] in row["explanation"]
+    assert check_rationale(row["explanation"], [facts]) == row["explanation"]
 
 
 def test_over_budget_counters_once_then_asks_approval() -> None:
