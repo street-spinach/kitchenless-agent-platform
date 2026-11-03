@@ -41,7 +41,11 @@ def test_csp_header(dist: Path) -> None:
     client = _client()
     for path in ("/owner/", "/owner/auth", "/owner/_expo/static/js/app.js"):
         assert client.get(path).headers["content-security-policy"] == owner_static.CSP
-    assert owner_static.CSP == "default-src 'self'; connect-src 'self'"
+    assert owner_static.CSP == (
+        "default-src 'self'; connect-src 'self'; style-src 'self' 'unsafe-inline'"
+    )
+    # Scripts are never inline or from elsewhere: no script-src widens default-src.
+    assert "script-src" not in owner_static.CSP
 
 
 def test_path_outside_dist_is_not_served(dist: Path) -> None:
