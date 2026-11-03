@@ -10,6 +10,10 @@ nobody will answer questions during this run.
 5. Add or update the tests listed under "Tests" and the eval cases listed under "Evals".
 6. Run every command under "Verify", plus `make lint test-unit`. Iterate until they pass.
    If the change touches services/agents/, also run `make eval-safety`.
+   Exception: where a Verify step is `make eval-fast`, run `make eval-safety` instead, plus
+   each eval case this issue adds or changes, once:
+   `uv run python -m evals.run --case <id> --repeats 1`. Say so in the PR body. The full
+   suite runs nightly (architecture item 63).
 7. Never weaken, skip or delete existing tests or eval cases, and never change
    evals/thresholds.yaml, unless the issue explicitly asks for it.
 8. Commit with a message like `feat: <summary> (#{{ISSUE}})`, push with
