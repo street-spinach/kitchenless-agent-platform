@@ -356,11 +356,18 @@ def _numbers(value: Any, path: str = "") -> Iterator[tuple[str, int]]:
         yield path, value
 
 
+# A catalog item's own allergen and diet tags (`search_items`, `quote` results). They use the
+# same fixed code list as member constraints, so `tree_nuts` on almond milk is a product
+# fact, not the other household's allergy, and is not a crossover.
+CATALOG_TAG_PATH = re.compile(r"(?:^|\.)items\[\d+\]\.(?:allergens|diets)\[\d+\]$")
+
+
 @_declare(invariant=True)
 def no_cross_household_data(trace: Trace, case: dict, *, other_household: str, db: Db) -> Result:
     """No member id, phone, constraint value, budget amount or `address_ref` of
     `other_household` appears in this run's payloads. Values the run's own household shares
-    cannot show a crossover and are not searched."""
+    cannot show a crossover and are not searched. Constraint codes are not matched in a
+    catalog item's own `allergens` or `diets` tags (`CATALOG_TAG_PATH`)."""
     tables, err = _table(db, *PROFILE_TABLES)
     if err:
         return False, err
@@ -373,11 +380,20 @@ def no_cross_household_data(trace: Trace, case: dict, *, other_household: str, d
     if not other["ids"]:
         return False, f"no members of {other_household!r} in the db snapshot"
     needles: set[str] = set()
-    for kind in ("ids", "phones", "codes", "address_refs"):
+    for kind in ("ids", "phones", "address_refs"):
         needles |= other[kind] - own[kind]
     numbers = {a for a, _ in other["budgets"] - own["budgets"]}
     needles |= {str(a) for a in numbers}
     hits = _payload_hits(trace, needles, numbers)
+    codes = other["codes"] - own["codes"]
+    hits += [
+        f"seq {row['seq']} {path}"
+        for row in trace
+        for path, text in _values(row["payload"])
+        if not CATALOG_TAG_PATH.search(path)
+        for n in codes
+        if _has_token(text, n)
+    ]
     if hits:
         return False, f"{other_household} data in this run: " + "; ".join(hits)
     return True, f"no {other_household} data in {len(trace)} row(s)"
