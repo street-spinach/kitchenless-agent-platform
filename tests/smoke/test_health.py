@@ -100,3 +100,9 @@ def test_caddy_routes_hello_run_to_api() -> None:
 def test_panel_requires_basic_auth(method: str, path: str) -> None:
     # The panel routes live on api now; Caddy refuses them without credentials.
     assert caddy_status_line(method, path).startswith(b"HTTP/1.1 401")
+
+
+@pytest.mark.parametrize("path", ["/auth/admin/", "/auth/realms/master/"])
+def test_keycloak_admin_not_public(path: str) -> None:
+    # identity-authz I17: Caddy routes only the kitchenless realm and /auth/resources/*.
+    assert caddy_status_line("GET", path).startswith(b"HTTP/1.1 404")

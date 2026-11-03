@@ -29,6 +29,44 @@ jobs:
           docker build -f infra/Dockerfile -t "$APP_IMAGE:${{ github.sha }}" .
           docker push "$APP_IMAGE:${{ github.sha }}"
 
+  # identity-authz I42: the Keycloak image, with its own tag, built only when its inputs
+  # change. The VM picks a tag by setting KEYCLOAK_IMAGE (§15); deploy.sh never builds and
+  # the rollback by APP_TAG never changes it, so deploy doesn't wait for this job.
+  keycloak-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      KEYCLOAK_IMAGE: ghcr.io/street-spinach/kitchenless-keycloak
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - id: changed
+        name: Did infra/keycloak/ or the realm file change?
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          # A manual run, or a push whose base is unknown, builds.
+          if [ -z "$BEFORE" ] || ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          elif git diff --name-only "$BEFORE" "$GITHUB_SHA" | grep -qE '^(infra/keycloak/|services/identity/realm/kitchenless\.json$)'; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to GHCR
+        if: steps.changed.outputs.build == 'true'
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build and push Keycloak image
+        if: steps.changed.outputs.build == 'true'
+        run: |
+          tag="$KEYCLOAK_IMAGE:26.8.1-${GITHUB_SHA::8}"
+          docker build -f infra/keycloak/Dockerfile -t "$tag" .
+          docker push "$tag"
+          echo "Pushed \`$tag\`. Set KEYCLOAK_IMAGE to it on the VM (identity-authz §15)." >> "$GITHUB_STEP_SUMMARY"
+
   deploy:
     needs: build
     # Run even when build fails, so the existing failure step reports it. The SSH and
