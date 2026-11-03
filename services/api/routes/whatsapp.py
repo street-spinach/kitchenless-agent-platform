@@ -4,8 +4,9 @@
     `hub.verify_token` equal to `WHATSAPP_VERIFY_TOKEN` echoes `hub.challenge`; anything
     else gets 403.
 *   `POST /webhooks/whatsapp`: verifies `X-Hub-Signature-256` with `WHATSAPP_APP_SECRET`
-    (401 on failure, before the body is parsed), then `ingest`s each message. Status
-    callbacks are ignored. `ingest` only writes rows, so the webhook acknowledges at once.
+    (401 on failure, before the body is parsed), then `ingest`s each message and passes
+    each `value.statuses[]` list to `status.record` (experience §5, EX-I16). Both only
+    write rows, so the webhook acknowledges at once.
 
 WhatsApp sends the sender's number as digits without `+`; it becomes E.164 by adding `+`.
 """
@@ -22,7 +23,7 @@ from starlette.routing import Route
 
 from services.api.ingest import Content, ingest
 from services.api.routes.internal import SIM_CHANNEL
-from services.api.whatsapp import signature
+from services.api.whatsapp import signature, status
 from services.common.config import get_settings
 
 __all__ = ["CHANNEL", "MEDIA_TYPES", "SIGNATURE_HEADER", "content_of", "routes"]
@@ -58,8 +59,8 @@ def content_of(message: dict[str, Any]) -> Content | None:
     return None
 
 
-def _messages(payload: object) -> Iterator[dict[str, Any]]:
-    """Every message in a webhook payload. Statuses and malformed parts are skipped."""
+def _values(payload: object) -> Iterator[dict[str, Any]]:
+    """Every `entry[].changes[].value` in a webhook payload. Malformed parts are skipped."""
     if not isinstance(payload, dict):
         return
     for entry in payload.get("entry") or []:
@@ -67,11 +68,26 @@ def _messages(payload: object) -> Iterator[dict[str, Any]]:
             continue
         for change in entry.get("changes") or []:
             value = change.get("value") if isinstance(change, dict) else None
-            if not isinstance(value, dict):
-                continue
-            for message in value.get("messages") or []:
-                if isinstance(message, dict):
-                    yield message
+            if isinstance(value, dict):
+                yield value
+
+
+def _messages(payload: object) -> Iterator[dict[str, Any]]:
+    """Every message in a webhook payload. Malformed parts are skipped."""
+    for value in _values(payload):
+        for message in value.get("messages") or []:
+            if isinstance(message, dict):
+                yield message
+
+
+def _statuses(payload: object) -> list[object]:
+    """Every `value.statuses[]` entry in a webhook payload."""
+    found: list[object] = []
+    for value in _values(payload):
+        statuses = value.get("statuses")
+        if isinstance(statuses, list):
+            found.extend(statuses)
+    return found
 
 
 async def verify_challenge(request: Request) -> Response:
@@ -108,6 +124,7 @@ async def receive(request: Request) -> JSONResponse:
                 continue
             phone = sender if sender.startswith("+") else "+" + sender
             await ingest(conn, CHANNEL, external_id, phone, content)
+        await status.record(conn, _statuses(payload))
     return JSONResponse({"status": "ok"})
 
 
