@@ -5,8 +5,10 @@ Run with `python -m services.agents.host`. At startup it loads the enabled cards
 `consume_forever("agents", dispatch)`, `sweep_forever()` and `/health` on port 8003.
 
 *   `dispatch` routes each message by `to_agent` to the handler of that card's class. A
-    message for a card this host did not load, or for a class with no handler, raises
-    `NoHandler`: an ordinary step failure, retried and then poisoned.
+    message for a card this host has not loaded first reloads the hosted cards once, so
+    cards seeded after startup are picked up without a restart (#59). A card still not
+    loaded, or a class with no handler, raises `NoHandler`: an ordinary step failure,
+    retried and then poisoned.
 *   The consumer is given `finish_run=runs.finish`, so an exception after the last attempt
     finishes the run with `status=error`.
 *   `/health` reports Postgres reachability, the loaded card count and the message backlog
@@ -65,6 +67,7 @@ EXTERNAL = "external"
 BACKLOG_HOSTS = ("agents", "api")
 
 ClassHandler = Callable[[Inbound, AgentCard], Awaitable[StepResult]]
+CardLoader = Callable[[], Awaitable[Iterable[AgentCard]]]
 Backlog = dict[str, dict[str, Any]]
 
 # One handler per agent class (`handle(msg, card) -> StepResult`, architecture items 28-30).
@@ -94,13 +97,29 @@ class NoHandler(LookupError):
 
 
 class Dispatcher:
-    """Routes a claimed message by `to_agent` to its card's class handler."""
+    """Routes a claimed message by `to_agent` to its card's class handler.
 
-    def __init__(self, cards: Iterable[AgentCard], handlers: Mapping[str, ClassHandler]) -> None:
-        self.cards: dict[str, AgentCard] = {c.agent_id: c for c in cards}
+    `reload`, when given, re-reads the hosted cards; it runs once per message whose
+    `to_agent` is not among the loaded cards.
+    """
+
+    def __init__(
+        self,
+        cards: Iterable[AgentCard],
+        handlers: Mapping[str, ClassHandler],
+        reload: CardLoader | None = None,
+    ) -> None:
+        self._class_handlers = handlers
+        self._reload = reload
+        self.cards: dict[str, AgentCard] = {}
         self.handlers: dict[str, ClassHandler] = {}
+        self._load(cards)
+
+    def _load(self, cards: Iterable[AgentCard]) -> None:
+        self.cards = {c.agent_id: c for c in cards}
+        self.handlers = {}
         for card in self.cards.values():
-            handler = handlers.get(card.agent_class)
+            handler = self._class_handlers.get(card.agent_class)
             if handler is None:
                 log.warning("no handler for class %s (card %s)", card.agent_class, card.agent_id)
                 continue
@@ -108,6 +127,9 @@ class Dispatcher:
 
     async def __call__(self, msg: Inbound) -> StepResult:
         to_agent = msg.row.to_agent
+        if to_agent not in self.cards and self._reload is not None:
+            self._load(await self._reload())
+            log.info("reloaded %d cards for host %s", len(self.cards), HOST)
         handler = self.handlers.get(to_agent)
         if handler is None:
             raise NoHandler(f"no handler on host {HOST!r} for {to_agent!r}")
@@ -197,14 +219,18 @@ async def serve(handlers: Mapping[str, ClassHandler] = HANDLERS) -> None:
     pool = db.get_pool()
     await pool.open()
     try:
-        async with pool.connection() as conn:
-            cards = await directory.hosted(conn, HOST)
+
+        async def load_cards() -> list[AgentCard]:
+            async with pool.connection() as conn:
+                return await directory.hosted(conn, HOST)
+
+        cards = await load_cards()
         log.info("loaded %d cards for host %s", len(cards), HOST)
-        dispatch = Dispatcher(cards, handlers)
+        dispatch = Dispatcher(cards, handlers, reload=load_cards)
         server = uvicorn.Server(
             uvicorn.Config(
                 create_app(
-                    card_count=lambda: len(cards),
+                    card_count=lambda: len(dispatch.cards),
                     a2a_routes=A2AServer.from_settings(pool.connection).routes(),
                 ),
                 host="0.0.0.0",
