@@ -14,13 +14,18 @@ resulting message through the outbox and marks the timer `done`:
 Kinds the sweeper does not know are never claimed and stay `pending` (agent-protocol §4).
 A timer whose action raises is rolled back to its savepoint, stays `pending` and is tried
 again on the next sweep.
+
+After the timer pass, at most once every `reminders.REMINDER_SECONDS` (60 s), it runs the
+reminder pass (experience.md §10, EX-A2, EX-I42). `timers` is unchanged.
 """
 
 import asyncio
 import contextlib
 import logging
 import signal
+import time
 from collections.abc import Awaitable, Callable, Mapping
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
@@ -28,6 +33,7 @@ from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
+from services.agents import reminders
 from services.common import db, ids, orders, outbox, runs
 from services.safety.scope import unscoped
 
@@ -168,8 +174,14 @@ async def sweep_forever(
     pool: AsyncConnectionPool | None = None,
     stop: asyncio.Event | None = None,
     every: float = SWEEP_SECONDS,
+    reminder_every: float = reminders.REMINDER_SECONDS,
+    clock: Callable[[], float] = time.monotonic,
+    reminder_pass: Callable[[AsyncConnection, datetime], Awaitable[int]] | None = None,
 ) -> None:
-    """Run `sweep_once` every `every` seconds until SIGTERM (or `stop`)."""
+    """Run `sweep_once` every `every` seconds until SIGTERM (or `stop`), then the reminder
+    pass when `reminder_every` seconds have passed since the last one (EX-I42)."""
+    reminder_pass = reminder_pass or reminders.reminder_pass
+    last_reminders: float | None = None
     pool = pool or db.get_pool()
     stop = stop or asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -180,6 +192,9 @@ async def sweep_forever(
             async with pool.connection() as conn:
                 while await sweep_once(conn) == CLAIM_LIMIT and not stop.is_set():
                     pass
+                if last_reminders is None or clock() - last_reminders >= reminder_every:
+                    last_reminders = clock()
+                    await reminder_pass(conn, datetime.now(UTC))
         except Exception:
             log.exception("sweep failed")
         with contextlib.suppress(TimeoutError):

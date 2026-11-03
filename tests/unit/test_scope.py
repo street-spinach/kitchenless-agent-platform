@@ -41,6 +41,8 @@ ALLOWLIST: dict[str, str] = {
     "services/seed/__main__.py": "unscoped:seed",
     "services/common/runs.py": "unscoped:runs",
     "services/agents/sweeper.py": "unscoped:sweeper",
+    # The reminder pass (experience EX-I41): no household context, every household.
+    "services/agents/reminders.py": "unscoped:reminder_pass",
     "services/api/ingest.py": "unscoped:ingest",
     "services/mocks/control.py": "unscoped:control.reset",
     # Every household query through `scope.scoped` with the session's scope (I24).

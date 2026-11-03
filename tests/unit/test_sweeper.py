@@ -2,6 +2,7 @@
 issue #38)."""
 
 import asyncio
+import contextlib
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
@@ -421,3 +422,43 @@ def test_failing_timer_left_pending_others_fire(world: str) -> None:
     assert _timer(world, bad)["status"] == "pending"
     assert _timer(world, good)["status"] == "done"
     assert len(_messages(world, run_id)) == 1
+
+
+def test_reminder_pass_once_per_minute(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The sweeper runs the reminder pass at most once per `REMINDER_SECONDS` (EX-I42),
+    whatever its own sweep interval."""
+
+    class _Pool:
+        @contextlib.asynccontextmanager
+        async def connection(self) -> Any:
+            yield object()
+
+    now = [0.0]
+    sweeps: list[float] = []
+    passes: list[float] = []
+    stop = asyncio.Event()
+
+    async def fake_sweep(conn: Any) -> int:
+        sweeps.append(now[0])
+        now[0] += 15.0  # each sweep: 15 s later, on the fake clock
+        if len(sweeps) == 12:
+            stop.set()
+        return 0
+
+    async def fake_pass(conn: Any, at: Any) -> int:
+        passes.append(now[0])
+        return 0
+
+    monkeypatch.setattr(sweeper, "sweep_once", fake_sweep)
+    asyncio.run(
+        sweeper.sweep_forever(
+            pool=_Pool(),  # type: ignore[arg-type]
+            stop=stop,
+            every=0,
+            clock=lambda: now[0],
+            reminder_pass=fake_pass,
+        )
+    )
+    assert sweeper.reminders.REMINDER_SECONDS == 60.0
+    # 12 sweeps over 180 s: the pass runs on the first and then once each 60 s.
+    assert passes == [15.0, 75.0, 135.0]
