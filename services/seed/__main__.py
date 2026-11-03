@@ -374,6 +374,11 @@ def _seed_household(
                 ["phone_e164"],
                 {"phone_e164": phone, "user_id": user_id, "channel_mode": mode},
             )
+            # Seeded phones start inside the WhatsApp window (experience EX-A4, EX-I11).
+            conn.execute(
+                "UPDATE channel_identities SET last_inbound_at = now() WHERE phone_e164 = %s",
+                (phone,),
+            )
         _people_card(conn, f"consumer:{m['member_id']}", "consumer", f"user:{user_id}", hh)
     _people_card(conn, f"household:{hid}", "household", f"household:{hid}", hh)
 

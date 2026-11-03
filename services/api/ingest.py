@@ -3,7 +3,9 @@
 `ingest` is used by the simulated WhatsApp route, `POST /runs` and, later, the real webhook
 (#73). It only writes rows, in one transaction, and never waits on an agent:
 
-1.  Insert `inbound_messages`. On conflict (a duplicate delivery), return.
+1.  Insert `inbound_messages`. On conflict (a duplicate delivery), return. Otherwise set
+    the phone's `channel_identities.last_inbound_at` to the row's `received_at`, before any
+    routing, for every content kind (experience §5, EX-I10).
 2.  Look up the phone in `channel_identities`, then the member's household and consumer
     agent. An unknown phone gets no run. Its "not registered" reply belongs to
     identity-authz I26 (#124).
@@ -137,7 +139,12 @@ class _Member:
 _INSERT_INBOUND_SQL = """
 INSERT INTO inbound_messages (channel, external_id) VALUES (%s, %s)
 ON CONFLICT (channel, external_id) DO NOTHING
-RETURNING external_id
+RETURNING external_id, received_at
+"""
+
+# The window state (experience §5): every new inbound message from a known phone.
+_SET_LAST_INBOUND_SQL = """
+UPDATE channel_identities SET last_inbound_at = %s WHERE phone_e164 = %s
 """
 
 _SET_RUN_SQL = """
@@ -225,9 +232,13 @@ async def ingest(
     """
     async with conn.transaction():
         cur = await conn.execute(_INSERT_INBOUND_SQL, (channel, external_id))
-        if await cur.fetchone() is None:
+        inserted = await cur.fetchone()
+        if inserted is None:
             log.info("duplicate inbound %s message ignored", channel)
             return None
+        # Before any routing, for every content kind (experience EX-I10). An unknown phone
+        # matches no row.
+        await conn.execute(_SET_LAST_INBOUND_SQL, (inserted[1], phone))
 
         member = await _member(conn, phone)
         if member is None:

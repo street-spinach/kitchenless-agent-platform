@@ -637,3 +637,59 @@ def test_retry_without_target_is_normal_text(world: str) -> None:
     assert run_id is not None
     trigger = _run_row(world, run_id)["trigger"]
     assert "retry_of" not in trigger and trigger["text"] == "retry"
+
+
+# Window state (experience §5, EX-I10) ----------------------------------------------------
+
+
+def _last_inbound(pg: str, phone: str) -> Any:
+    [row] = w.query(
+        pg, "SELECT last_inbound_at FROM channel_identities WHERE phone_e164 = %s", phone
+    )
+    return row["last_inbound_at"]
+
+
+def _received_at(pg: str, external_id: str) -> Any:
+    [row] = w.query(
+        pg, "SELECT received_at FROM inbound_messages WHERE external_id = %s", external_id
+    )
+    return row["received_at"]
+
+
+def test_last_inbound_set_once_per_message(world: str) -> None:
+    w.query(world, "UPDATE channel_identities SET last_inbound_at = NULL RETURNING phone_e164")
+    assert _ingest(world, "wamid.w1", Content("text", text="Weekly shop")) is not None
+    first = _received_at(world, "wamid.w1")
+    assert _last_inbound(world, w.MEMBER_PHONE) == first
+    # Only the sender's phone moves.
+    assert _last_inbound(world, w.ADMIN_PHONE) is None
+
+    # A duplicate delivery returns no row and updates nothing.
+    w.query(
+        world,
+        "UPDATE channel_identities SET last_inbound_at = NULL WHERE phone_e164 = %s"
+        " RETURNING phone_e164",
+        w.MEMBER_PHONE,
+    )
+    assert _ingest(world, "wamid.w1", Content("text", text="Weekly shop")) is None
+    assert _last_inbound(world, w.MEMBER_PHONE) is None
+
+    # Every content kind counts, media included.
+    assert _ingest(world, "wamid.w2", Content("media")) is not None
+    assert _last_inbound(world, w.MEMBER_PHONE) == _received_at(world, "wamid.w2")
+
+    # An unknown phone writes no channel identity.
+    assert _ingest(world, "wamid.w3", Content("text", text="hi"), phone=w.UNKNOWN_PHONE) is None
+    assert (
+        w.query(world, "SELECT * FROM channel_identities WHERE phone_e164 = %s", w.UNKNOWN_PHONE)
+        == []
+    )
+
+
+def test_last_inbound_set_for_button_taps(world: str) -> None:
+    w.query(world, "UPDATE channel_identities SET last_inbound_at = NULL RETURNING phone_e164")
+    # A button that starts nothing still counts as the person writing.
+    assert _ingest(world, "wamid.tap", Content("button", button="approve:1")) is None
+    assert _last_inbound(world, w.MEMBER_PHONE) == _received_at(world, "wamid.tap")
+    assert _ingest(world, "wamid.sf", Content("button", button="sf:not-a-uuid:1:drop")) is None
+    assert _last_inbound(world, w.MEMBER_PHONE) == _received_at(world, "wamid.sf")
