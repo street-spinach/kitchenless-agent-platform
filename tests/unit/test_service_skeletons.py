@@ -56,11 +56,19 @@ def test_service_ports() -> None:
 
 
 @pytest.mark.parametrize("method", ["get", "post", "put", "patch", "delete"])
-@pytest.mark.parametrize("path", ["/app", "/app/orders/1", "/me", "/me/profile"])
+@pytest.mark.parametrize("path", ["/app", "/app/orders/1"])
 def test_reserved_routes_501(method: str, path: str) -> None:
     resp = TestClient(api.create_app()).request(method, path)
     assert resp.status_code == 501
     assert resp.json() == {"owner": "experience design"}
+
+
+@pytest.mark.parametrize("method", ["get", "post", "put", "patch", "delete"])
+@pytest.mark.parametrize("path", ["/me", "/me/profile"])
+def test_me_no_longer_reserved(method: str, path: str) -> None:
+    # identity-authz I-A14: `me.py` serves `/me/*`, so nothing there answers 501.
+    resp = TestClient(api.create_app()).request(method, path, follow_redirects=False)
+    assert resp.status_code != 501
 
 
 def test_unreserved_prefix_is_404() -> None:
