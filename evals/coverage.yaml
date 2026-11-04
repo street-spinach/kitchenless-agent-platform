@@ -77,6 +77,9 @@ prefixes:
   task-held-release: experience
   task-take-turns-switch-from-page: experience
   task-pantry-ran-out-reorders: experience
+  # pantry (pantry.md §8, P8). Longer than architecture's task-weekly-order-, so they win.
+  task-weekly-order-skips-pantry: pantry
+  task-weekly-order-nothing-needed: pantry
 
 goals:
   # evals.md §12 "Covers". AG13 and AG14 are unit tests only (agents.md).
@@ -102,3 +105,9 @@ goals:
     XG8: [safety-pending-joiner-allergy-enforced]
     XG11: [task-pantry-ran-out-reorders]
     XG12: [task-take-turns-switch-from-page]
+  # pantry.md P8. The other PG goals are unit tests only.
+  pantry:
+    PG1: [task-weekly-order-skips-pantry-items]
+    PG2: [task-weekly-order-skips-pantry-items]
+    PG4: [task-weekly-order-skips-pantry-items]
+    PG5: [task-weekly-order-nothing-needed]

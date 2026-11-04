@@ -1,0 +1,19 @@
+# Pantry §8 case 2 (PT-CUJ 2): everything on the stub list is at home, so no quote request is
+# sent and the run ends completed with reason nothing_needed.
+id: task-weekly-order-nothing-needed
+category: task
+tags: [fast]
+model_modes: [stub]
+household: us-1-eval
+run: weekly_grocery_order
+setup:
+  pantry:
+    milk: [{kind: add, age_hours: 1}]
+    eggs: [{kind: add, age_hours: 1}]
+    bread: [{kind: add, age_hours: 1}]
+    bananas: [{kind: add, age_hours: 1}]
+    rice: [{kind: add, age_hours: 1}]
+expect:
+  - {check: no_quote_requests}
+  - {check: run_status, args: {status: completed, reason: nothing_needed}}
+  - {check: reply_template, args: {name: nothing_needed}}
