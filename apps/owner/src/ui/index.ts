@@ -1,4 +1,5 @@
 // The owner app's shared components (EX-I43). Screens import from here only.
+export { Badge } from "./badge";
 export { Banner } from "./banner";
 export { Card } from "./card";
 export { Empty } from "./empty";

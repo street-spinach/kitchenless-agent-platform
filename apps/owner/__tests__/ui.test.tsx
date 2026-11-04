@@ -3,6 +3,7 @@ import { act, create, type ReactTestRenderer } from "react-test-renderer";
 import { StyleSheet, Text } from "react-native";
 
 import {
+  Badge,
   Banner,
   Card,
   Empty,
@@ -107,6 +108,16 @@ test("Sheet shows its title and choices when visible", async () => {
     tree.root.findByProps({ accessibilityLabel: "Close" }).props.onPress();
   });
   expect(onClose).toHaveBeenCalledTimes(1);
+});
+
+test("Badge is a lime pill, and ListRow shows one before its trailing text", async () => {
+  const tree = await render(<Badge text="Live" testID="badge" />);
+  const [view] = tree.root.findAll((n) => typeof n.type === "string" && n.props.testID === "badge");
+  expect(StyleSheet.flatten(view.props.style).backgroundColor).toBe(theme.colors.accent);
+  expect(text(tree)).toContain("Live");
+  const row = await render(<ListRow title="K7Q2M9XD" badge="Live" trailing="$48.00" testID="r" />);
+  expect(row.root.findAll((n) => n.props.testID === "r-badge").length).toBeGreaterThan(0);
+  expect(text(await render(<ListRow title="x" testID="q" />))).not.toContain("Live");
 });
 
 test("Banner renders its text in both tones", async () => {

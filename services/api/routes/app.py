@@ -11,6 +11,8 @@
     `owner_rule_changed` audit row. The rule raises the handlers' floors (I33).
 *   `GET /app/orders?summary=0|1` and `GET /app/notices?limit=N` (experience.md §11,
     EX-I47) read through `scope.org_scoped` in `owner_views.py`. They name no household.
+*   `GET /app/orders/{ref}/turns` (showcase.md §6): the negotiation sheet's timeline for one
+    of the org's orders, the same way; a ref that isn't the org's answers 404.
 *   `GET /app/insights` (this ISO week; the labelled sample when `INSIGHTS_SAMPLE=1`) and
     `GET /app/connection` (EX-I48), the same way.
 
@@ -173,6 +175,17 @@ async def orders(request: Request) -> Response:
         return JSONResponse({"orders": await owner_views.orders(conn, org)})
 
 
+async def turns(request: Request) -> Response:
+    org = await _org(request)
+    if isinstance(org, Response):
+        return org
+    async with request.app.state.connect() as conn:
+        found = await owner_views.turns(conn, org, request.path_params["ref"])
+    if found is None:
+        return JSONResponse({"error": "not_found"}, status_code=404)
+    return JSONResponse(found)
+
+
 async def notices(request: Request) -> Response:
     raw = request.query_params.get("limit", str(NOTICES_DEFAULT))
     if not raw.isdigit() or not 1 <= int(raw) <= owner_views.MAX_ROWS:
@@ -211,6 +224,7 @@ async def connection(request: Request) -> Response:
 routes = [
     Route("/app/rules", rules, methods=["GET", "POST"]),
     Route("/app/orders", orders, methods=["GET"]),
+    Route("/app/orders/{ref}/turns", turns, methods=["GET"]),
     Route("/app/notices", notices, methods=["GET"]),
     Route("/app/insights", insights, methods=["GET"]),
     Route("/app/connection", connection, methods=["GET"]),
