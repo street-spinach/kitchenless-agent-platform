@@ -1,0 +1,27 @@
+/* Spinach brand tokens (showcase.md §2), from the Spinach theme stylesheet 1.6.0.
+   The source copy: apps/owner/src/ui/theme.ts and the Keycloak login theme CSS hold
+   copies, and tests/unit/test_brand_tokens.py fails when they differ. */
+:root {
+  --brand-green-900: #123710;
+  --brand-green-700: #1e6b1c;
+  --brand-green-600: #268923;
+  --brand-green-500: #2a9727;
+  --brand-green-50: #eaf5e9;
+  --brand-lime: #8ecc06;
+  --brand-orange: #db5f00;
+  --brand-ink: #262b25;
+  --brand-ink-soft: #323831;
+  --brand-muted: #5a6559;
+  --brand-muted-2: #7b847a;
+  --brand-line: rgba(38, 43, 37, 0.08);
+  --brand-bg: #f8fbf7;
+  --brand-bg-2: #efefee;
+  --brand-white: #ffffff;
+  --brand-danger: #e03030;
+  --brand-radius-card: 24px;
+  --brand-radius-control: 12px;
+  --brand-shadow: 0 10px 30px rgba(38, 43, 37, 0.06);
+  --brand-shadow-lift: 0 22px 70px rgba(18, 55, 16, 0.14);
+  --brand-gradient: linear-gradient(91deg, #1e6b1c, #2a9727);
+  --brand-font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
