@@ -111,6 +111,8 @@ TOOL_SCOPES: Mapping[str, ToolScope] = {
     "get_setup_state": _delegated("consumer", scope=None),
     "propose_setup": _delegated("consumer", scope="constraints:write"),
     "apply_setup": _service("system"),
+    "set_household_take_turns": _service("system"),
+    "react_to_meal": _service("system"),
 }
 
 

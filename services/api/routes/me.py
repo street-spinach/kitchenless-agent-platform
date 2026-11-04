@@ -22,6 +22,10 @@ Pages render from `services/api/templates/` with `/me/static/me.css`.
     budget, take-turns (the switch for the approver), the last delivered dinners with
     reactions, and the allergies and diets the viewer may see. Every read goes through
     `scope.scoped` and `visibility.can_see`; a child sees only their own row.
+*   `POST /me/household/take-turns` and `POST /me/meals/{order_id}/reaction` (EX-I37)
+    start a household `chat` run (`trigger.source = "me"`), call
+    `set_household_take_turns` or `react_to_meal` as `system:api` with the session
+    person as `user_id`, finish the run and go back to `/me/household`.
 *   `GET /me/history` lists the person's audit rows and approvals, and spending per week
     (per order: an admin every order, others the orders they started).
 *   `GET /me/household/band` returns the band (a page for `Accept: text/html`, else JSON);
@@ -40,6 +44,7 @@ scope (§8).
 
 import html
 import json
+import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -58,13 +63,19 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 from starlette.templating import Jinja2Templates
 
-from services.common import ids
+from services.common import ids, mcp_client, runs
 from services.common.config import get_settings
 from services.common.money import Money
 from services.common.money import format as money_format
 from services.common.orders import PLACED_OR_LATER
+from services.common.run_context import RunContext
 from services.identity import audit, grants, keycloak_admin, links, token_source
-from services.identity.errors import DependencyUnavailable, IdentityError, LinkInvalid
+from services.identity.errors import (
+    DependencyUnavailable,
+    GrantError,
+    IdentityError,
+    LinkInvalid,
+)
 from services.safety import scope, visibility
 
 __all__ = [
@@ -85,6 +96,17 @@ SESSION_SECONDS = 30 * 60
 # A consent chain must finish within a link's lifetime.
 STATE_SECONDS = links.LINK_SECONDS
 REVOKE_REASON = "user"
+
+log = logging.getLogger(__name__)
+
+# A `/me` POST that calls a tool (experience §3): a household `chat` run started by `api`,
+# `trigger = {user_id, source: "me"}`, the tool called as `system:api`, the run finished.
+API_AGENT = "system:api"
+HOUSEHOLD_SERVER = "household"
+ME_SOURCE = "me"
+WRONG_APPROVER = "wrong_approver"
+# `mcp_client.call_tool_as`; tests replace it with the in-process server.
+CALL_TOOL = mcp_client.call_tool_as
 
 # The page templates and stylesheet (experience §8, EX-I35, EX-I36).
 _API_DIR = Path(__file__).resolve().parents[1]
@@ -694,6 +716,105 @@ async def household_page(request: Request) -> Response:
     return _render(request, "household.html", context)
 
 
+# --- household actions (EX-I37) ---------------------------------------------------------
+
+
+class _ToolFailed(Exception):
+    """The tool could not be reached or failed; the run ended `error`."""
+
+
+async def _me_tool(
+    request: Request, session: Session, tool: str, args: dict[str, Any]
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Call `tool` for the session person in a new §3 `/me` run: `(result, None)`, or
+    `(None, reason)` for a refusal (the run `completed` with that reason) or a household
+    grant that is not active (no run starts). A failure to reach the tool ends the run
+    `error` and raises `_ToolFailed`."""
+    async with _connect(request) as conn:
+        try:
+            run_id = await runs.start(
+                conn,
+                household_id=session.household_id,
+                kind="chat",
+                trigger={"user_id": session.user_id, "source": ME_SOURCE},
+            )
+        except GrantError as refused:
+            return None, refused.reason
+        await conn.commit()  # the guard reads the run from its own connection
+    ctx = RunContext(run_id=run_id, agent_id=API_AGENT, conversation_id=None)
+    result: dict[str, Any] | None = None
+    reason: str | None = None
+    status = "completed"
+    try:
+        result = await CALL_TOOL(HOUSEHOLD_SERVER, tool, args, ctx=ctx)
+    except mcp_client.ToolRefused as refused:
+        reason = refused.reason
+    except Exception:
+        log.exception("/me tool %s failed", tool)
+        status = "error"
+    async with _connect(request) as conn:
+        await runs.finish(conn, run_id, API_AGENT, status, reason or tool)
+        await conn.commit()
+    if status == "error":
+        raise _ToolFailed(tool)
+    return result, reason
+
+
+def _action_refused(reason: str | None) -> HTMLResponse:
+    if reason == WRONG_APPROVER:
+        return _error("Not allowed", "Only the approver can change this.", 403)
+    if reason is not None and reason.startswith("grant_"):
+        return _error(
+            "Agent paused",
+            "Your household agent needs its consent renewed. Ask an admin to tap Renew in"
+            " WhatsApp.",
+            409,
+        )
+    return _error("Not saved", "That didn't go through. Go back, reload and try again.", 403)
+
+
+async def take_turns(request: Request) -> Response:
+    """`POST /me/household/take-turns`: the approver's switch (`on` present means on)."""
+    session = _session(request)
+    if session is None:
+        return _signed_out()
+    if not csrf_ok(session, FORM_TAKE_TURNS, await _posted_token(request)):
+        return _csrf_refused()
+    on = (await request.form()).get("on") is not None
+    args = {"on": on, "user_id": str(session.user_id)}
+    try:
+        result, reason = await _me_tool(request, session, "set_household_take_turns", args)
+    except _ToolFailed:
+        return _error("Not saved", "Something went wrong. Try again in a minute.", 503)
+    if result is None:
+        return _action_refused(reason)
+    return RedirectResponse("/me/household", status_code=303)
+
+
+async def reaction(request: Request) -> Response:
+    """`POST /me/meals/{order_id}/reaction`: `value` 1 or -1 for the session person."""
+    session = _session(request)
+    if session is None:
+        return _signed_out()
+    if not csrf_ok(session, FORM_REACTION, await _posted_token(request)):
+        return _csrf_refused()
+    try:
+        order_id = UUID(request.path_params["order_id"])
+    except ValueError:
+        return _error("Not found", "That meal isn't there.", 404)
+    raw = (await request.form()).get("value")
+    if raw not in ("1", "-1"):
+        return _error("Not saved", "Pick 👍 or 👎.", 400)
+    args = {"order_id": str(order_id), "value": int(str(raw)), "user_id": str(session.user_id)}
+    try:
+        result, reason = await _me_tool(request, session, "react_to_meal", args)
+    except _ToolFailed:
+        return _error("Not saved", "Something went wrong. Try again in a minute.", 503)
+    if result is None:
+        return _action_refused(reason)
+    return RedirectResponse("/me/household", status_code=303)
+
+
 # --- agents ---------------------------------------------------------------------------
 
 
@@ -984,6 +1105,8 @@ routes = [
     Route("/me/callback", callback, methods=["GET"]),
     Route("/me/consent/done", consent_done, methods=["GET"]),
     Route("/me/household", household_page, methods=["GET"]),
+    Route("/me/household/take-turns", take_turns, methods=["POST"]),
+    Route("/me/meals/{order_id}/reaction", reaction, methods=["POST"]),
     Route("/me/agents", agents, methods=["GET"]),
     Route("/me/agents/{agent_id}/revoke", revoke, methods=["POST"]),
     Route("/me/history", history, methods=["GET"]),

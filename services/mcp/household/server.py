@@ -32,6 +32,10 @@ The agents tools (agents design §9, §10; AG-A5):
 *   `get_household_rules()` *guarded*: take-turns, the turn index and the approver.
 *   `advance_turn(order_id)` *guarded*: once per delivered dinner, while take-turns is on.
 *   `set_take_turns(order_id, on, user_id)` *guarded*, `api` service token, approver only.
+*   `set_household_take_turns(on, user_id)` *guarded*, `api` service token, approver only:
+    the `/me/household` switch (experience EX-A7, EX-I37).
+*   `react_to_meal(order_id, value, user_id)` *guarded*, `api` service token: a member's
+    👍/👎 on a delivered meal, one per person (experience EX-I37).
 
 The shortfall tools (agent-protocol §10 and P25, #68):
 
@@ -112,11 +116,13 @@ __all__ = [
     "get_shortfall",
     "open_shortfall",
     "propose_setup",
+    "react_to_meal",
     "record_delivery",
     "record_dislike",
     "request_approval",
     "server",
     "set_order_state",
+    "set_household_take_turns",
     "set_take_turns",
     "setup_removals",
 ]
@@ -1018,23 +1024,7 @@ async def set_take_turns(
         await limits.check_approver(conn, household, user_id)
 
     async def call() -> dict[str, Any]:
-        async with db.get_pool().connection() as conn, conn.transaction():
-            q = _scoped(conn, household)
-            found = await q.fetch(
-                "SELECT take_turns FROM household_rules"
-                " WHERE household_id = %(household)s FOR UPDATE"
-            )
-            before = found[0] if found else None
-            await q.execute(
-                "INSERT INTO household_rules (household_id, take_turns, set_by)"
-                " VALUES (%(household)s, %(on)s, %(user)s) ON CONFLICT (household_id) DO UPDATE"
-                " SET take_turns = EXCLUDED.take_turns, set_by = EXCLUDED.set_by,"
-                " updated_at = now()",
-                on=on,
-                user=user_id,
-            )
-        was_on = False if before is None else bool(before[0])
-        return {"changed": was_on != on, "take_turns": on}
+        return {"changed": await _write_take_turns(household, on, user_id), "take_turns": on}
 
     return await run_guarded(
         ctx,
@@ -1043,6 +1033,117 @@ async def set_take_turns(
         limits=check,
         key=None,
         request={"order_id": str(order_id), "on": on, "user_id": str(user_id)},
+        call=call,
+        apply=None,
+    )
+
+
+async def _write_take_turns(household: str | None, on: bool, user_id: uuid.UUID) -> bool:
+    """Set `household_rules.take_turns` and `set_by`; whether the setting changed."""
+    async with db.get_pool().connection() as conn, conn.transaction():
+        q = _scoped(conn, household)
+        found = await q.fetch(
+            "SELECT take_turns FROM household_rules WHERE household_id = %(household)s FOR UPDATE"
+        )
+        before = found[0] if found else None
+        await q.execute(
+            "INSERT INTO household_rules (household_id, take_turns, set_by)"
+            " VALUES (%(household)s, %(on)s, %(user)s) ON CONFLICT (household_id) DO UPDATE"
+            " SET take_turns = EXCLUDED.take_turns, set_by = EXCLUDED.set_by,"
+            " updated_at = now()",
+            on=on,
+            user=user_id,
+        )
+    was_on = False if before is None else bool(before[0])
+    return was_on != on
+
+
+async def set_household_take_turns(
+    ctx: CallContext, *, on: bool, user_id: uuid.UUID
+) -> dict[str, Any]:
+    """The take-turns switch on `/me/household` (experience EX-A7, EX-I37): the order-less
+    form of `set_take_turns`. `system:api` only; the household is the run's; `user_id` (the
+    session person) must be its approver (else `wrong_approver`), and is written to
+    `set_by`. Writing the same value again is harmless, so there is no key."""
+    household = await _run_household(ctx)
+
+    async def check(conn: AsyncConnection) -> None:
+        if ctx.agent_id != API_AGENT:
+            raise GuardRefused(AUTHZ_DENIED)
+        _require_household(household)
+        if not isinstance(on, bool):
+            raise GuardRefused(INVALID_VALUE)
+        await limits.check_approver(conn, household, user_id)
+
+    async def call() -> dict[str, Any]:
+        changed = await _write_take_turns(household, on, user_id)
+        return {"changed": changed, "take_turns": on}
+
+    return await run_guarded(
+        ctx,
+        tool=f"{AREA}.set_household_take_turns",
+        relation=None,
+        limits=check,
+        key=None,
+        request={"on": on, "user_id": str(user_id)},
+        call=call,
+        apply=None,
+    )
+
+
+async def react_to_meal(
+    ctx: CallContext, *, order_id: uuid.UUID, value: int, user_id: uuid.UUID
+) -> dict[str, Any]:
+    """A 👍 (1) or 👎 (-1) on a delivered meal from `/me/household` (experience EX-OD8,
+    EX-I37). `system:api` only; `user_id` (the session person) must be a member of the
+    run's household (else `authz_denied`); the order must be the household's (else
+    `authz_denied`) and `delivered` (else `wrong_order_state`); `value` 1 or -1 (else
+    `invalid_value`). One row per person, replaced by a later tap; no key. Reactions are
+    never read by an agent, prompt or rule."""
+    household = await _run_household(ctx)
+
+    async def check(conn: AsyncConnection) -> None:
+        if ctx.agent_id != API_AGENT:
+            raise GuardRefused(AUTHZ_DENIED)
+        if isinstance(value, bool) or value not in (1, -1):
+            raise GuardRefused(INVALID_VALUE)
+        if not await _is_member(conn, household, user_id):
+            raise GuardRefused(AUTHZ_DENIED)
+        order = await _order(conn, order_id, _require_household(household))
+        if order["state"] != "delivered":
+            raise GuardRefused(WRONG_ORDER_STATE)
+
+    async def call() -> dict[str, Any]:
+        async with db.get_pool().connection() as conn, conn.transaction():
+            q = _scoped(conn, household)
+            before = await q.fetch(
+                "SELECT r.value FROM meal_reactions r JOIN orders o ON o.order_id = r.order_id"
+                " WHERE o.household_id = %(household)s AND r.order_id = %(order)s"
+                " AND r.user_id = %(user)s FOR UPDATE OF r",
+                order=order_id,
+                user=user_id,
+            )
+            await q.execute(
+                "INSERT INTO meal_reactions (order_id, user_id, value)"
+                " SELECT o.order_id, %(user)s, %(value)s FROM orders o"
+                " WHERE o.order_id = %(order)s AND o.household_id = %(household)s"
+                " AND o.state = 'delivered'"
+                " ON CONFLICT (order_id, user_id) DO UPDATE"
+                " SET value = EXCLUDED.value, created_at = now()",
+                order=order_id,
+                user=user_id,
+                value=value,
+            )
+        changed = not before or int(before[0][0]) != value
+        return {"order_id": str(order_id), "value": value, "changed": changed}
+
+    return await run_guarded(
+        ctx,
+        tool=f"{AREA}.react_to_meal",
+        relation=None,
+        limits=check,
+        key=None,
+        request={"order_id": str(order_id), "value": value, "user_id": str(user_id)},
         call=call,
         apply=None,
     )
@@ -2012,6 +2113,20 @@ async def _set_take_turns_tool(
     order_id: uuid.UUID, on: bool, user_id: uuid.UUID, ctx: Context
 ) -> CallToolResult:
     return await _serve(ctx, set_take_turns, order_id=order_id, on=on, user_id=user_id)
+
+
+@server.tool(name="set_household_take_turns")
+async def _set_household_take_turns_tool(
+    on: bool, user_id: uuid.UUID, ctx: Context
+) -> CallToolResult:
+    return await _serve(ctx, set_household_take_turns, on=on, user_id=user_id)
+
+
+@server.tool(name="react_to_meal")
+async def _react_to_meal_tool(
+    order_id: uuid.UUID, value: Literal[1, -1], user_id: uuid.UUID, ctx: Context
+) -> CallToolResult:
+    return await _serve(ctx, react_to_meal, order_id=order_id, value=value, user_id=user_id)
 
 
 @server.tool(name="open_shortfall")
