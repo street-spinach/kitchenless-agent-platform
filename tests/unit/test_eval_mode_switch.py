@@ -51,7 +51,7 @@ def run(state: Path, *args: str, **env: str) -> subprocess.CompletedProcess[str]
         "STATE": str(state),
         # What `.env` interpolation gives the fake when no shell override is set.
         "ENV_MODE": "stub",
-        "ENV_BUSINESS": "Muse Glimmer",
+        "ENV_BUSINESS": "meta-models/muse-spark-open",
         "EVAL_MODE_POLL_SECONDS": "1",
         "EVAL_MODE_WAIT_SECONDS": "3",
     }
@@ -89,7 +89,8 @@ def test_real_defaults_business_name(state: Path) -> None:
     serving(state, "stub")
     result = run(state, "real")
     assert result.returncode == 0, result.stderr
-    assert docker_calls(state) == [f"{UP}|MODEL_MODE=real|MODEL_BUSINESS_NAME=Muse Glimmer"]
+    expected = f"{UP}|MODEL_MODE=real|MODEL_BUSINESS_NAME=meta-models/muse-spark-open"
+    assert docker_calls(state) == [expected]
 
 
 def test_real_exits_1_when_health_never_confirms(state: Path) -> None:

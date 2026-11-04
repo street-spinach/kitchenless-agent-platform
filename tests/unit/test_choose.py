@@ -277,3 +277,64 @@ def test_guidance_ignored_in_stub_mode() -> None:
 
     assert seen == [{"a": 1}]
     assert choice.value == "w1"
+
+
+class _KeyedTransport(ScriptedTransport):
+    """Also records the API key each call sends (#392)."""
+
+    def __init__(self, script: list[Any]) -> None:
+        super().__init__(script)
+        self.keys: list[Any] = []
+
+    async def post(self, base_url: str, api_key: Any, body: dict, timeout: float) -> dict:
+        self.keys.append(api_key)
+        return await super().post(base_url, api_key, body, timeout)
+
+
+def _window_choice(transport: Any, **overrides: Any) -> Choice:
+    c = client(mode="real", transport=transport, **overrides)
+    return _choose(c, "choose_window", OneOf(["w1", "w2"]), "w1", {"windows": ["w1", "w2"]})
+
+
+def test_business_endpoint_used_with_its_own_key() -> None:
+    transport = _KeyedTransport([completion({"pick": "w2", "rationale": "Later is fine."})])
+
+    choice = _window_choice(
+        transport,
+        model_business_base_url="http://glimmer.invalid/v1",
+        model_business_api_key="kb",
+    )
+
+    assert choice.source == "model"
+    assert [call[0] for call in transport.calls] == ["http://glimmer.invalid/v1"]
+    assert transport.keys == ["kb"]
+
+
+def test_business_endpoint_never_gets_the_primary_key() -> None:
+    # A self-hosted Glimmer may need no key; the Meta key must not leak to it.
+    transport = _KeyedTransport([completion({"pick": "w2", "rationale": "Later is fine."})])
+
+    _window_choice(transport, model_business_base_url="http://glimmer.invalid/v1")
+
+    assert transport.keys == [None]
+
+
+def test_empty_business_endpoint_uses_primary() -> None:
+    transport = _KeyedTransport([completion({"pick": "w2", "rationale": "Later is fine."})])
+
+    _window_choice(transport)
+
+    assert [call[0] for call in transport.calls] == ["http://primary.invalid/v1"]
+    assert transport.keys == ["k1"]
+
+
+def test_business_endpoint_alone_is_enough_to_call() -> None:
+    # Business host set, primary empty: business agents still call their host.
+    transport = _KeyedTransport([completion({"pick": "w2", "rationale": "Later is fine."})])
+
+    choice = _window_choice(
+        transport, model_base_url=None, model_business_base_url="http://glimmer.invalid/v1"
+    )
+
+    assert choice.source == "model"
+    assert [call[0] for call in transport.calls] == ["http://glimmer.invalid/v1"]

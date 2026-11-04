@@ -22,6 +22,8 @@ def settings(**overrides: Any) -> SimpleNamespace:
         "run_token_ceiling": None,
         "model_business_name": "Muse Glimmer",
         "model_business_timeout_seconds": 5,
+        "model_business_base_url": None,
+        "model_business_api_key": None,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
