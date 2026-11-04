@@ -13,6 +13,7 @@ import {
   Sheet,
   Skeleton,
   Stat,
+  colors,
   spacing,
   type,
 } from "../../src/ui";
@@ -76,8 +77,9 @@ export default function Home() {
         }}
         testID="discount-card"
         title="Discount"
+        tone="hero"
       >
-        <Text style={type.body}>{discountText(pct)}</Text>
+        <Text style={[type.body, styles.heroText]}>{discountText(pct)}</Text>
       </Card>
       <Card title="Today">
         <View style={styles.stats}>
@@ -123,6 +125,7 @@ export default function Home() {
 }
 
 const styles = StyleSheet.create({
+  heroText: { color: colors.onHero },
   page: { gap: spacing.md, padding: spacing.md },
   stats: { flexDirection: "row", justifyContent: "space-between" },
 });

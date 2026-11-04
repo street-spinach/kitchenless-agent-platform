@@ -10,7 +10,11 @@ export function ErrorState({ text = "Something went wrong.", onRetry, testID }: 
   return (
     <View accessibilityRole="alert" style={styles.error} testID={testID}>
       <Text style={[type.body, styles.text]}>{text}</Text>
-      <Pressable accessibilityRole="button" onPress={onRetry} style={styles.button}>
+      <Pressable
+        accessibilityRole="button"
+        onPress={onRetry}
+        style={({ pressed }) => [styles.button, pressed && styles.pressed]}
+      >
         <Text style={styles.buttonText}>Try again</Text>
       </Pressable>
     </View>
@@ -25,6 +29,7 @@ const styles = StyleSheet.create({
     paddingVertical: spacing.sm,
   },
   buttonText: { color: colors.onPrimary, fontSize: 15, fontWeight: "600" },
+  pressed: { backgroundColor: colors.primaryPressed },
   error: { alignItems: "center", gap: spacing.md, padding: spacing.xl },
   text: { textAlign: "center" },
 });

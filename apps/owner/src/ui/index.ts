@@ -7,5 +7,5 @@ export { ListRow } from "./list-row";
 export { Sheet } from "./sheet";
 export { Skeleton } from "./skeleton";
 export { Stat } from "./stat";
-export { colors, radius, spacing, theme, type } from "./theme";
+export { brand, colors, radius, spacing, theme, type } from "./theme";
 export type { Theme } from "./theme";

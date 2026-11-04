@@ -98,3 +98,10 @@ test("loading and empty states", async () => {
   expect(text(tree)).toContain(discountText(null));
   expect(has(tree, "notices-empty")).toBe(true);
 });
+
+test("the discount card is the hero card (showcase.md §3.2)", async () => {
+  const tree = await render(<Home />);
+  await flush();
+  const [card] = tree.root.findAll((n) => n.props.testID === "discount-card");
+  expect(card.props.tone).toBe("hero");
+});
