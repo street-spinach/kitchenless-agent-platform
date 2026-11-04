@@ -22,3 +22,7 @@ RUN /opt/keycloak/bin/kc.sh build \
 
 # Imported on start with --import-realm (skipped when the realm already exists).
 COPY --chown=keycloak:keycloak services/identity/realm/kitchenless.json /opt/keycloak/data/import/
+
+# The `kitchenless` login theme (showcase.md §3.3, SC-A5): CSS and images only. Read at
+# runtime, so it needs no rebuild.
+COPY --chown=keycloak:keycloak services/identity/realm/theme/kitchenless/ /opt/keycloak/themes/kitchenless/

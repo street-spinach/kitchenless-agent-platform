@@ -190,3 +190,56 @@ def test_owner_app_redirect_and_origin() -> None:
     assert owner["implicitFlowEnabled"] is False
     assert owner["directAccessGrantsEnabled"] is False
     assert owner["attributes"]["pkce.code.challenge.method"] == "S256"
+
+
+# showcase.md §3.3: the consent screen's wording for each class scope.
+CONSENT_TEXT = {
+    "constraints:read": "Read your household's allergies, diets and dislikes",
+    "constraints:write": "Save allergies, diets and dislikes you tell it",
+    "pantry:read": "See what's at home",
+    "pantry:write": "Record what's at home or run out",
+    "meals:plan": "Plan meals for you",
+    "orders:place": "Place orders within your budget and approval rules",
+    "approvals:request": "Ask your approver before spending above the band",
+}
+THEME = REPO / "services/identity/realm/theme/kitchenless/login"
+DOCKERFILE = REPO / "infra/keycloak/Dockerfile"
+THEME_COPY = (
+    "COPY --chown=keycloak:keycloak services/identity/realm/theme/kitchenless/ "
+    "/opt/keycloak/themes/kitchenless/"
+)
+
+
+def test_login_theme_is_kitchenless() -> None:
+    """showcase.md SC-A5, §3.3: the realm uses the `kitchenless` login theme the image
+    ships; the theme is CSS and images on keycloak.v2, with no template overrides."""
+    realm = json.loads(REALM.read_text())
+    assert realm["loginTheme"] == "kitchenless"
+    props = dict(
+        line.split("=", 1)
+        for line in (THEME / "theme.properties").read_text().splitlines()
+        if line and not line.startswith("#")
+    )
+    assert props["parent"] == "keycloak.v2"
+    assert props["import"] == "common/keycloak"
+    assert props["styles"].split() == ["css/styles.css", "css/kitchenless.css"]
+    assert not list(THEME.rglob("*.ftl")), "the theme must not override templates (§3.3)"
+    assert (THEME / "resources/img/spinach-icon.png").read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+    assert "url(../img/spinach-icon.png)" in (THEME / "resources/css/kitchenless.css").read_text()
+    assert THEME_COPY in DOCKERFILE.read_text()
+
+
+def test_every_class_scope_has_consent_text() -> None:
+    """showcase.md §3.3: every scope in grants.CLASS_SCOPES is a realm client scope shown on
+    the consent screen with its §3.3 text."""
+    from services.identity.grants import CLASS_SCOPES
+
+    realm = json.loads(REALM.read_text())
+    scopes = {s["name"]: s for s in realm["clientScopes"]}
+    class_scopes = {name for names in CLASS_SCOPES.values() for name in names}
+    assert class_scopes == set(CONSENT_TEXT)
+    for name in sorted(class_scopes):
+        assert name in scopes, f"realm has no client scope {name}"
+        attrs = scopes[name]["attributes"]
+        assert attrs["display.on.consent.screen"] == "true", name
+        assert attrs["consent.screen.text"] == CONSENT_TEXT[name], name

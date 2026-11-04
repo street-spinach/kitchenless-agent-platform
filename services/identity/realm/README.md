@@ -37,6 +37,11 @@ owner runs the steps after merge.
     `service_account`, `delegation:client`). **A realm import that lists `clientScopes`
     gets no built-in scopes except `offline_access`**, so a scope removed from the list
     is gone from the realm (without `basic`, tokens have no `sub`).
+*   `loginTheme: "kitchenless"` (showcase.md §3.3): the CSS-only theme in
+    `theme/kitchenless/login/`, which the image copies to `/opt/keycloak/themes/`. Each
+    class scope carries the §3.3 `consent.screen.text`; `tests/unit/test_realm_file.py`
+    fails if a scope in `grants.CLASS_SCOPES` has none. On an existing realm, apply both
+    with `kcadm.sh` (showcase.md §3.3, "Deploying the theme").
 *   The seeded users with fixed ids, each with `realmRoles: ["default-roles-kitchenless"]`
     (users created by an import get no default roles, and without `offline_access`
     consent fails):
