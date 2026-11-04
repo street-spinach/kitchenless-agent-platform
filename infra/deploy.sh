@@ -4,14 +4,16 @@
 set -euo pipefail
 SHA="$1"
 APP_IMAGE_REPO="ghcr.io/street-spinach/kitchenless-app"
+# The app root. Only tests set APP_DIR.
+APP_DIR="${APP_DIR:-/opt/app}"
 
 # Step 1: a freeze (before demo day, or a Keycloak upgrade) skips the deploy.
-if [ -e /opt/app/DEPLOY_FREEZE ]; then
-  echo "Deploy of $SHA skipped: /opt/app/DEPLOY_FREEZE exists."
+if [ -e "$APP_DIR/DEPLOY_FREEZE" ]; then
+  echo "Deploy of $SHA skipped: $APP_DIR/DEPLOY_FREEZE exists."
   exit 0
 fi
 
-cd /opt/app
+cd "$APP_DIR"
 COMPOSE=(docker compose -f infra/docker-compose.yml --env-file infra/.env)
 LAST_GREEN=$(cat .last_green 2>/dev/null || echo "")
 
@@ -27,9 +29,15 @@ if ! ghcr_token | grep -q .; then
 fi
 ghcr_token | docker login ghcr.io -u madushankaf --password-stdin >/dev/null
 
-# Step 3: shell values win over infra/.env in Compose interpolation.
+# Step 3: shell values win over infra/.env in Compose interpolation. The checks run in stub
+# mode (G7); step 6a gives `agents` back the mode infra/.env sets.
 export APP_TAG="$SHA"
 export MODEL_MODE=stub
+
+# The MODEL_MODE line of infra/.env, without quotes (empty when missing).
+env_model_mode() {
+  sed -n 's/^MODEL_MODE=//p' infra/.env | tail -n 1 | sed -e 's/^["'\'']//' -e 's/["'\'']$//'
+}
 
 # Caddy reads infra/Caddyfile through a single-file bind mount. `git checkout` replaces the
 # file, the running container keeps the old one, and `up` only recreates Caddy when its
@@ -60,6 +68,19 @@ if up_all && make seed && make smoke && make scenario; then
   echo "$SHA" > .last_green
   prune_app_images
   echo "Deploy $SHA verified."
+  # Step 6a: when infra/.env holds MODEL_MODE=real (demo week, evals §9), recreate `agents`
+  # from it so the VM stays in real mode after a deploy. If that doesn't come up, put
+  # `agents` back in stub mode (MODEL_MODE=stub is still exported here) and fail, so the
+  # owner sees it. The image itself is verified, so `.last_green` stands and nothing rolls
+  # back.
+  if [ "$(env_model_mode)" = "real" ]; then
+    if ! infra/eval-mode.sh restore; then
+      echo "WARNING: agents did not come back in real mode; it is back in stub mode."
+      "${COMPOSE[@]}" up -d --no-build --no-deps --force-recreate --wait agents || true
+      exit 1
+    fi
+    echo "agents restored in real mode from infra/.env."
+  fi
   exit 0
 fi
 

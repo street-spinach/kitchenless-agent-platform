@@ -1176,6 +1176,11 @@ G6 measures the **peak** during a full weekly-order run: `docker stats` sampled 
     5.  Run `make seed`, `make smoke` and `make scenario`.
     6.  On success, write `.last_green` and remove local `kitchenless-app` images other
         than the 3 newest tags.
+        *Amended 2026-11-04 (owner, demo week):* then, when `infra/.env` holds
+        `MODEL_MODE=real`, run `infra/eval-mode.sh restore` so `agents` runs in `.env`'s
+        mode again (evals §9). The checks in step 5 still run in stub mode (G7). If the
+        restore fails, recreate `agents` in stub mode and exit 1; `.last_green` stands, since
+        the image was verified.
     7.  On failure, set `APP_TAG=$LAST_GREEN`, run `up -d --no-build --wait` and
         `make smoke`, then exit 1.
 

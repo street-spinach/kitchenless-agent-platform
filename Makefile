@@ -53,8 +53,19 @@ eval-fast:
 eval-safety:
 	uv run python -m evals.run --tag fast --category safety --repeats 1
 
+# Until eval-nightly.sh (#232) replaces it: when `agents` serves the real model (demo week,
+# evals §9), the stub suite is skipped, as evals §10 step 3 does with real evals off, so the
+# nightly never spends model tokens.
+AGENTS_MODEL_MODE = $(COMPOSE) exec -T agents python -c "import json,urllib.request; \
+	print(json.load(urllib.request.urlopen('http://127.0.0.1:8003/health', timeout=3)) \
+	.get('model_mode', ''))"
+
 eval-full:
-	$(COMPOSE) run --rm testrunner python -m evals.run --all
+	@if [ "$$($(AGENTS_MODEL_MODE) 2>/dev/null)" = "real" ]; then \
+		echo 'EVAL_STATUS {"outcome": "skipped", "detail": "agents_real"}'; \
+	else \
+		$(COMPOSE) run --rm testrunner python -m evals.run --all; \
+	fi
 
 # SEED_ARGS, for example --env eval (architecture items 55 and 73).
 seed:

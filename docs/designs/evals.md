@@ -709,6 +709,12 @@ Recreating `agents` drops in-flight steps; they are redelivered (architecture §
 households get real-mode answers during the window (E-OD5). The scripts run inside the
 `deploy` concurrency group, so a deploy never interleaves with them.
 
+*Amended 2026-11-04 (owner: demo week starts now):* `infra/.env` on the VM holds
+`MODEL_MODE=real` from now on. `deploy.sh` runs `restore` after a verified deploy
+(architecture §11, `deploy.sh` step 6), so a deploy, whose checks run in stub mode, leaves
+the VM in real mode. With real evals off, the nightly reports `skipped`, `agents_real` (§10
+step 3) and spends no tokens.
+
 ### 10. The nightly workflow
 
 `nightly-evals.yml` keeps its schedule, `workflow_dispatch` (gaining an optional
