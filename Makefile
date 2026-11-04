@@ -7,7 +7,7 @@ define allow_empty
 s=$$?; if [ $$s -eq 5 ]; then echo "No $(1) tests yet."; exit 0; fi; exit $$s
 endef
 
-.PHONY: up down lint test-unit test-contract fga-test smoke a2a-smoke scenario scenario-identity eval-fast eval-safety eval-full seed seed-local app-deps app-lint app-test
+.PHONY: up down lint test-unit test-contract fga-test smoke a2a-smoke scenario scenario-identity eval-fast eval-safety eval-full eval-nightly seed seed-local app-deps app-lint app-test
 
 up:
 	$(COMPOSE) up -d --build --remove-orphans --wait
@@ -70,6 +70,10 @@ eval-full:
 	else \
 		$(COMPOSE) run --rm testrunner python -m evals.run --all; \
 	fi
+
+# One night's eval run on the VM (evals §10). BUSINESS_MODEL makes it a D4 run.
+eval-nightly:
+	infra/eval-nightly.sh $(BUSINESS_MODEL)
 
 # SEED_ARGS, for example --env eval (architecture items 55 and 73).
 seed:

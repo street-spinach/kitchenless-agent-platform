@@ -3,6 +3,12 @@ on:
   schedule:
     - cron: "30 20 * * *"   # 02:00 in Colombo
   workflow_dispatch:
+    inputs:
+      business_model:
+        description: Business model name for a D4 run (evals §11). Empty for a normal night.
+        required: false
+        type: string
+        default: ""
 permissions:
   contents: read
   issues: write
@@ -16,25 +22,59 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      # The name goes through a remote shell and make, so only plain name characters pass.
+      - name: Check the business model input
+        env:
+          BUSINESS_MODEL: ${{ inputs.business_model }}
+        run: |
+          if [[ ! "$BUSINESS_MODEL" =~ ^[A-Za-z0-9._/:-]*$ ]]; then
+            echo "::error::business_model has characters outside A-Za-z0-9._/:-"
+            exit 1
+          fi
+      # A stopped VM must reach triage (E-CUJ 4), so a failed keyscan fails at SSH below.
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.VM_SSH_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H "${{ secrets.VM_HOST }}" >> ~/.ssh/known_hosts
-      - name: Run full eval suite on the VM
-        id: evals
-        shell: bash
+          ssh-keyscan -H "${{ secrets.VM_HOST }}" >> ~/.ssh/known_hosts || true
+      # The SSH exit code is ignored: the EVAL_STATUS line decides (evals §10). The limits
+      # leave triage time to report a VM that went away mid-run.
+      - name: Run the nightly evals on the VM
+        continue-on-error: true
+        timeout-minutes: 57
+        env:
+          BUSINESS_MODEL: ${{ inputs.business_model }}
         run: |
-          set -o pipefail
-          ssh "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}" "cd /opt/app && make eval-full" 2>&1 | tee evals.log
-      - name: File regression issue
-        if: failure()
+          ssh -o ConnectTimeout=30 -o ServerAliveInterval=30 -o ServerAliveCountMax=4 \
+            "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}" \
+            "cd /opt/app && make eval-nightly BUSINESS_MODEL='$BUSINESS_MODEL'" 2>&1 | tee evals.log || true
+      - name: List open issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh issue list --state open --json number,title,labels --limit 200 > issues.json
+      - name: Triage
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # shellcheck disable=SC2016  # backticks are a literal Markdown code fence
-          gh issue create \
-            --title "Eval regression $(date -u +%Y-%m-%d)" \
-            --label "eval-regression,needs-human" \
-            --body "$(printf 'Nightly evals fell below thresholds.\n\n```\n%s\n```' "$(tail -n 80 evals.log)")"
+          python3 scripts/eval_triage.py --log evals.log --issues issues.json > action.json
+          jq -r '.body // ""' action.json > body.md
+          case "$(jq -r .action action.json)" in
+            create)
+              gh issue create --title "$(jq -r .title action.json)" \
+                --label "$(jq -r '.labels | join(",")' action.json)" --body-file body.md
+              ;;
+            comment)
+              number=$(jq -r .number action.json)
+              gh issue comment "$number" --body-file body.md
+              jq -r '.add_labels[]' action.json | while read -r label; do
+                gh issue edit "$number" --add-label "$label"
+              done
+              ;;
+          esac
+      - name: Job summary
+        if: always()
+        run: |
+          if [ -f evals.log ]; then
+            sed -n '/EVAL_SUMMARY_BEGIN/,/EVAL_SUMMARY_END/p' evals.log >> "$GITHUB_STEP_SUMMARY"
+          fi
