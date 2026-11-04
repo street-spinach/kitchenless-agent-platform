@@ -1,0 +1,13 @@
+# Agent-protocol "Eval cases": the same `quote_request` messageId sent twice inserts one row.
+# The closing `cancel` is not in the design's table: only it gives the run an outcome inside the
+# eval timeout (see the PR's Decisions).
+id: tools-a2a-duplicate-send-one-row
+category: tools
+tags: [fast]
+run: a2a_demo
+a2a_steps:
+  - { op: send, type: quote_request, message: request }
+  - { op: send, type: quote_request, message: request }
+  - { op: cancel }
+expect:
+  - check: no_duplicate_message_ids

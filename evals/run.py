@@ -1,11 +1,12 @@
 """Eval runner (ENGINEERING_PROCESS.md section 12.6).
 
 For each selected case and repeat: reset and seed mocks, start the scenario, drive the open
-run (`approve_as`, `inject`, `shortfall`; architecture item 65, agent-protocol P38), wait for
-an `outcome` trace event, then run the case's checks over the trace (and, for checks that take
-it, a read-only `db` snapshot of the run's rows). Each attempt's verdict and the eval run's
-outcome come from `evals/outcome.py` (evals.md §5). Writes evals/results/<timestamp>.json (JSON
-v1, the field table in `evals/outcome.py`) and .md, prints the Markdown summary between
+run (`approve_as`, `inject`, `shortfall`, `a2a_steps`; architecture item 65, agent-protocol
+P38), wait for an `outcome` trace event, then run the case's checks over the trace (and, for
+checks that take it, a read-only `db` snapshot of the run's rows). Each attempt's verdict and
+the eval run's outcome come from `evals/outcome.py` (evals.md §5). Writes
+evals/results/<timestamp>.json (JSON v1, the field table in `evals/outcome.py`) and .md, prints
+the Markdown summary between
 `SUMMARY_BEGIN` and `SUMMARY_END`, and ends standard output with one `EVAL_STATUS` line. Exit
 codes: 0 pass or budget exhausted, 1 regression, 2 invalid cases, 3 infra or model unavailable.
 
@@ -33,7 +34,7 @@ Budget, deadline, lock and history (evals.md §5, §7; build step 5c):
 *   With `--mode real`: `$AGENTS_URL/health` must report `model_mode: real` (else `infra`,
     `mode_mismatch`).
 
-Config (env): ORCHESTRATOR_URL, DATABASE_URL, AGENTS_URL, EVAL_TIMEOUT_SECONDS,
+Config (env): ORCHESTRATOR_URL, DATABASE_URL, AGENTS_URL, A2A_DEMO_TOKEN, EVAL_TIMEOUT_SECONDS,
 EVAL_DEADLINE_SECONDS, RUN_TOKEN_CEILING, GIT_SHA.
 """
 
@@ -65,9 +66,17 @@ from psycopg.types.json import Jsonb
 from evals import outcome
 from evals import select as case_order
 from evals.checks import CHECKS
+from services.agents.a2a.server import SENDER as A2A_SENDER
+from services.agents.a2a.server import VERSION_HEADER as A2A_VERSION_HEADER
 from services.agents.common.trace import read_trace
 from services.common import directory, ids, orders
 from services.common.protocol import render_summary
+from services.common.protocol.a2a import (
+    A2A_PROTOCOL_VERSION,
+    ROLE_USER,
+    TASK_STATE_SUBMITTED,
+    TASK_STATE_WORKING,
+)
 from services.common.trace import TraceStore
 from services.mocks.control import SETUP_KEYS
 from services.safety.scope import Unscoped, unscoped
@@ -128,6 +137,19 @@ DEFAULT_TEXT = {
 }
 # Shortfall reply buttons are `sf:<shortfall_id>:<line>:<sku | drop>` (agent-protocol §10).
 SHORTFALL_BUTTON = "sf"
+# Agent-protocol P38: the `a2a_demo` scenario, against the seller of CUJ 7. The endpoint fills
+# every other field of the request (§11 step 4).
+A2A_DEMO = "a2a_demo"
+A2A_AGENT = "grocery:mock-us"
+A2A_REQUEST = {
+    "items": [
+        {"item": "milk", "qty": 1, "unit": "each"},
+        {"item": "eggs", "qty": 1, "unit": "each"},
+    ],
+    "constraints": {"allergens": [], "diets": []},
+}
+A2A_OPS = ("send", "get", "cancel")
+A2A_STEP_FIELDS = frozenset({"op", "type", "message", "error", "total_percent"})
 
 # evals.md §5, "Standard output".
 SUMMARY_BEGIN = "<!-- EVAL_SUMMARY_BEGIN -->"
@@ -140,6 +162,8 @@ RUNNER_ERROR_CHECK = "runner_error"
 
 # evals.md §5 and §7 (build step 5c).
 DEFAULT_AGENTS_URL = "http://localhost:8003"
+# Matches infra/.env.example, for runs on the host, as DEFAULT_DATABASE_URL does.
+DEFAULT_A2A_TOKEN = "change-me-local"
 DEFAULT_TIMEOUT_SECONDS = 300.0
 DEFAULT_DEADLINE_SECONDS = 3000.0
 LOCK_KEY = "evals:eval"
@@ -277,6 +301,30 @@ def _validate_setup(case: dict[str, Any], source: str) -> None:
             raise CaseError(f"{source}: setup key {name!r} must be {key.type.__name__}")
 
 
+def _validate_a2a(case: dict[str, Any], source: str) -> None:
+    """`a2a_steps` (agent-protocol P38): `{op: send, type, message?, error?, total_percent?}`,
+    `{op: get}` or `{op: cancel}`, opening with the `quote_request` that starts the run."""
+    if case["run"] != A2A_DEMO:
+        if "a2a_steps" in case:
+            raise CaseError(f"{source}: a2a_steps is only for {A2A_DEMO}")
+        return
+    if "overrides" in case:
+        raise CaseError(f"{source}: {A2A_DEMO} takes no overrides: the endpoint starts the run")
+    steps = case.get("a2a_steps")
+    if not isinstance(steps, list) or not steps:
+        raise CaseError(f"{source}: {A2A_DEMO} needs a non-empty a2a_steps list")
+    for step in steps:
+        if (
+            not isinstance(step, dict)
+            or step.get("op") not in A2A_OPS
+            or set(step) - A2A_STEP_FIELDS
+            or (step["op"] == "send") != isinstance(step.get("type"), str)
+        ):
+            raise CaseError(f"{source}: bad a2a step {step!r}")
+    if steps[0].get("type") != "quote_request" or "error" in steps[0]:
+        raise CaseError(f"{source}: a2a_steps must open with send quote_request")
+
+
 def _validate_expect(case: dict[str, Any], source: str) -> None:
     if not isinstance(case["expect"], list) or not case["expect"]:
         raise CaseError(f"{source}: expect must be a non-empty list")
@@ -316,6 +364,7 @@ def validate_case(case: Any, source: str, categories: set[str]) -> dict[str, Any
         raise CaseError(f"{source}: unknown scenario {case['run']!r}")
     _validate_modes(case, source)
     _validate_setup(case, source)
+    _validate_a2a(case, source)
     _validate_expect(case, source)
     return case
 
@@ -471,15 +520,127 @@ def start_pair(case: dict[str, Any]) -> uuid.UUID:
     return uuid.UUID(post_json("/runs", body)["run_id"])
 
 
+def a2a_rpc(method: str, params: dict[str, Any]) -> dict[str, Any]:
+    """One JSON-RPC call to `<AGENTS_URL>/a2a/<A2A_AGENT>`; an HTTP error status raises."""
+    base = os.environ.get("AGENTS_URL", DEFAULT_AGENTS_URL).rstrip("/")
+    token = os.environ.get("A2A_DEMO_TOKEN") or DEFAULT_A2A_TOKEN
+    payload = {"jsonrpc": "2.0", "id": str(uuid.uuid4()), "method": method, "params": params}
+    req = urllib.request.Request(
+        f"{base}/a2a/{A2A_AGENT}",
+        data=json.dumps(payload).encode(),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            A2A_VERSION_HEADER: A2A_PROTOCOL_VERSION,
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read())
+
+
+class A2AClient:
+    """One attempt's A2A client, following the case's `a2a_steps` (agent-protocol P38). Message
+    ids are new each attempt, or a repeat would count as a duplicate of the last attempt's
+    `SendMessage`; steps with the same `message` name share one id."""
+
+    def __init__(self, steps: list[dict[str, Any]]) -> None:
+        self.pending = list(steps)
+        self.attempt = uuid.uuid4().hex
+        self.task: dict[str, Any] | None = None
+        self.last_message_id = ""
+
+    def _offer(self) -> dict[str, Any]:
+        artifacts = (self.task or {}).get("artifacts") or []
+        if not artifacts:
+            raise CaseError("a2a counter_offer: the task has no offer")
+        return artifacts[-1]["parts"][0]["data"]["body"]
+
+    def _body(self, step: dict[str, Any]) -> dict[str, Any]:
+        if step["type"] == "quote_request":
+            return A2A_REQUEST
+        if step["type"] == "counter_offer":
+            offer = self._offer()
+            return {
+                "round": offer["round"],
+                "lines": offer["lines"],
+                "total_minor": offer["total_minor"] * step.get("total_percent", 100) // 100,
+                "currency": offer["currency"],
+            }
+        return {}
+
+    def _message(self, step: dict[str, Any]) -> dict[str, Any]:
+        self.last_message_id = f"{self.attempt}:{step.get('message') or uuid.uuid4().hex}"
+        message: dict[str, Any] = {
+            "messageId": self.last_message_id,
+            "role": ROLE_USER,
+            "parts": [{"data": {"type": step["type"], "body": self._body(step)}}],
+        }
+        if step["type"] != "quote_request" and self.task is not None:
+            message["taskId"] = self.task["id"]
+            message["contextId"] = self.task["contextId"]
+        return message
+
+    def _call(
+        self, step: dict[str, Any], method: str, params: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """The call's result, or `None` for the JSON-RPC error the step expects. Any other
+        answer raises: an `accept` that is not refused must fail the attempt."""
+        reply = a2a_rpc(method, params)
+        error = reply.get("error")
+        if (error or {}).get("code") != step.get("error"):
+            raise CaseError(f"a2a {method}: got {error!r}, expected error {step.get('error')!r}")
+        return None if error else reply["result"]
+
+    def advance(self) -> bool:
+        """Run the next step; returns whether every step is done. A `get` repeats until the
+        task leaves `SUBMITTED` and `WORKING`."""
+        step = self.pending[0]
+        if step["op"] == "send":
+            result = self._call(step, "SendMessage", {"message": self._message(step)})
+            task = result["task"] if result else None
+        elif self.task is None:
+            raise CaseError(f"a2a {step['op']}: no task yet")
+        elif step["op"] == "get":
+            task = self._call(step, "GetTask", {"id": self.task["id"]})
+        else:
+            task = self._call(step, "CancelTask", {"id": self.task["id"]})
+        if task is not None:
+            self.task = task
+        waiting = task is not None and task["status"]["state"] in (
+            TASK_STATE_SUBMITTED,
+            TASK_STATE_WORKING,
+        )
+        if step["op"] == "get" and waiting:
+            return False
+        self.pending.pop(0)
+        return not self.pending
+
+
+# Clients of the attempts started by `start_a2a`, until `run_steps` takes them.
+A2A_CLIENTS: dict[uuid.UUID, A2AClient] = {}
+
+
+def start_a2a(case: dict[str, Any]) -> uuid.UUID:
+    """Send the opening `quote_request`, which starts the run; `run_steps` drives the rest.
+    The run's id is derived from the request's message id (agent-protocol §11 step 3)."""
+    client = A2AClient(case["a2a_steps"])
+    client.advance()
+    run_id = ids.a2a_run_id(ids.a2a_message_id(A2A_SENDER, client.last_message_id))
+    A2A_CLIENTS[run_id] = client
+    return run_id
+
+
 SCENARIOS: dict[str, Callable[[dict[str, Any]], uuid.UUID]] = {
     "hello": start_hello,
     "weekly_grocery_order": _start_run("weekly_grocery_order"),
     PAIR: start_pair,
     "busy_night_dinner": _start_run("busy_night_dinner"),
+    A2A_DEMO: start_a2a,
 }
 
 
-# --- runner steps while the run is open (approve_as, inject, shortfall) ----------------------
+# --- runner steps while the run is open (approve_as, inject, shortfall, a2a_steps) -----------
 
 # A step is polled with the run's current trace until it returns True (done).
 Step = Callable[[list[dict[str, Any]]], bool]
@@ -699,8 +860,20 @@ def inject_step(dsn: str, run_id: uuid.UUID, spec: dict[str, Any]) -> Step:
     return step
 
 
+def a2a_step(client: A2AClient) -> Step:
+    """`a2a_steps`: one client step per poll, so `drive` sees an outcome before the next."""
+
+    def step(trace: list[dict[str, Any]]) -> bool:
+        return client.advance()
+
+    return step
+
+
 def run_steps(case: dict[str, Any], dsn: str, run_id: uuid.UUID) -> list[Step]:
     steps = []
+    client = A2A_CLIENTS.pop(run_id, None)
+    if client is not None and client.pending:
+        steps.append(a2a_step(client))
     if case.get("approve_as"):
         steps.append(approve_step(dsn, run_id, case["approve_as"]))
     if case.get("inject"):

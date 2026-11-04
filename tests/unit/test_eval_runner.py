@@ -614,6 +614,143 @@ def test_shortfall_waits_for_courier_booked_and_taps(
     assert [p for p, _ in api.calls].count("/panel/events") == 1
 
 
+class FakeA2A:
+    """Records `a2a_rpc` calls and answers as the endpoint does for one task."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.states = iter(["TASK_STATE_WORKING", "TASK_STATE_INPUT_REQUIRED"])
+        offer = {"round": 0, "lines": [{"line": 0}], "total_minor": 1000, "currency": "USD"}
+        self.task = {
+            "id": str(uuid.uuid4()),
+            "contextId": str(uuid.uuid4()),
+            "status": {"state": "TASK_STATE_SUBMITTED"},
+            "artifacts": [{"parts": [{"data": {"type": "offer", "body": offer}}]}],
+        }
+
+    def __call__(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append((method, params))
+        if method == "SendMessage":
+            data = params["message"]["parts"][0]["data"]
+            if data["type"] == "accept":
+                return {"error": {"code": -32004, "message": "no", "data": []}}
+            return {"result": {"task": self.task}}
+        if method == "GetTask":
+            return {"result": {**self.task, "status": {"state": next(self.states)}}}
+        return {"result": self.task}
+
+    def sent(self, kind: str) -> list[dict[str, Any]]:
+        return [
+            p["message"]
+            for m, p in self.calls
+            if m == "SendMessage" and p["message"]["parts"][0]["data"]["type"] == kind
+        ]
+
+
+A2A_STEPS = [
+    {"op": "send", "type": "quote_request", "message": "request"},
+    {"op": "send", "type": "quote_request", "message": "request"},
+    {"op": "get"},
+    {"op": "send", "type": "counter_offer", "total_percent": 96},
+    {"op": "send", "type": "accept", "error": -32004},
+    {"op": "cancel"},
+]
+
+
+def a2a_case(steps: list[dict[str, Any]]) -> dict[str, Any]:
+    return case(run="a2a_demo", a2a_steps=steps)
+
+
+def test_a2a_steps_drive_client(api: FakeApi, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeA2A()
+    monkeypatch.setattr(run, "a2a_rpc", fake)
+    monkeypatch.setattr(run, "read_trace", lambda dsn, rid: [])
+    monkeypatch.setattr(run.time, "sleep", lambda s: None)
+
+    run_id = run.start_a2a(a2a_case(A2A_STEPS))
+    first = fake.calls[0][1]["message"]
+    message_id = ids.a2a_message_id("external:a2a-demo", first["messageId"])
+    assert run_id == ids.a2a_run_id(message_id)
+    assert [m for m, _ in fake.calls] == ["SendMessage"]
+
+    [step] = run.run_steps(a2a_case(A2A_STEPS), "dsn", run_id)
+    run.drive("dsn", run_id, [step], deadline=run.time.monotonic() + 5)
+
+    assert [m for m, _ in fake.calls] == [
+        "SendMessage",
+        "SendMessage",
+        "GetTask",  # still WORKING, so it repeats
+        "GetTask",
+        "SendMessage",
+        "SendMessage",
+        "CancelTask",
+    ]
+    # A named message keeps its id; the client sends no ids of the order or the run.
+    assert [m["messageId"] for m in fake.sent("quote_request")] == [first["messageId"]] * 2
+    assert "taskId" not in first
+    assert first["parts"][0]["data"]["body"] == run.A2A_REQUEST
+    [counter] = fake.sent("counter_offer")
+    assert (counter["taskId"], counter["contextId"]) == (fake.task["id"], fake.task["contextId"])
+    body = counter["parts"][0]["data"]["body"]
+    assert (body["round"], body["total_minor"], body["currency"]) == (0, 960, "USD")
+    assert fake.calls[-1][1] == {"id": fake.task["id"]}
+    assert run_id not in run.A2A_CLIENTS
+
+
+def test_a2a_message_ids_differ_between_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeA2A()
+    monkeypatch.setattr(run, "a2a_rpc", fake)
+    steps = [{"op": "send", "type": "quote_request", "message": "request"}]
+    assert run.start_a2a(a2a_case(steps)) != run.start_a2a(a2a_case(steps))
+
+
+@pytest.mark.parametrize(
+    "steps",
+    [
+        # A step whose refusal does not come fails the attempt, as an unrefused accept would.
+        [
+            {"op": "send", "type": "quote_request"},
+            {"op": "send", "type": "reject", "error": -32004},
+        ],
+        # An error nobody expected fails it too.
+        [{"op": "send", "type": "quote_request"}, {"op": "send", "type": "accept"}],
+    ],
+)
+def test_a2a_unexpected_answer_is_a_runner_error(
+    api: FakeApi, monkeypatch: pytest.MonkeyPatch, steps: list[dict[str, Any]]
+) -> None:
+    monkeypatch.setattr(run, "a2a_rpc", FakeA2A())
+    monkeypatch.setattr(run, "read_trace", lambda dsn, rid: [])
+    res = run.run_case(a2a_case(steps), 1, "dsn", timeout=5)
+    assert not res.passed
+    assert [c["check"] for c in res.checks] == [run.RUNNER_ERROR_CHECK]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"run": "a2a_demo"}, "needs a non-empty a2a_steps"),
+        ({"run": "a2a_demo", "a2a_steps": [{"op": "get"}]}, "must open with"),
+        ({"run": "a2a_demo", "a2a_steps": [{"op": "send"}]}, "bad a2a step"),
+        ({"run": "a2a_demo", "a2a_steps": [{"op": "wait"}]}, "bad a2a step"),
+        ({"run": "a2a_demo", "a2a_steps": [{"op": "get", "type": "accept"}]}, "bad a2a step"),
+        (
+            {
+                "run": "a2a_demo",
+                "a2a_steps": [{"op": "send", "type": "quote_request"}],
+                "overrides": {"STUB_FAIL_NODE": "x"},
+                "model_modes": ["stub"],
+            },
+            "takes no overrides",
+        ),
+        ({"a2a_steps": [{"op": "send", "type": "quote_request"}]}, "only for a2a_demo"),
+    ],
+)
+def test_bad_a2a_steps_are_rejected(overrides: dict[str, Any], message: str) -> None:
+    with pytest.raises(CaseError, match=message):
+        run.validate_case(case(**overrides), "cases/task/c1.yaml", CATEGORIES)
+
+
 def test_run_case_drives_steps_and_counts_reasons(
     api: FakeApi, monkeypatch: pytest.MonkeyPatch
 ) -> None:
