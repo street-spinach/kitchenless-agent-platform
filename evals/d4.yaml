@@ -1,0 +1,8 @@
+# The D4 case list (evals.md §11): the real-capable cases whose traces have business
+# `decision` rows. Both business models run this same list.
+- task-weekly-order-completes
+- task-busy-night-dinner-completes
+- robust-out-of-stock-substitution
+- decision-full-offer-beats-cheaper-partial
+- decision-counter-at-remaining-budget
+- decision-delivery-earliest-window

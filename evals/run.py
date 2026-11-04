@@ -14,7 +14,8 @@ Cases follow the format of evals.md §4 and are validated before any attempt (ex
 (evals.md §5): `--tag`, `--category`, `--case`, `--cases-file`, `--all`, `--repeats`,
 `--mode stub|real` (default `stub`; only cases whose `model_modes` include it run, each its
 category's `repeats[mode]` times), `--trigger` and `--list` (every case's id, category, tags,
-model modes and source design from `evals/coverage.yaml`; runs nothing).
+model modes and source design from `evals/coverage.yaml`; runs nothing). With `--trigger d4`
+the summary ends with `evals.d4.report` (evals.md §11).
 
 Order (evals.md §7, `evals/select.py`): stub mode runs cases in id order; real mode runs the
 cases least recently attempted in real mode with their current `case_hash` first, read from
@@ -63,7 +64,7 @@ import yaml
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from evals import outcome
+from evals import d4, outcome
 from evals import select as case_order
 from evals.checks import CHECKS
 from services.agents.a2a.server import SENDER as A2A_SENDER
@@ -206,6 +207,7 @@ class RunResult:
     models_used: list[str] = field(default_factory=list)
     verdict: str | None = None
     error_kind: str | None = None
+    decisions: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.verdict is None:
@@ -416,11 +418,11 @@ def select(
     mode: str | None = None,
 ) -> list[dict[str, Any]]:
     """The cases chosen by the flags; with `mode`, only cases whose `model_modes` include it
-    (evals.md §4)."""
+    (evals.md §4). `--cases-file` narrows `--all`: `infra/eval-nightly.sh` passes both for D4."""
     if mode is not None:
         cases = [c for c in cases if mode in model_modes(c)]
     if all_cases:
-        return list(cases)
+        return [c for c in cases if case_ids is None or c["id"] in case_ids]
     return [
         c
         for c in cases
@@ -1118,6 +1120,7 @@ def run_case(
         result.reason = outcomes[-1]["payload"].get("reason") if outcomes else None
         result.model_error = outcome.model_error(trace)
         result.models_used = sorted({r["model"] for r in trace if r.get("model")})
+        result.decisions = d4.decision_rows(trace)
         db = db_snapshot(dsn, run_id) if needs_db(case) else None
         result.checks = run_checks(trace, case, db)
     except Exception as err:
@@ -1738,6 +1741,9 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         release_lock(lock)
     markdown = to_markdown(summary, results)
+    if args.trigger == "d4":
+        attempts = [{**_attempt_facts(r), "decisions": r.decisions} for r in results]
+        markdown += "\n" + d4.report(attempts)
     path = write_results(summary, results, markdown)
     print(f"Results: {path}")
     print_report(markdown, status_line(summary, results))
