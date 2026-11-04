@@ -55,6 +55,11 @@ The setup tools (experience §9, EX-I26), for the consumer agent:
     `pending` onto the new user and marks the code used (EX-I31). Until then the codes of
     open join codes are part of the household's merged allergens and constraints.
 
+The pantry correction (experience §8, EX-I39):
+
+*   `record_pantry_check(pantry_item, kind, user_id)` *guarded*, `api` service token, adults
+    only: one `verify` or `out` event for a vocabulary item.
+
 The household is always the run's household (`runs.household_id`), never an argument.
 """
 
@@ -118,6 +123,7 @@ __all__ = [
     "propose_setup",
     "record_delivery",
     "record_dislike",
+    "record_pantry_check",
     "request_approval",
     "server",
     "set_order_state",
@@ -165,6 +171,14 @@ SETUP_EXPIRED = "setup_expired"
 _SETUP_ANSWERS = frozenset({"yes", "no", "remove", "keep"})
 _REMOVAL_ANSWERS = frozenset({"remove", "keep"})
 _JOIN_CODE_TRIES = 3
+# `record_pantry_check` (experience EX-I39): the person is not an adult of the household, the
+# item is not a vocabulary name, or the household's pantry is off (PT-OD4).
+NOT_ADULT = "not_adult"
+UNKNOWN_PANTRY_ITEM = "unknown_pantry_item"
+PANTRY_OFF = "pantry_off"
+_ADULT_ROLES = frozenset({"admin", "member"})
+_PANTRY_CHECK_KINDS = frozenset({"verify", "out"})
+_PANTRY_CHECK_SOURCE = "me_page"
 # `complete_join`: not the household's open code for this person's phone (experience §9).
 JOIN_CODE_INVALID = "join_code_invalid"
 
@@ -1932,6 +1946,61 @@ async def apply_setup(
     )
 
 
+async def record_pantry_check(
+    ctx: CallContext, *, pantry_item: str, kind: str, user_id: uuid.UUID
+) -> dict[str, Any]:
+    """An adult's "Still have it" or "Ran out" on `/me/pantry` (experience §8, EX-I39), from
+    `api` with its service token. `user_id` is the signed-in person, checked to be an adult
+    of the run's household (a child is `not_adult`, anyone else `authz_denied`). `pantry_item`
+    is a vocabulary name as written, not an alias. A household whose pantry is off is refused
+    `pantry_off`. `delta` is 0, so `get_pantry`'s `items` do not change.
+    """
+    household = await _run_household(ctx)
+
+    async def check(conn: AsyncConnection) -> None:
+        if ctx.agent_id != API_AGENT:
+            raise GuardRefused(AUTHZ_DENIED)
+        if kind not in _PANTRY_CHECK_KINDS:
+            raise GuardRefused(INVALID_KIND)
+        role = await _role(conn, household, user_id)
+        if role is None:
+            raise GuardRefused(AUTHZ_DENIED)
+        if role not in _ADULT_ROLES:
+            raise GuardRefused(NOT_ADULT)
+        if not pantry.is_enabled(ctx.env):
+            raise GuardRefused(PANTRY_OFF)
+        if pantry_item not in pantry.load_vocabulary().window_days:
+            raise GuardRefused(UNKNOWN_PANTRY_ITEM)
+
+    async def call() -> dict[str, Any]:
+        async with db.get_pool().connection() as conn, conn.transaction():
+            cur = await _scoped(conn, household).execute(
+                "INSERT INTO pantry_events (household_id, item, pantry_item, unit, delta, kind,"
+                " source, run_id, actor_user_id)"
+                " VALUES (%(household)s, %(item)s, %(item)s, 'each', 0, %(kind)s, %(source)s,"
+                " %(run)s, %(user)s) RETURNING event_id",
+                item=pantry_item,
+                kind=kind,
+                source=_PANTRY_CHECK_SOURCE,
+                run=ctx.run_id,
+                user=user_id,
+            )
+            row = await cur.fetchone()
+        assert row is not None
+        return {"event_id": row[0], "pantry_item": pantry_item, "kind": kind}
+
+    return await run_guarded(
+        ctx,
+        tool=f"{AREA}.record_pantry_check",
+        relation=None,
+        limits=check,
+        key=None,
+        request={"pantry_item": pantry_item, "kind": kind, "user_id": str(user_id)},
+        call=call,
+        apply=None,
+    )
+
+
 async def complete_join(ctx: CallContext, *, code: str, user_id: uuid.UUID) -> dict[str, Any]:
     """Finish a join (experience §9, EX-I31), from `api` with its service token. `user_id`
     is the new user: a member of the run's household whose phone is the code's.
@@ -2195,6 +2264,15 @@ async def _apply_setup_tool(
         removal=removal,
         child_user_ids=child_user_ids,
         user_id=user_id,
+    )
+
+
+@server.tool(name="record_pantry_check")
+async def _record_pantry_check_tool(
+    pantry_item: str, kind: Literal["verify", "out"], user_id: uuid.UUID, ctx: Context
+) -> CallToolResult:
+    return await _serve(
+        ctx, record_pantry_check, pantry_item=pantry_item, kind=kind, user_id=user_id
     )
 
 

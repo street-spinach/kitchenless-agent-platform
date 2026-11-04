@@ -3,14 +3,23 @@
 
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
 import psycopg
 import pytest
 from psycopg.types.json import Jsonb
+from psycopg_pool import AsyncConnectionPool
 from starlette.responses import Response
 
 from services.api.routes import me
+from services.common import db as common_db
+from services.common import pantry
+from services.common.mcp_client import AdapterUnavailable, ToolRefused
+from services.identity.errors import AuthzUnavailable
+from services.mcp.household import server as household
+from services.mcp.meta import CallContext
+from services.safety.guard import GuardRefused
 from tests.unit import api_world as aw
 from tests.unit import experience_world as ew
 from tests.unit import identity_world as w
@@ -222,6 +231,224 @@ def test_history_spending(world: World, kc: FakeKeycloak) -> None:
     assert '<span class="muted">' in member
     assert "Dinner</span>" not in member  # the dinners were not Sam's
     assert "$84.20" not in child and "No spending yet." in child
+
+
+def _pantry_event(pg: str, item: str, kind: str, age_hours: float = 0) -> None:
+    with psycopg.connect(pg) as conn:
+        conn.execute(
+            "INSERT INTO pantry_events (household_id, item, pantry_item, kind, delta, unit, source,"
+            " ts) VALUES (%s, %s, %s, %s, 0, 'each', 'test',"
+            " now() - make_interval(secs => %s::float8))",
+            (HOUSEHOLD, item, item, kind, age_hours * 3600),
+        )
+
+
+def _section(text: str, heading: str) -> str:
+    """One state's card on `/me/pantry`."""
+    start = text.index(f">{heading}</h2>")
+    return text[start : text.index("</section>", start)]
+
+
+@db
+def test_pantry_page_on_and_off(world: World, kc: FakeKeycloak) -> None:
+    _named(world.pg, world)
+    _pantry_event(world.pg, "rice", "verify", 2 * 24)  # 14-day window: trusted
+    _pantry_event(world.pg, "milk", "add", 5 * 24)  # 3-day window: stale
+    _pantry_event(world.pg, "bread", "verify", 30)
+    _pantry_event(world.pg, "bread", "out", 1)  # the latest event wins
+    page = _page(world, world.member, "/me/pantry")
+    assert page.status_code == 200
+    text = page.text
+    assert '<a href="/me/pantry" aria-current="page">' in text
+    at_home, unsure, out = (_section(text, h) for h in ("At home", "Not sure", "Out"))
+    assert "<strong>rice</strong>" in at_home and "Last checked 2 days ago" in at_home
+    assert "<strong>milk</strong>" in unsure and "Last checked 5 days ago" in unsure
+    assert "<strong>bread</strong>" in out and "Last checked today" in out
+    # Every vocabulary item is listed; one with no event is Not sure, never checked.
+    assert "<strong>granola</strong>" in unsure and "Never checked" in unsure
+    assert text.count('value="out">Ran out') == len(pantry.load_vocabulary().names)
+    assert 'action="/me/pantry/almond%20milk"' in text
+    assert 'name="csrf" value="' in text
+    # A child sees no household-wide row, so nothing here to read or correct.
+    child = _page(world, world.child, "/me/pantry")
+    assert child.status_code == 200
+    assert "<strong>" in child.text and "rice" not in child.text and "<form" not in child.text
+    # Another household's events are not this household's pantry.
+    with psycopg.connect(world.pg) as conn:
+        conn.execute(
+            "INSERT INTO pantry_events (household_id, item, pantry_item, kind, delta, unit, source)"
+            " VALUES ('h-other', 'granola', 'granola', 'out', 0, 'each', 'test')"
+        )
+    assert "<strong>granola</strong>" in _section(
+        _page(world, world.member, "/me/pantry").text, "Not sure"
+    )
+    # Signed out, and an outsider's session for this household.
+    assert _client(world.pg).get("/me/pantry").status_code == 401
+    assert _page(world, world.other_admin, "/me/pantry").status_code == 401
+    # Off for a live household: the line, no items, even with events.
+    with psycopg.connect(world.pg) as conn:
+        conn.execute("UPDATE households SET env = 'live' WHERE household_id = %s", (HOUSEHOLD,))
+    off = _page(world, world.member, "/me/pantry").text
+    assert "Pantry tracking isn't on for your household yet." in off
+    assert "rice" not in off and "<form" not in off
+
+
+class FakeTool:
+    """`call_tool_as` for `/me` POSTs: records the call, then calls the real tool in its run
+    (`raises` instead fails the call the way the `mcp` service would)."""
+
+    def __init__(self, pg: str, env: str = "eval") -> None:
+        self.pg = pg
+        self.env = env
+        self.calls: list[tuple[str, str, dict[str, Any], Any]] = []
+        self.raises: Exception | None = None
+
+    async def __call__(self, server: str, tool: str, args: Any, *, ctx: Any) -> dict[str, Any]:
+        self.calls.append((server, tool, dict(args), ctx))
+        if self.raises is not None:
+            raise self.raises
+        call = CallContext(
+            run_id=ctx.run_id,
+            agent_id=ctx.agent_id,
+            conversation_id=None,
+            attempt=1,
+            token=w.service_token(ctx.agent_id),
+            env=self.env,
+            modes={},
+            on_behalf_of=None,
+            household_id=HOUSEHOLD,
+        )
+        async with AsyncConnectionPool(self.pg, min_size=1, max_size=3, open=False) as pool:
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setattr(common_db, "get_pool", lambda: pool)
+                try:
+                    return await household.record_pantry_check(
+                        call,
+                        pantry_item=args["pantry_item"],
+                        kind=args["kind"],
+                        user_id=UUID(args["user_id"]),
+                    )
+                except GuardRefused as refused:
+                    raise ToolRefused(refused.reason) from None
+
+
+@pytest.fixture
+def tool(world: World, monkeypatch: pytest.MonkeyPatch) -> FakeTool:
+    """The tool behind `/me` POSTs, the household's grant and `system:api`'s client row."""
+    with psycopg.connect(world.pg) as conn:
+        w.grant_household(conn, HOUSEHOLD, world.admin.user_id)
+        conn.execute(
+            "INSERT INTO agent_clients (agent_id, client_id, kind) VALUES (%s, %s, 'service')",
+            (household.API_AGENT, w.API_CLIENT),
+        )
+    fake = FakeTool(world.pg)
+    monkeypatch.setattr(me, "call_tool_as", fake)
+    return fake
+
+
+def _pantry_post(
+    world: World, person: w.Person, item: str = "rice", kind: str | None = "out"
+) -> Any:
+    client = _client(world.pg)
+    client.cookies.update(_session_cookie(person))
+    data = {"csrf": _csrf(person, "pantry")}
+    if kind is not None:
+        data["kind"] = kind
+    return client.post(f"/me/pantry/{item}", data=data, follow_redirects=False)
+
+
+def _pantry_runs(pg: str) -> list[dict[str, Any]]:
+    return aw.query(
+        pg, "SELECT household_id, kind, status, reason, trigger FROM runs ORDER BY started_at"
+    )
+
+
+@db
+def test_pantry_post(world: World, kc: FakeKeycloak, tool: FakeTool) -> None:
+    resp = _pantry_post(world, world.member)
+    assert (resp.status_code, resp.headers["location"]) == (303, "/me/pantry")
+    [(server, name, args, ctx)] = tool.calls
+    assert (server, name) == ("household", "record_pantry_check")
+    assert args == {"pantry_item": "rice", "kind": "out", "user_id": str(world.member.user_id)}
+    assert ctx.agent_id == "system:api"
+    # The §3 run: a household `chat` run of the session person, ended by `api`.
+    assert _pantry_runs(world.pg) == [
+        {
+            "household_id": HOUSEHOLD,
+            "kind": "chat",
+            "status": "completed",
+            "reason": "record_pantry_check",
+            "trigger": {"user_id": str(world.member.user_id), "source": "me"},
+        }
+    ]
+    [event] = aw.query(world.pg, "SELECT * FROM pantry_events")
+    assert (event["kind"], event["pantry_item"]) == ("out", "rice")
+    assert event["actor_user_id"] == world.member.user_id
+    [run] = aw.query(world.pg, "SELECT run_id FROM runs")
+    assert event["run_id"] == run["run_id"]
+    # The page now shows it Out; a name with a space reaches the tool decoded.
+    assert "<strong>rice</strong>" in _section(_page(world, world.member, "/me/pantry").text, "Out")
+    assert _pantry_post(world, world.admin, "almond%20milk", "verify").status_code == 303
+    assert tool.calls[-1][2]["pantry_item"] == "almond milk"
+
+
+@db
+def test_pantry_post_csrf_and_kind_first(world: World, kc: FakeKeycloak, tool: FakeTool) -> None:
+    client = _client(world.pg)
+    client.cookies.update(_session_cookie(world.member))
+    for csrf in ({}, {"csrf": "forged"}, {"csrf": _csrf(world.member, "band")}):
+        resp = client.post("/me/pantry/rice", data={"kind": "out", **csrf})
+        assert resp.status_code == 403, csrf
+    assert _client(world.pg).post("/me/pantry/rice", data={"kind": "out"}).status_code == 401
+    for kind in ("add", "", None):
+        assert _pantry_post(world, world.member, kind=kind).status_code == 400, kind
+    # An outsider's session for this household is signed out.
+    assert _pantry_post(world, world.other_admin).status_code == 401
+    assert tool.calls == [] and _pantry_runs(world.pg) == []
+
+
+@db
+def test_pantry_post_refused(world: World, kc: FakeKeycloak, tool: FakeTool) -> None:
+    """A refusal shows a page, writes nothing and ends the run `completed` with its reason."""
+    child = _pantry_post(world, world.child)
+    assert child.status_code == 403 and "Only an adult can change this." in child.text
+    unknown = _pantry_post(world, world.member, "caviar")
+    assert unknown.status_code == 404
+    tool.env = "live"
+    off = _pantry_post(world, world.member)
+    assert off.status_code == 403
+    assert aw.query(world.pg, "SELECT 1 FROM pantry_events") == []
+    assert [(r["status"], r["reason"]) for r in _pantry_runs(world.pg)] == [
+        ("completed", "not_adult"),
+        ("completed", "unknown_pantry_item"),
+        ("completed", "pantry_off"),
+    ]
+
+
+@db
+def test_pantry_post_outage_ends_run_error(world: World, kc: FakeKeycloak, tool: FakeTool) -> None:
+    tool.raises = AuthzUnavailable()
+    down = _pantry_post(world, world.member)
+    assert down.status_code == 503
+    assert "We couldn&#39;t check your access just now." in down.text
+    tool.raises = AdapterUnavailable("transport")
+    assert _pantry_post(world, world.member).status_code == 503
+    assert [(r["status"], r["reason"]) for r in _pantry_runs(world.pg)] == [
+        ("error", "authz_unavailable"),
+        ("error", "transport"),
+    ]
+    assert aw.query(world.pg, "SELECT 1 FROM pantry_events") == []
+
+
+@db
+def test_pantry_post_without_grant_starts_no_run(
+    world: World, kc: FakeKeycloak, tool: FakeTool
+) -> None:
+    with psycopg.connect(world.pg) as conn:
+        conn.execute("UPDATE agent_grants SET status = 'revoked'")
+    resp = _pantry_post(world, world.member)
+    assert resp.status_code == 403 and "needs renewing" in resp.text
+    assert tool.calls == [] and _pantry_runs(world.pg) == []
 
 
 @db
