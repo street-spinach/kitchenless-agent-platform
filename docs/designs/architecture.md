@@ -810,7 +810,12 @@ profile may use its own OpenAI-compatible host through `MODEL_BUSINESS_BASE_URL`
 `MODEL_BUSINESS_API_KEY`. When the URL is set, its own key goes with it, even if empty, and
 the primary key is never sent there; when it is empty, the profile uses `MODEL_BASE_URL` and
 `MODEL_API_KEY` as before. The host is an operator choice. A scale-to-zero host's cold
-start is longer than the 5 s timeout, so keep one replica warm for the demo.
+start is longer than the 5 s timeout, so keep one replica warm for the demo. Glimmer is not
+on Baseten, so the planned setup is Muse Spark Open on Baseten's Model API
+(`MODEL_BUSINESS_NAME=meta-models/muse-spark-open`). It is far larger than Glimmer (816B
+mixture-of-experts, 42B active), so the real-model rehearsal (Q2) must confirm that its
+answers fit the 5 s timeout and the 300-token cap; otherwise the business agents fall back
+to the rule defaults on every step.
 
 *   **`MODEL_MODE=real`** calls the primary model, set by `MODEL_BASE_URL` and `MODEL_NAME`.
     This is Muse Spark, Meta's hosted reasoning model (brief §4.3), called through its
