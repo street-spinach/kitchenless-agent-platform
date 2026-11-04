@@ -1,0 +1,14 @@
+# Evals §12 case 7 (AG2): one line is out of stock at grocery:mock-us, so the household takes
+# the full offer from grocery:square-us over the cheaper partial one. Eggs, because
+# grocery:mock-us has no other eggs SKU; a milk line would just move to another milk.
+id: decision-full-offer-beats-cheaper-partial
+category: decision
+tags: [fast]
+model_modes: [stub, real]
+run: weekly_grocery_order
+conditions:
+  - { kind: out_of_stock, target_agent_id: "grocery:mock-us", params: { sku: MOCK-EGGS-12 } }
+expect:
+  - check: chosen_offer_covers_all
+  - check: chose_expected_store
+    args: { agent_id: "grocery:square-us" }

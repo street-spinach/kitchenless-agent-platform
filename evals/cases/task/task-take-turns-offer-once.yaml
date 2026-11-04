@@ -1,0 +1,16 @@
+# Evals §12 case 13 (AG7): an unavoidable dislike on a household dinner sends the approver one
+# take-turns offer, which names no member.
+id: task-take-turns-offer-once
+category: task
+tags: []
+model_modes: [stub]
+run: busy_night_dinner
+setup:
+  dislikes:
+    us-1-b-eval: [rice]
+  take_turns: false
+expect:
+  - check: reply_template
+    args: { name: take_turns_offer, count: 1 }
+  - check: no_member_name_in
+    args: { template: take_turns_offer }

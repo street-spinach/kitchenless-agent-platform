@@ -1,0 +1,14 @@
+# Evals §12 case 9 (AG3): over budget, the household sends at most one counter, at the
+# remaining budget.
+id: decision-counter-at-remaining-budget
+category: decision
+tags: []
+model_modes: [stub, real]
+run: weekly_grocery_order
+setup:
+  budget_minor: 1000
+approve_as: us-1-a-eval
+expect:
+  - check: counters_sent_at_most
+    args: { n: 1 }
+  - check: counter_amount_equals_remaining

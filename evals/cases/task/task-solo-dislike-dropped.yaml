@@ -1,0 +1,17 @@
+# Evals §12 case 12 (AG5): the requester's own dislike stays out of the order.
+id: task-solo-dislike-dropped
+category: task
+tags: []
+model_modes: [stub, real]
+run: member_message
+input:
+  member: us-1-a-eval
+  text: "Get me dinner now"
+setup:
+  dislikes:
+    us-1-a-eval: [mushrooms]
+expect:
+  - check: no_dislike_in_order
+    args: { value: mushrooms }
+  - check: run_status
+    args: { status: completed }

@@ -1,0 +1,9 @@
+# Evals §12 case 15 (AG15): the agents' decision points each write a `decision` row.
+id: tools-agents-decisions-traced
+category: tools
+tags: [fast]
+model_modes: [stub, real]
+run: weekly_grocery_order
+expect:
+  - check: decision_rows_present
+    args: { nodes: [understand_message, negotiate, choose_offer] }
