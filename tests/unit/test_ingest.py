@@ -170,6 +170,7 @@ async def _call_tool(server: str, tool: str, args: dict, *, ctx: RunContext, **k
         "decide_approval": household.decide_approval,
         "set_take_turns": household.set_take_turns,
         "apply_setup": household.apply_setup,
+        "complete_join": household.complete_join,
     }[tool]
     uuids = ("approval_id", "user_id", "order_id", "proposal_id")
     typed = {k: uuid.UUID(v) if k in uuids else v for k, v in args.items()}
@@ -1335,3 +1336,268 @@ def test_setup_tap_reply_order(setup_world: str, monkeypatch: pytest.MonkeyPatch
     # Every reply passes the sender's validation.
     for body in _replies(setup_world, run_id, "wamid.order"):
         WhatsAppOut.model_validate(body)
+
+
+# Joining (experience §3, §9, §16; EX-I32) -----------------------------------------------
+
+JOINER_PHONE = "+15550100777"
+JOIN_CODE = "K7Q2M3XD"
+JOIN_TEXT = Content("text", text=f"  join {JOIN_CODE.lower()} ")
+
+
+def _open_code(pg: str, *, phone: str = JOINER_PHONE, days: int = 7) -> None:
+    w.query(
+        pg,
+        "INSERT INTO join_codes (code, household_id, phone_e164, display_name, pending,"
+        " created_by, expires_at)"
+        " VALUES (%s, %s, %s, 'Sam', %s::jsonb, %s, now() + make_interval(days => %s))"
+        " RETURNING code",
+        JOIN_CODE,
+        w.HOUSEHOLD_ID,
+        phone,
+        '{"allergies": ["peanuts"], "diets": ["vegetarian"]}',
+        w.ADMIN,
+        days,
+    )
+
+
+def _join(
+    pg: str,
+    monkeypatch: pytest.MonkeyPatch,
+    external_id: str,
+    content: Content = JOIN_TEXT,
+    phone: str = JOINER_PHONE,
+    call_tool: Any = _call_tool,
+) -> tuple[uuid.UUID | None, list[str]]:
+    """Ingest one message; return the run and the direct replies, by template."""
+    replies: list[str] = []
+
+    async def unknown(to: str) -> None:
+        replies.append(f"unknown_number:{to}")
+
+    async def retry(to: str) -> None:
+        replies.append(f"retry_prompt:{to}")
+
+    async def go(conn: psycopg.AsyncConnection) -> uuid.UUID | None:
+        return await ingest(
+            conn,
+            CHANNEL,
+            external_id,
+            phone,
+            content,
+            call_tool=call_tool,
+            reply_unknown=unknown,
+            reply_retry=retry,
+        )
+
+    return _with_pool(pg, monkeypatch, go), replies
+
+
+@pytest.fixture
+def tuples(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    written: list[Any] = []
+    monkeypatch.setattr(fga, "ensure", written.extend)
+    return written
+
+
+def _joiner(pg: str) -> uuid.UUID:
+    [row] = w.query(
+        pg, "SELECT user_id FROM channel_identities WHERE phone_e164 = %s", JOINER_PHONE
+    )
+    return row["user_id"]
+
+
+def _join_row(pg: str) -> dict:
+    [row] = w.query(pg, "SELECT used_at, used_by FROM join_codes WHERE code = %s", JOIN_CODE)
+    return row
+
+
+def _nobody_joined(pg: str) -> None:
+    assert w.query(pg, "SELECT 1 FROM channel_identities WHERE phone_e164 = %s", JOINER_PHONE) == []
+    assert w.query(pg, "SELECT * FROM runs") == []
+    assert _join_row(pg)["used_at"] is None
+
+
+def test_join_valid(world: str, monkeypatch: pytest.MonkeyPatch, tuples: list[Any]) -> None:
+    _open_code(world)
+
+    run_id, replies = _join(world, monkeypatch, "wamid.join")
+
+    assert run_id is not None and replies == []
+    user = _joiner(world)
+    inbound = ids.inbound_id(CHANNEL, "wamid.join")
+    run = _run_row(world, run_id)
+    assert (run["kind"], run["household_id"], run["status"], run["reason"]) == (
+        "chat",
+        w.HOUSEHOLD_ID,
+        "completed",
+        "joined",
+    )
+    assert run["trigger"] == {
+        "source": "join",
+        "user_id": str(user),
+        "inbound_id": str(inbound),
+    }
+    [member] = w.query(
+        world, "SELECT household_id, role FROM household_members WHERE user_id = %s", user
+    )
+    assert member == {"household_id": w.HOUSEHOLD_ID, "role": "member"}
+    rows = w.query(
+        world,
+        "SELECT kind, value, source FROM member_constraints WHERE user_id = %s ORDER BY kind",
+        user,
+    )
+    assert rows == [
+        {"kind": "allergy", "value": "peanuts", "source": "join"},
+        {"kind": "diet", "value": "vegetarian", "source": "join"},
+    ]
+    assert _join_row(world)["used_by"] == user
+
+    messages = {m["message_id"]: m for m in _messages(world, run_id)}
+    assert len(messages) == 2
+    joined = messages[ids.message_id(inbound, 0)]["body"]
+    assert joined["template"] == "joined"
+    assert joined["user_id"] == str(user)
+    [house] = w.query(world, "SELECT name FROM households WHERE household_id = %s", w.HOUSEHOLD_ID)
+    assert joined["params"] == {"name": "Sam", "household": house["name"]}
+    consent = messages[ids.message_id(inbound, 1)]["body"]
+    assert consent["template"] == ME_LINK
+    [card] = w.query(world, "SELECT agent_id FROM agent_cards WHERE owner_ref = %s", f"user:{user}")
+    assert consent["link"] == {
+        "household_id": w.HOUSEHOLD_ID,
+        "agent_ids": [card["agent_id"]],
+        "purpose": "consent",
+    }
+    [decision] = w.query(
+        world, "SELECT payload FROM agent_traces WHERE run_id = %s AND kind = 'decision'", run_id
+    )
+    assert (decision["payload"]["node"], decision["payload"]["choice"]) == ("join", "joined")
+    [inbound_row] = w.query(world, "SELECT run_id FROM inbound_messages")
+    assert inbound_row["run_id"] == run_id
+
+
+def test_join_wrong_phone(world: str, monkeypatch: pytest.MonkeyPatch, tuples: list[Any]) -> None:
+    _open_code(world)
+
+    run_id, replies = _join(world, monkeypatch, "wamid.x", phone=w.UNKNOWN_PHONE)
+
+    assert run_id is None
+    assert replies == [f"unknown_number:{w.UNKNOWN_PHONE}"]
+    _nobody_joined(world)
+    assert tuples == []
+
+
+def test_join_expired_code_gets_unknown_number(
+    world: str, monkeypatch: pytest.MonkeyPatch, tuples: list[Any]
+) -> None:
+    _open_code(world, days=-1)
+
+    run_id, replies = _join(world, monkeypatch, "wamid.x")
+
+    assert run_id is None and replies == [f"unknown_number:{JOINER_PHONE}"]
+    _nobody_joined(world)
+
+
+def test_join_joined_inside_window(
+    world: str, monkeypatch: pytest.MonkeyPatch, tuples: list[Any]
+) -> None:
+    _open_code(world)
+
+    run_id, _ = _join(world, monkeypatch, "wamid.join")
+
+    assert run_id is not None
+    assert _last_inbound(world, JOINER_PHONE) == _received_at(world, "wamid.join")
+    # Through the sim sender: only a message inside the window is sent as text.
+    w.query(world, "UPDATE channel_identities SET channel_mode = 'sim' RETURNING 1")
+    inbound = ids.inbound_id(CHANNEL, "wamid.join")
+    [msg] = [m for m in _messages(world, run_id) if m["message_id"] == ids.message_id(inbound, 0)]
+    assert "Welcome, Sam." in _send(world, msg)["graph"]["text"]["body"]
+
+
+def test_unknown_phone_reply_unchanged(
+    world: str, monkeypatch: pytest.MonkeyPatch, tuples: list[Any]
+) -> None:
+    _open_code(world)
+
+    for n, text in enumerate(("hi", "JOIN", "JOIN AAAAAAAA", f"JOIN {JOIN_CODE} please")):
+        run_id, replies = _join(world, monkeypatch, f"wamid.{n}", Content("text", text=text))
+        assert run_id is None and replies == [f"unknown_number:{JOINER_PHONE}"], text
+    _nobody_joined(world)
+
+
+def test_join_create_person_failure_writes_nothing(
+    world: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _open_code(world)
+
+    def down(tuples: Any) -> None:
+        raise ConnectionError("openfga is down")
+
+    monkeypatch.setattr(fga, "ensure", down)
+    run_id, replies = _join(world, monkeypatch, "wamid.join")
+
+    assert run_id is None and replies == [f"retry_prompt:{JOINER_PHONE}"]
+    _nobody_joined(world)
+    assert w.query(world, "SELECT 1 FROM users WHERE display_name = 'Sam'") == []
+
+    # The JOIN can be repeated.
+    monkeypatch.setattr(fga, "ensure", lambda tuples: None)
+    run_id, replies = _join(world, monkeypatch, "wamid.again")
+    assert run_id is not None and replies == []
+    assert _join_row(world)["used_by"] == _joiner(world)
+
+
+def test_join_refused_can_be_sent_again(
+    world: str, monkeypatch: pytest.MonkeyPatch, tuples: list[Any]
+) -> None:
+    """The person is registered but `complete_join` refused: the code stays open, and the
+    repeated JOIN from the now-known phone finishes the join."""
+    _open_code(world)
+
+    async def refuse(*args: Any, **kwargs: Any) -> dict:
+        raise ToolRefused("join_code_invalid")
+
+    run_id, _ = _join(world, monkeypatch, "wamid.join", call_tool=refuse)
+
+    assert run_id is not None
+    run = _run_row(world, run_id)
+    assert (run["status"], run["reason"]) == ("error", "join_code_invalid")
+    assert [m["body"]["template"] for m in _messages(world, run_id)] == ["retry_prompt"]
+    assert _join_row(world)["used_at"] is None
+
+    again, _ = _join(world, monkeypatch, "wamid.again")
+
+    assert again is not None and again != run_id
+    assert _run_row(world, again)["status"] == "completed"
+    assert _join_row(world)["used_by"] == _joiner(world)
+
+
+def test_join_from_another_households_member_is_normal_text(
+    world: str, monkeypatch: pytest.MonkeyPatch, tuples: list[Any]
+) -> None:
+    _open_code(world, phone=w.REAL_PHONE)
+
+    run_id, replies = _join(world, monkeypatch, "wamid.x", phone=w.REAL_PHONE)
+
+    assert replies == []
+    assert run_id is not None and _run_row(world, run_id)["trigger"]["source"] == CHANNEL
+    assert _join_row(world)["used_at"] is None
+
+
+def test_join_refused_grant_keeps_code_open(
+    world: str, monkeypatch: pytest.MonkeyPatch, tuples: list[Any]
+) -> None:
+    _open_code(world)
+    w.query(
+        world,
+        "UPDATE agent_grants SET status = 'revoked', revoke_reason = 'user'"
+        " WHERE agent_id = %s RETURNING 1",
+        HOUSEHOLD_AGENT,
+    )
+
+    run_id, replies = _join(world, monkeypatch, "wamid.join")
+
+    assert run_id is not None and replies == []
+    run = _run_row(world, run_id)
+    assert (run["household_id"], run["status"]) == (None, "completed")
+    assert _join_row(world)["used_at"] is None
