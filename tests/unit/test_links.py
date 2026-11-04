@@ -193,7 +193,8 @@ def test_next_redirect(pg: str) -> None:
         )
         assert url.startswith("https://kitchenless.test/me/l/")
         assert url.endswith(f"?next={page}")
-        assert links.next_path(page) == f"/me/{page}"
+        expected = "/me/orders/latest" if page == "story" else f"/me/{page}"
+        assert links.next_path(page) == expected
     plain = _issue(pg, admin.user_id, admin.user_id, purpose="me", agent_ids=[])
     assert "?" not in plain
     assert links.next_path(None) == "/me/agents"

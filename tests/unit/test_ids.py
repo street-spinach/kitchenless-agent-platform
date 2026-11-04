@@ -283,7 +283,7 @@ def test_reminder_stop_payload() -> None:
 
 
 def test_page_button_round_trips_and_rejects_anything_else() -> None:
-    for page in ("household", "pantry", "renew"):
+    for page in ("household", "pantry", "renew", "story"):
         payload = ids.page_button(page)
         assert payload == f"me:{page}"
         assert ids.parse_page_button(payload) == page

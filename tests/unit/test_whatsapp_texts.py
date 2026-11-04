@@ -29,6 +29,7 @@ CATALOG_KEYS = {
     "approval_cancelled",
     "chat_reply",
     "order_summary",
+    "order_progress",
     "no_offers",
     "off_topic_reply",
     "dislike_saved",

@@ -3,6 +3,7 @@
 No test calls the real Graph API: real phones use a fake `send_real`."""
 
 import asyncio
+import json
 import uuid
 from typing import Any
 
@@ -10,6 +11,7 @@ import pytest
 
 from services.api.whatsapp import sender as s
 from services.api.whatsapp import templates
+from services.common import ids
 from services.common.config import Settings
 from services.common.consumer import Inbound
 from services.common.protocol.a2a import AgentMessageRow
@@ -28,6 +30,13 @@ APPROVAL = {
     "ref": {"kind": "approval", "id": APPROVAL_ID},
 }
 RETRY = {"template": "retry_prompt"}
+ORDER_ID = str(uuid.uuid4())
+SUMMARY = {
+    "template": "order_summary",
+    "params": {"text": "Your order was delivered."},
+    "ref": {"kind": "order", "id": ORDER_ID},
+}
+SEE_HOW = {"payload": "me:story", "title": "See how"}
 
 
 @pytest.fixture
@@ -255,3 +264,105 @@ def test_real_outside_window_never_calls_graph(world: str) -> None:
     assert calls == []
     [send] = _sends(world)
     assert (send["outcome"], send["reason"]) == (s.SKIPPED, s.OUTSIDE_WINDOW)
+
+
+# The See how button (showcase §5, SC-A1) ------------------------------------------------
+
+
+def _all_templates() -> Settings:
+    env = {
+        **full_env("api"),
+        **{t.setting.upper(): t.name for t in templates.TEMPLATES.values()},
+    }
+    return Settings.from_env(env)
+
+
+def test_see_how_payload_is_not_a_decision() -> None:
+    assert s.SEE_HOW_BUTTON == SEE_HOW
+    assert ids.parse_approval_button(SEE_HOW["payload"]) is None
+    assert ids.parse_take_turns_button(SEE_HOW["payload"]) is None
+    assert ids.parse_setup_button(SEE_HOW["payload"]) is None
+    assert ids.parse_page_button(SEE_HOW["payload"]) == "story"
+
+
+@pytest.mark.db
+@pytest.mark.parametrize(("body", "before"), [(APPROVAL, 2), (SUMMARY, 0)])
+def test_see_how_added_inside_window(world: str, body: dict[str, Any], before: int) -> None:
+    _send(world, _out(world, body))
+    [out] = w.query(world, "SELECT * FROM sim_outbound")
+    # After any decision buttons, which keep their places.
+    assert out["body"]["buttons"] == [*body.get("buttons", []), SEE_HOW]
+    replies = out["body"]["graph"]["interactive"]["action"]["buttons"]
+    assert len(replies) == before + 1
+    assert replies[-1]["reply"] == {"id": "me:story", "title": "See how"}
+
+
+@pytest.mark.db
+def test_see_how_only_on_its_two_keys(world: str) -> None:
+    _send(world, _out(world, RETRY))
+    [out] = w.query(world, "SELECT * FROM sim_outbound")
+    assert out["body"]["buttons"] == []
+    assert out["body"]["graph"]["type"] == "text"
+
+
+@pytest.mark.db
+def test_see_how_never_pushes_out_a_decision_button(world: str) -> None:
+    full = [{"payload": f"ap:{n}", "title": f"Choice {n}"} for n in range(s.MAX_BUTTONS)]
+    _send(world, _out(world, {**APPROVAL, "buttons": full}))
+    [out] = w.query(world, "SELECT * FROM sim_outbound")
+    assert out["body"]["buttons"] == full
+
+
+@pytest.mark.db
+def test_see_how_goes_to_the_real_sender(world: str) -> None:
+    sent: list[dict[str, Any]] = []
+
+    async def graph(phone: str, body: dict[str, Any]) -> str | None:
+        sent.append(body)
+        return "wamid.1"
+
+    _send(world, _out(world, SUMMARY, w.LIVE_ADMIN), graph)
+    [body] = sent
+    assert body["buttons"] == [SEE_HOW]
+    assert s.graph_payload(w.REAL_PHONE, body) is not None
+
+
+@pytest.mark.db
+@pytest.mark.parametrize("body", [APPROVAL, SUMMARY])
+def test_see_how_not_in_a_held_body(world: str, body: dict[str, Any]) -> None:
+    _last_inbound(world, w.MEMBER_PHONE, "30 hours")
+    _send(world, _out(world, body))
+    [held] = w.query(world, "SELECT * FROM held_messages")
+    assert held["body"]["buttons"] == body.get("buttons", [])
+
+
+@pytest.mark.db
+def test_see_how_not_in_a_meta_template(world: str) -> None:
+    _last_inbound(world, w.MEMBER_PHONE, "30 hours")
+    built = templates.request("approval_needed_v1", ["$76.00", "6:30 pm"], APPROVAL["buttons"])
+    assert "me:story" not in json.dumps(built)
+
+    async def params(conn: Any, key: str, body: dict[str, Any]) -> list[str]:
+        return ["Mock Store", "3", "$76.00"]
+
+    msg = _out(world, SUMMARY)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(templates, "params", params)
+        asyncio.run(s.Sender(w.connect_to(world), settings=_all_templates())(msg))
+    [out] = w.query(world, "SELECT * FROM sim_outbound")
+    assert out["body"]["graph"]["type"] == "template"
+    assert "me:story" not in json.dumps(out["body"])
+    [send] = _sends(world)
+    assert send["outcome"] == s.TEMPLATE
+
+
+@pytest.mark.db
+def test_see_how_dropped_when_graph_says_outside(world: str) -> None:
+    # Graph 131047 after the button was added: the body held is the one without it.
+    async def graph(phone: str, body: dict[str, Any]) -> str | None:
+        assert body["buttons"][-1] == SEE_HOW
+        raise s.GraphRefused(s.OUTSIDE_WINDOW_CODE)
+
+    _send(world, _out(world, APPROVAL, w.LIVE_ADMIN), graph)
+    [held] = w.query(world, "SELECT * FROM held_messages")
+    assert held["body"]["buttons"] == APPROVAL["buttons"]

@@ -13,7 +13,8 @@ routed by its type and the order's phase:
     member has answered, `build_list` (the model's list, then in code: item names, the
     pantry skip on weekly grocery orders and the AG5 dislike rule, agents §6, pantry §5) →
     `request_quotes` (`directory.find`, one `quote_request` per seller, the 30 s
-    `quote_round` timer, state `quoting`). Dislikes and pantry data are never sent to
+    `quote_round` timer, state `quoting`, and once per order `order_progress` to the adult
+    who started the run, showcase §5). Dislikes and pantry data are never sent to
     sellers. When the pantry skip emptied the list, `nothing_needed` instead: the draft
     order is cancelled and the run ends `completed`, reason `nothing_needed`.
 *   `offer` while quoting, or the reply to our counter → `record_offer`. Any other offer is
@@ -91,6 +92,7 @@ from services.agents.common.model import (
 )
 from services.agents.household import stubs
 from services.agents.household.prompts import BUILD_LIST_PROMPT, EXPLAIN_PROMPT, NO_CODES
+from services.common import codes as code_words
 from services.common import dislikes, ids, mcp_client, pantry
 from services.common.consumer import (
     Inbound,
@@ -177,6 +179,15 @@ HANDLED_TYPES = frozenset(
 DROP_SELLER_ON_REFUSAL = frozenset({"quote_request", "counter_offer"})
 END_RUN_ON_REFUSAL = frozenset({"accept", "cancel"})
 SUMMARY_TEMPLATE = "order_summary"
+PROGRESS_TEMPLATE = "order_progress"
+# Showcase §5: what a seller is called, and the words for the one budget period.
+SELLER_NOUN = {"grocery": "store", "dinner": "restaurant"}
+BUDGET_PERIOD = "weekly"
+BUDGET_PERIOD_NOUN = "week"
+NO_CHECKS_TEXT = "your rules"
+# WhatsApp's body limit (experience §5): a summary the story line would push over it goes
+# without the line, since the sender refuses a body over the limit.
+SUMMARY_MAX_CHARS = 1024
 NO_OFFERS_TEMPLATE = "no_offers"
 # Pantry §5, §6: the decision, the text and the run's reason when everything is at home.
 NOTHING_NEEDED = "nothing_needed"
@@ -261,6 +272,8 @@ class HouseholdState(TypedDict, total=False):
     # Pantry §5 (agents §17, PT-A10): read with defaults, so `STATE_VERSION` stays 1.
     pantry_skipped: list[str]  # list names the pantry skip dropped (weekly orders)
     pantry_as_of: str | None  # `get_pantry`'s `as_of` for that skip
+    # Showcase §5: read with its default, so `STATE_VERSION` stays 1.
+    weekly_budget: dict[str, Any] | None  # {amount_minor, currency}
     # The inbound message of the current invocation.
     message_id: str
     message_type: str
@@ -431,8 +444,74 @@ def explanation_template(facts: Mapping[str, Any]) -> str:
     return text + "."
 
 
-def _summary(delivered: str, state: Mapping[str, Any]) -> str:
-    """The order summary (agents §11), one line per part, joined into one parameter."""
+def _plural(count: int, noun: str) -> str:
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+
+
+def _and(words: Sequence[str]) -> str:
+    """`a`, `a and b`, `a, b and c`."""
+    return " and ".join(w for w in (", ".join(words[:-1]), *words[-1:]) if w)
+
+
+def _check_words(allergens: Sequence[str], diets: Sequence[str]) -> str:
+    """The household's codes as words (showcase §5): "peanuts and sesame, vegetarian". The
+    union across members, never a name; an unlabelled code is shown as it is, not left out."""
+    labels: Mapping[str, str] = code_words.LABELS
+    parts = [_and([labels.get(c, c) for c in allergens]), *(labels.get(c, c) for c in diets)]
+    return ", ".join(p for p in parts if p) or NO_CHECKS_TEXT
+
+
+def _progress_params(
+    state: Mapping[str, Any], sellers: int, allergens: Sequence[str], diets: Sequence[str]
+) -> dict[str, str] | None:
+    """`order_progress`'s parameters (showcase §5), or `None` with no budget to name."""
+    weekly = state.get("weekly_budget")
+    if not weekly:
+        return None
+    items = state.get("items") or []
+    kind = state.get("kind") or "grocery"
+    return {
+        "sellers": _plural(sellers, SELLER_NOUN[kind]),
+        "items": _plural(sum(int(i["qty"]) for i in items), "dinner")
+        if kind == "dinner"
+        else _plural(len(items), "item"),
+        "checks": _check_words(allergens, diets),
+        "budget": str(_money(weekly["amount_minor"], weekly["currency"])),
+        "period": BUDGET_PERIOD,
+    }
+
+
+def _story_line(
+    state: Mapping[str, Any], seller: str, lines: int, total_minor: int, currency: str
+) -> str | None:
+    """The story line of `order_summary` (showcase §5), from graph state alone, or `None`
+    if the budget isn't there (a run checkpointed before this line existed).
+
+    `lines` counts the final order's lines: each passed the guard's checks, or the order
+    would not exist. A line no seller offered was never checked, so it isn't counted as
+    failing them. `remaining_minor` is from before this order, so it adds to the spend."""
+    weekly, remaining = state.get("weekly_budget"), state.get("remaining_minor")
+    if not weekly or remaining is None:
+        return None
+    budget = int(weekly["amount_minor"])
+    first = (state.get("counter") or {}).get("from_minor")
+    was = ""
+    if first is not None and _chosen(state)["total_minor"] < first:
+        was = f" after one counter-offer (was {_money(first, currency)})"
+    noun = SELLER_NOUN[state.get("kind") or "grocery"]
+    asked = _plural(len(state.get("conversations") or {}), noun)
+    spent = budget - int(remaining) + total_minor
+    return (
+        f"I asked {asked}. {seller} won at {_money(total_minor, currency)}{was}. "
+        f"{lines} of {lines} lines passed the allergy and diet checks. "
+        f"Spent {_money(spent, currency)} of {_money(budget, currency)} "
+        f"this {BUDGET_PERIOD_NOUN}."
+    )
+
+
+def _summary(delivered: str, state: Mapping[str, Any], story: str | None = None) -> str:
+    """The order summary (agents §11), one line per part, joined into one parameter. It
+    ends with the `story` line when that fits (showcase §5)."""
     parts = [delivered]
     if state.get("explanation"):
         parts.append(str(state["explanation"]))
@@ -448,7 +527,10 @@ def _summary(delivered: str, state: Mapping[str, Any]) -> str:
     if skipped:
         parts.append(f"Skipped, already at home: {', '.join(skipped)}.")
     # WhatsApp template parameters can't hold newlines, so the parts are joined by spaces.
-    return " ".join(parts)
+    text = " ".join(parts)
+    if story and len(text) + 1 + len(story) <= SUMMARY_MAX_CHARS:
+        return f"{text} {story}"
+    return text
 
 
 def _codes(constraints: Sequence[Mapping[str, Any]], key: str) -> str:
@@ -559,6 +641,7 @@ def build_graph(
     load_whatsapp_members: LoadMembers | None = None,
     label_seller: LabelSeller = _agent_id_label,
     load_vocabulary: LoadVocabulary = pantry.load_vocabulary,
+    load_adults: LoadMembers | None = None,
 ) -> StateGraph:
     """The household graph's nodes and edges, before `compile(checkpointer=...)`.
 
@@ -566,7 +649,9 @@ def build_graph(
     shortfall is relayed to; without it nobody is asked (fails closed: every line drops).
     `label_seller` names a seller in member-facing text with its vendor label (adapters
     §6), from the run's pinned modes. `load_vocabulary` gives the pantry vocabulary
-    (pantry §2); a failed load means nothing is skipped.
+    (pantry §2); a failed load means nothing is skipped. `load_adults` gives the adult
+    members, the only people `order_progress` goes to; without it nobody gets it (fails
+    closed).
     """
 
     async def tool(
@@ -682,6 +767,11 @@ def build_graph(
         if model.mode == "stub" and seconds > 0:
             await sleep(seconds)
 
+    async def started_by_adult(state: HouseholdState) -> bool:
+        if load_adults is None or not state.get("user_id"):
+            return False
+        return state["user_id"] in (await load_adults(state["household_id"])).values()
+
     async def ignore(state: HouseholdState) -> dict[str, Any]:
         reason = {"offer": "late_offer"}.get(state["message_type"], "ignored")
         await trace_decision(state, "ignore", reason)
@@ -701,6 +791,7 @@ def build_graph(
             "take_turns": bool(rules.get("take_turns")),
             "turn_index": _int(rules.get("turn_index"), 0),
             "approver_user_id": str(approver) if approver else None,
+            "weekly_budget": rules.get("weekly"),
         }
 
     async def collect_constraints(state: HouseholdState) -> dict[str, Any]:
@@ -928,6 +1019,17 @@ def build_graph(
             conversation = str(ids.conversation_id(message_id))
             _add(state, out, seller, "quote_request", body, conversation_id=conversation)
             conversations[seller] = conversation
+        # After the quotes, so their ids don't move. A re-quote says nothing again.
+        if sellers and not state.get("requotes") and await started_by_adult(state):
+            params = _progress_params(state, len(sellers), sorted(allergens), sorted(diets))
+            if params is not None:
+                progress = {
+                    "user_id": state["user_id"],
+                    "template": PROGRESS_TEMPLATE,
+                    "params": params,
+                    "buttons": [],
+                }
+                _add(state, out, WHATSAPP, "whatsapp_out", progress)
         timer = {
             "kind": "quote_round",
             "seconds": QUOTE_ROUND_SECONDS,
@@ -963,6 +1065,7 @@ def build_graph(
         remaining = int(budget["remaining"]["amount_minor"])
         counters = int(state.get("counters") or 0)
         update["remaining_minor"] = remaining
+        update["weekly_budget"] = budget.get("weekly") or state.get("weekly_budget")
         # Code only (agents §7): one counter, at the remaining budget, to the best offer.
         ranked = compare_offers(offers)
         best = ranked[0]
@@ -1370,10 +1473,12 @@ def build_graph(
                 f"Your order {state['order_id'][:8]} was delivered: "
                 f"{count} items, {total} {currency} minor units."
             )
+            seller = await label_seller(UUID(state["run_id"]), _seller_of(state, offer["quote_id"]))
+            story = _story_line(state, seller, count, total, currency)
             body = {
                 "user_id": state["user_id"],
                 "template": SUMMARY_TEMPLATE,
-                "params": {"text": _summary(delivered, state)},
+                "params": {"text": _summary(delivered, state, story)},
                 "buttons": [],
                 "ref": {"kind": "order", "id": state["order_id"]},
             }
@@ -1643,6 +1748,7 @@ class HouseholdGraph:
         load_whatsapp_members: LoadMembers | None = None,
         label_seller: LabelSeller = _agent_id_label,
         load_vocabulary: LoadVocabulary = pantry.load_vocabulary,
+        load_adults: LoadMembers | None = None,
     ) -> None:
         self._load_run = load_run
         self._offer_ttl_seconds = offer_ttl_seconds
@@ -1657,6 +1763,7 @@ class HouseholdGraph:
             load_whatsapp_members,
             label_seller,
             load_vocabulary,
+            load_adults,
         )
         self.graph = self.builder.compile(checkpointer=checkpointer)
 
@@ -1780,6 +1887,14 @@ WHERE m.household_id = %s
   AND EXISTS (SELECT 1 FROM channel_identities ci WHERE ci.user_id = m.user_id)
 ORDER BY c.agent_id
 """
+# The adults, the only people `order_progress` goes to (showcase SC-A6).
+_ADULTS_SQL = """
+SELECT c.agent_id, m.user_id::text
+FROM household_members m
+JOIN agent_cards c ON c.class = 'consumer' AND c.enabled AND c.owner_ref = 'user:' || m.user_id
+WHERE m.household_id = %s AND m.role IN ('admin', 'member')
+ORDER BY c.agent_id
+"""
 _RUN_MODES_SQL = "SELECT modes FROM runs WHERE run_id = %s"
 _ORG_NAME_SQL = "SELECT name FROM organizations WHERE 'org:' || org_id = %s"
 _default: HouseholdGraph | None = None
@@ -1833,6 +1948,11 @@ def _build_default() -> HouseholdGraph:
             )
             return {agent_id: user_id for agent_id, user_id in await cur.fetchall()}
 
+    async def load_adults(household_id: str) -> Members:
+        async with pool.connection() as conn:
+            cur = await unscoped(conn, "household_graph").execute(_ADULTS_SQL, (household_id,))
+            return {agent_id: user_id for agent_id, user_id in await cur.fetchall()}
+
     async def find_sellers(cls: str, region: str, zone_id: str, currency: str) -> list[str]:
         async with pool.connection() as conn:
             cards = await directory.find(conn, cls, region, zone_id, currency)
@@ -1852,6 +1972,7 @@ def _build_default() -> HouseholdGraph:
         offer_ttl_seconds=get_settings().offer_ttl_seconds,
         load_whatsapp_members=load_whatsapp_members,
         label_seller=label_seller,
+        load_adults=load_adults,
     )
 
 

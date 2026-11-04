@@ -863,7 +863,7 @@ def test_reminders_off_on(world: str) -> None:
     assert w.run(world, lambda conn: runs.retry_target(conn, w.MEMBER)) is None
 
 
-@pytest.mark.parametrize("page", ["household", "pantry"])
+@pytest.mark.parametrize("page", ["household", "pantry", "story"])
 def test_page_button_sends_link(world: str, monkeypatch: pytest.MonkeyPatch, page: str) -> None:
     _patch_links(monkeypatch)
     external_id = f"wamid.me.{page}"

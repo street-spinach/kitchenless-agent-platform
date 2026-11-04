@@ -15,7 +15,7 @@ from services.agents.household import graph as hg
 from services.agents.household import stubs
 from services.common.consumer import RunFinish
 from tests.unit import model_fakes as mf
-from tests.unit.test_household_graph import LABELS, NOW, World
+from tests.unit.test_household_graph import LABELS, NOW, World, before_story
 
 BEST = "grocery:square-us"
 RUNNER_UP = "grocery:mock-us"
@@ -150,7 +150,7 @@ def test_model_sentence_passes_through_the_graph() -> None:
     text = summary.body["params"]["text"]
     assert text.startswith(f"Your order {w.order_id[:8]} was delivered: 1 items, 2100 USD")
     # The explanation, then the pantry skip line: the fake pantry has rice (pantry §6).
-    assert text.endswith(" " + expected + " Skipped, already at home: rice.")
+    assert before_story(text).endswith(" " + expected + " Skipped, already at home: rice.")
     assert "\n" not in text
 
 
@@ -179,7 +179,7 @@ def test_model_failure_uses_template() -> None:
     done = w.delivered()
     assert done.finish == RunFinish("completed")
     [summary] = done.messages
-    assert summary.body["params"]["text"].endswith(
+    assert before_story(summary.body["params"]["text"]).endswith(
         "Chose Square Grocery (simulated): 1 of 4 items for $21.00. Skipped, already at home: rice."
     )
 

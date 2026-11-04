@@ -311,7 +311,7 @@ class LinkRequest(_Part):
     household_id: str
     agent_ids: list[str]
     purpose: Literal["consent", "me"] = "consent"
-    next: Literal["household", "pantry", "history", "agents"] | None = None
+    next: Literal["household", "pantry", "history", "agents", "story"] | None = None
 
 
 class WhatsAppOut(_Body):

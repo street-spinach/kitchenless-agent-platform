@@ -187,8 +187,10 @@ class World:
         sellers: list[str] | None = None,
         overrides: dict[str, Any] | None = None,
         load_vocabulary: Any = None,
+        adults: dict[str, str] | None = None,
     ) -> None:
         self.run_id = uuid.uuid4()
+        self.adults = adults
         self.load_vocabulary = load_vocabulary or pantry.load_vocabulary
         self.overrides = dict(overrides or {})
         self.slept: list[float] = []
@@ -213,7 +215,12 @@ class World:
             load_whatsapp_members=self.load_whatsapp_members,
             label_seller=self.label_seller,
             load_vocabulary=self.load_vocabulary,
+            load_adults=None if self.adults is None else self.load_adults,
         )
+
+    async def load_adults(self, household_id: str) -> dict[str, str]:
+        assert household_id == "us-1"
+        return dict(self.adults or {})
 
     async def label_seller(self, run_id: uuid.UUID, agent_id: str) -> str:
         assert run_id == self.run_id
@@ -1410,6 +1417,11 @@ def test_quote_request_has_no_pantry_fields() -> None:
         assert [i["item"] for i in m.body["items"]] == ["eggs", "bread", "bananas", "rice"]
 
 
+def before_story(text: str) -> str:
+    """The summary without its closing story line (showcase §5)."""
+    return text.partition(" I asked ")[0]
+
+
 def _delivered_summary(w: World) -> str:
     w.accepted()
     w.order_update("order_confirm", "placed", "grocery:square-us")
@@ -1421,7 +1433,7 @@ def _delivered_summary(w: World) -> str:
 def test_summary_names_skipped_items() -> None:
     w = World()
     w.household.pantry = pantry_result(estimate("milk"), estimate("eggs"))
-    assert _delivered_summary(w).endswith(" Skipped, already at home: milk, eggs.")
+    assert before_story(_delivered_summary(w)).endswith(" Skipped, already at home: milk, eggs.")
     # No skip, no line.
     w = World()
     w.household.pantry = pantry_result(enabled=False)
