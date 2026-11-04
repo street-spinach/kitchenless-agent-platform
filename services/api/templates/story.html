@@ -102,11 +102,9 @@ Amounts are none when the viewer may not see this order's spending (experience Â
 <section class="card">
   <h2>Behind the scenes</h2>
   <ol class="timeline">
-    <li class="dot-ok">{{ story.behind.agents }} agents took part</li>
-    <li class="dot-ok">{{ story.behind.messages }} messages exchanged</li>
-    <li class="dot-ok">{{ story.behind.model_decisions }} decisions used the model, {{ story.behind.rule_decisions }} the rule default</li>
-    <li class="dot-ok">{{ story.behind.tokens }} tokens</li>
-    <li class="dot-ok">{{ story.behind.elapsed }} from start to finish</li>
+    <li class="dot-ok">{{ story.behind.agents }} agents worked on this order</li>
+    <li class="dot-ok">They sent each other {{ story.behind.messages }} messages</li>
+    <li class="dot-ok">Done in {{ story.behind.elapsed }}</li>
   </ol>
 </section>
 {% endblock %}

@@ -288,6 +288,9 @@ def test_consent_happy_path_two_agents(world: World, kc: FakeKeycloak) -> None:
     agents = client.get("/me/agents")
     assert agents.status_code == 200
     assert agents.text.count("Revoke") == 2
+    # Plain names, not agent ids (#432); the ids stay only in the revoke form URLs.
+    assert "Your household agent" in agents.text and "Your personal agent" in agents.text
+    assert f"<strong>{ADMIN_AGENT}</strong>" not in agents.text
 
 
 @db
@@ -489,5 +492,25 @@ def test_band_admin_only(world: World, kc: FakeKeycloak) -> None:
     ]
     # The history page shows the person's own audit rows.
     history = admin.get("/me/history")
-    assert history.status_code == 200 and history.text.count("band_changed") == 2
-    assert member.get("/me/history").text.count("band_changed") == 0
+    # In plain words (#432): no internal kind names.
+    assert history.status_code == 200
+    assert history.text.count("The approval limit changed") == 2
+    assert "band_changed" not in history.text
+    assert member.get("/me/history").text.count("The approval limit changed") == 0
+
+
+def test_event_text_is_plain() -> None:
+    """#432: every audit kind has plain words, and agent names are never ids."""
+    from services.api.routes import me
+    from services.identity import audit
+
+    assert set(me._EVENT_TEXT) == set(audit.KINDS)
+    granted = me._event_text("consent_granted", "consumer")
+    assert granted == "You let your personal agent act for you"
+    expired = me._event_text("grant_expired", "household")
+    assert expired == "Your household agent's permission ran out"
+    assert me._event_text("consent_revoked", None) == "An agent can no longer act for you"
+    assert me._event_text("something_new", None) == "Account activity"
+    for kind in audit.KINDS:
+        text = me._event_text(kind, "consumer")
+        assert "_" not in text and ":" not in text

@@ -340,3 +340,12 @@ def test_history_approval_pills(templates: Jinja2Templates, status: str, pill: s
     row = {"at": "Tue 4 Nov 18:02", "amount": "$84.20", "status": status}
     out = _render(templates, "history", approvals=[row])
     assert f'<span class="pill {pill}">{status}</span>' in out
+
+
+def test_story_behind_the_scenes_in_plain_words(templates: Jinja2Templates) -> None:
+    """#432: no token counts or "rule default" on a person's order page."""
+    page = _render(templates, "story")
+    assert "4 agents worked on this order" in page
+    assert "12 messages" in page and "Done in 14 s" in page
+    assert "token" not in page.lower().replace("csrf", "")
+    assert "rule default" not in page
