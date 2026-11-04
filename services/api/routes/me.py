@@ -31,6 +31,9 @@ Pages render from `services/api/templates/` with `/me/static/me.css`.
     child sees no household-wide row, §4); otherwise the "isn't on" line. `POST
     /me/pantry/{pantry_item}` with `kind` (`verify` or `out`) starts the `/me` run and calls
     `record_pantry_check` for the signed-in person (EX-I40).
+*   `GET /me/orders/{ref}`: one order's story (showcase §4), for adults; an adult who may
+    not see the order's spending (§4) gets it without amounts or approvals. `GET
+    /me/orders/latest` redirects to the household's newest order that has left `draft`.
 *   `GET /me/history` lists the person's audit rows and approvals, and spending per week
     (per order: an admin every order, others the orders they started).
 *   `GET /me/household/band` returns the band (a page for `Accept: text/html`, else JSON);
@@ -67,6 +70,7 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 from starlette.templating import Jinja2Templates
 
+from services.api import story
 from services.common import ids, pantry, runs
 from services.common.config import get_settings
 from services.common.mcp_client import AdapterUnavailable, ToolRefused, call_tool_as
@@ -583,7 +587,7 @@ def _render(request: Request, name: str, context: dict[str, Any]) -> Response:
 # --- household ------------------------------------------------------------------------
 
 
-async def _this_week_order(q: scope.Scoped) -> dict[str, Any] | None:
+async def _this_week_order(q: scope.Scoped, session: Session) -> dict[str, Any] | None:
     """The household's newest order this budget week (Monday 00:00, household time), with
     the household agent's checked explanation from its `choose_offer` decision."""
     rows = await q.fetch(
@@ -620,6 +624,7 @@ async def _this_week_order(q: scope.Scoped) -> dict[str, Any] | None:
         "summary": summary,
         "state": _STATE_TEXT.get(state, state),
         "explanation": explained[0][0] if explained else None,
+        "ref": ids.org_order_ref(session.household_id, order_id),
     }
 
 
@@ -672,6 +677,7 @@ async def _meals(
     return [
         {
             "order_id": str(order_id),
+            "ref": ids.org_order_ref(session.household_id, order_id),
             "title": items or "Dinner",
             "delivered": _day(at.astimezone(ZoneInfo(tz))),
             "totals": {"up": int(up), "down": int(down)} if totals else None,
@@ -722,7 +728,7 @@ async def household_page(request: Request) -> Response:
         context["household_wide"] = wide
         context["people"] = await _people(q, viewer)
         if wide:
-            context["order"] = await _this_week_order(q)
+            context["order"] = await _this_week_order(q, session)
             context["spending"] = await _spending(q)
             rules = await q.fetch(
                 "SELECT take_turns FROM household_rules WHERE household_id = %(household)s"
@@ -734,6 +740,77 @@ async def household_page(request: Request) -> Response:
             }
             context["meals"] = await _meals(q, session, viewer)
     return _render(request, "household.html", context)
+
+
+# --- order story (showcase §4) --------------------------------------------------------
+
+
+def _not_available() -> HTMLResponse:
+    return _error("Not available", "This page isn't available.", 403)
+
+
+def _starter(raw: str | None) -> UUID | None:
+    """The person who started a run, from `runs.trigger`; None for a run nobody started."""
+    try:
+        return UUID(raw) if raw else None
+    except ValueError:
+        return None
+
+
+async def order_story(request: Request) -> Response:
+    """`GET /me/orders/{ref}`: adults only, checked before the ref, so a child learns
+    nothing about which refs exist. The ref is a hash, so it is matched over the household's
+    orders."""
+    session = _session(request)
+    if session is None:
+        return _signed_out()
+    ref = request.path_params["ref"]
+    async with _connect(request) as conn:
+        viewer = await _viewer(conn, session)
+        if viewer is None:
+            return _signed_out()
+        if not visibility.can_see(viewer, "plan", None):
+            return _not_available()
+        q = scope.scoped(conn, scope.from_session(session))
+        rows = await q.fetch(
+            "SELECT o.order_id, o.state, r.trigger->>'user_id' FROM orders o"
+            " JOIN runs r ON r.run_id = o.run_id WHERE o.household_id = %(household)s"
+        )
+        found = next(
+            (r for r in rows if ids.org_order_ref(session.household_id, r[0]) == ref), None
+        )
+        if found is None:
+            return _error("Not found", "We couldn't find that order.", 404)
+        order_id, state, starter = found
+        built = await story.build_story(q, order_id)
+        if not visibility.can_see(viewer, "spending_per_order", _starter(starter)):
+            built = story.without_spending(built)
+        context = await _frame(q, session, "household")
+    context["story"] = built
+    context["state_text"] = _STATE_TEXT.get(state, state)
+    return _render(request, "story.html", context)
+
+
+async def latest_order(request: Request) -> Response:
+    """`GET /me/orders/latest`: to the story of the household's newest order past `draft`."""
+    session = _session(request)
+    if session is None:
+        return _signed_out()
+    async with _connect(request) as conn:
+        viewer = await _viewer(conn, session)
+        if viewer is None:
+            return _signed_out()
+        if not visibility.can_see(viewer, "plan", None):
+            return _not_available()
+        q = scope.scoped(conn, scope.from_session(session))
+        rows = await q.fetch(
+            "SELECT order_id FROM orders WHERE household_id = %(household)s"
+            " AND state <> 'draft' ORDER BY created_at DESC, order_id DESC LIMIT 1"
+        )
+    if not rows:
+        return _page("No orders yet", "<p>No orders yet.</p>")
+    ref = ids.org_order_ref(session.household_id, rows[0][0])
+    return RedirectResponse(f"/me/orders/{ref}", status_code=303)
 
 
 # --- `/me` POSTs that call a tool ------------------------------------------------------
@@ -1004,11 +1081,7 @@ async def _spending_history(q: scope.Scoped, viewer: visibility.Member) -> list[
             week, {"week": f"Week of {week.day} {week:%b}", "sum": 0, "cur": currency, "orders": []}
         )
         entry["sum"] += int(total)
-        try:
-            starter_id = UUID(starter) if starter else None
-        except ValueError:
-            starter_id = None
-        if visibility.can_see(viewer, "spending_per_order", starter_id):
+        if visibility.can_see(viewer, "spending_per_order", _starter(starter)):
             entry["orders"].append(
                 {
                     "at": _day(at.astimezone(ZoneInfo(tz))),
@@ -1185,6 +1258,9 @@ routes = [
     Route("/me/household", household_page, methods=["GET"]),
     Route("/me/household/take-turns", take_turns, methods=["POST"]),
     Route("/me/meals/{order_id}/reaction", reaction, methods=["POST"]),
+    # `latest` first: `{ref}` would match it too.
+    Route("/me/orders/latest", latest_order, methods=["GET"]),
+    Route("/me/orders/{ref}", order_story, methods=["GET"]),
     Route("/me/pantry", pantry_page, methods=["GET"]),
     Route("/me/pantry/{pantry_item}", pantry_check, methods=["POST"]),
     Route("/me/agents", agents, methods=["GET"]),

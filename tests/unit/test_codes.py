@@ -30,6 +30,19 @@ def test_enums_match_migration() -> None:
         assert code in codes.ALIASES[code.value]
 
 
+def test_labels_cover_every_code() -> None:
+    """Showcase §4: a plain lower-case label for every code, never the raw code."""
+    assert set(codes.LABELS) == {*AllergenCode, *DietCode}
+    for code, label in codes.LABELS.items():
+        assert label == label.lower() and label.strip() == label, code
+        assert "_" not in label, code
+    assert codes.LABELS[A.PEANUTS] == "peanuts"
+    assert codes.LABELS[A.TREE_NUTS] == "tree nuts"
+    assert codes.LABELS[D.HIGH_PROTEIN] == "high protein"
+    # The labels are looked up by the plain strings stored in message bodies.
+    assert codes.LABELS["tree_nuts"] == "tree nuts"  # type: ignore[index]
+
+
 def test_cross_check_finds_missed_alias() -> None:
     msg = "Kavi is allergic to nuts and dairy, Mira eats no prawns and Ravi is gluten-free."
     assert codes.cross_check(msg, set()) == ["nuts", "dairy", "prawns", "gluten-free"]

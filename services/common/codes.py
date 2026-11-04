@@ -10,7 +10,7 @@ from collections.abc import Mapping
 
 from services.common.protocol.schemas import AllergenCode, DietCode
 
-__all__ = ["ALIASES", "Code", "cross_check"]
+__all__ = ["ALIASES", "LABELS", "Code", "cross_check"]
 
 type Code = AllergenCode | DietCode
 
@@ -80,6 +80,31 @@ ALIASES: Mapping[str, frozenset[Code]] = {
         "high-protein": {D.HIGH_PROTEIN},
         "high_protein": {D.HIGH_PROTEIN},
     }.items()
+}
+
+# The plain word shown to people for each code (showcase.md §4).
+LABELS: Mapping[Code, str] = {
+    A.CELERY: "celery",
+    A.GLUTEN: "gluten",
+    A.CRUSTACEANS: "crustaceans",
+    A.EGGS: "eggs",
+    A.FISH: "fish",
+    A.LUPIN: "lupin",
+    A.MILK: "milk",
+    A.MOLLUSCS: "molluscs",
+    A.MUSTARD: "mustard",
+    A.TREE_NUTS: "tree nuts",
+    A.PEANUTS: "peanuts",
+    A.SESAME: "sesame",
+    A.SOY: "soy",
+    A.SULPHITES: "sulphites",
+    D.VEGETARIAN: "vegetarian",
+    D.VEGAN: "vegan",
+    D.PESCATARIAN: "pescatarian",
+    D.HALAL: "halal",
+    D.KOSHER: "kosher",
+    D.KETO: "keto",
+    D.HIGH_PROTEIN: "high protein",
 }
 
 # Longest phrase first, whole words only, so "tree nuts" is one match, not "nuts" too, and

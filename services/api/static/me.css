@@ -122,6 +122,23 @@ button[aria-pressed="true"] { background: var(--brand-green-50); box-shadow: ins
 .pill-refused { background: #fdeaea; color: var(--brand-danger); }
 .pill-quiet { background: var(--brand-bg-2); color: var(--brand-muted); }
 
+/* The story page: the budget bar and the timeline (showcase §4). */
+progress.budget { display: block; width: 100%; height: 0.6rem; accent-color: var(--brand-lime); }
+.timeline { margin: 0.5rem 0 0; padding: 0; list-style: none; }
+.timeline li { position: relative; padding: 0 0 0.75rem 1.25rem; border-left: 2px solid var(--brand-green-50); }
+.timeline li::before {
+  content: "";
+  position: absolute;
+  top: 0.4rem;
+  left: -6px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--brand-green-500);
+}
+.timeline li.dot-attention::before { background: var(--brand-orange); }
+.timeline li.dot-quiet::before { background: var(--brand-muted-2); }
+
 /* Empty and error states: the logo at 48 px over the existing copy. */
 .state { text-align: center; }
 .state-logo { display: block; margin: 0.25rem auto 0.5rem; }
