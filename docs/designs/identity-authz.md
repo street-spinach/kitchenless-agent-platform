@@ -297,6 +297,10 @@ below as asked.
     *   One `audit_events` row (`consent_granted`) is written per grant.
     *   The page then shows a decoded sample token, with `sub` = Asha and `act.client_id` = the
         agent (demo moment 1).
+        *Amended 2026-11-05 (product owner, #436):* the page shows no token or agent id. It
+        says, in plain words, which agents can now act for the person ("Your household agent
+        and your personal agent can now act for you."). The consent scenario checks the same
+        claims through `TokenSource.sample_token` directly.
     *   If the link is used a second time, or after 10 minutes, the page shows "This link
         has expired" and nothing is granted. A link preview or scanner that only fetches
         the page does not use it up.
@@ -2055,7 +2059,8 @@ ALTER TABLE approvals ADD COLUMN limits text[] NOT NULL DEFAULT '{}'   -- 'band'
         code (`private_key_jwt`), calls `grants.create`, and redirects to the next agent or
         to the done page.
     *   `GET /me/consent/done` shows the decoded claims of one `TokenSource.sample_token`,
-        without the signature.
+        without the signature. *Amended 2026-11-05 (#436):* it shows plain words only; see
+        I-CUJ 1.
     *   `GET /me/agents` lists the person's agents and grants.
     *   `POST /me/agents/{agent_id}/revoke` applies the §11 permission rule, then calls
         `grants.revoke` and `after_revoke`.

@@ -283,7 +283,10 @@ def test_consent_happy_path_two_agents(world: World, kc: FakeKeycloak) -> None:
 
     done = client.get(resp.headers["location"])
     assert done.status_code == 200
-    assert world.admin.keycloak_sub in done.text and "household.h-me" in done.text
+    # Plain words, no token or agent id (#436).
+    assert "Your household agent and your personal agent can now act for you." in done.text
+    assert world.admin.keycloak_sub not in done.text and "household.h-me" not in done.text
+    assert "<pre>" not in done.text and "token" not in done.text.lower()
     assert "Skipped" not in done.text
     agents = client.get("/me/agents")
     assert agents.status_code == 200
@@ -393,7 +396,8 @@ def test_decline_skips_agent(world: World, kc: FakeKeycloak) -> None:
     assert [g["agent_id"] for g in _grants(world.pg)] == [ADMIN_AGENT]
     done = client.get(resp.headers["location"])
     assert done.status_code == 200
-    assert f"Skipped: {HOUSEHOLD_AGENT}" in done.text
+    assert "Skipped: Your household agent." in done.text
+    assert HOUSEHOLD_AGENT not in done.text
     assert ("household.h-me", "c1") not in kc.redeemed
 
 

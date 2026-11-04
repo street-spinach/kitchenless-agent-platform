@@ -13,8 +13,9 @@ Pages render from `services/api/templates/` with `/me/static/me.css`.
     For an agent client it redeems the code, calls `grants.create`, and redirects to the
     next agent or to the done page. A declined agent gets no grant and is listed as
     skipped.
-*   `GET /me/consent/done` shows the decoded claims of one `TokenSource.sample_token`,
-    without the signature.
+*   `GET /me/consent/done` says, in plain words, which agents can now act for the person
+    and which were skipped. It shows no token or agent id (#436); the consent scenario
+    checks the claims through `TokenSource.sample_token` directly.
 *   `GET /me/agents` lists the person's agents and grants; `POST
     /me/agents/{agent_id}/revoke` applies the §11 rule, then calls `grants.revoke` and
     `grants.after_revoke`.
@@ -51,7 +52,6 @@ scope (§8).
 """
 
 import html
-import json
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -78,7 +78,7 @@ from services.common.money import Money
 from services.common.money import format as money_format
 from services.common.orders import PLACED_OR_LATER
 from services.common.run_context import RunContext
-from services.identity import audit, grants, keycloak_admin, links, token_source
+from services.identity import audit, grants, keycloak_admin, links
 from services.identity.errors import (
     DependencyUnavailable,
     GrantError,
@@ -192,6 +192,22 @@ _AGENT_FALLBACK = "An agent"
 
 def _agent_label(cls: str | None) -> str:
     return _AGENT_LABELS.get(cls or "", _AGENT_FALLBACK)
+
+
+def _names(agent_ids: list[str]) -> str:
+    """Plain names for a list of agent ids, e.g. "Your household agent and your personal
+    agent" (#436). The ids themselves are never shown."""
+    labels: list[str] = []
+    for agent_id in agent_ids:
+        try:
+            cls = ids.parse_agent_id(agent_id)[0]
+        except ValueError:
+            cls = None
+        labels.append(_agent_label(cls))
+    tail = [label[0].lower() + label[1:] for label in labels[1:]]
+    if not tail:
+        return labels[0] if labels else ""
+    return ", ".join([labels[0], *tail[:-1]]) + f" and {tail[-1]}"
 
 
 def _event_text(kind: str, cls: str | None) -> str:
@@ -549,31 +565,10 @@ async def consent_done(request: Request) -> Response:
     skipped: list[str] = done["k"]
     parts = []
     if granted:
-        names = ", ".join(html.escape(a) for a in granted)
-        parts.append(f"<p>You consented to: {names}.</p>")
-        async with _connect(request) as conn:
-            cur = await conn.execute(
-                "SELECT env FROM households WHERE household_id = %s", (session.household_id,)
-            )
-            row = await cur.fetchone()
-            try:
-                source = token_source.get_source(row[0] if row else "live")
-                sample = await source.sample_token(conn, granted[0], session.user_id)
-            except (DependencyUnavailable, IdentityError):
-                sample = None
-        if sample is None:
-            parts.append("<p>A sample token could not be fetched right now.</p>")
-        else:
-            # The claims only; the signature is removed (§6, demo moment 1).
-            claims = jwt.decode(sample, options={"verify_signature": False})
-            shown = {k: claims.get(k) for k in ("sub", "act", "azp", "aud", "scope", "exp")}
-            parts.append(
-                "<p>An agent's token now looks like this:</p>"
-                f"<pre>{html.escape(json.dumps(shown, indent=2))}</pre>"
-            )
+        parts.append(f"<p>{html.escape(_names(granted))} can now act for you.</p>")
     if skipped:
-        parts.append(f"<p>Skipped: {', '.join(html.escape(a) for a in skipped)}.</p>")
-    parts.append("<p><a href='/me/agents'>Your agents</a></p>")
+        parts.append(f"<p>Skipped: {html.escape(_names(skipped))}.</p>")
+    parts.append("<p><a href='/me/agents'>See your agents</a></p>")
     return _page("All done", "".join(parts))
 
 
