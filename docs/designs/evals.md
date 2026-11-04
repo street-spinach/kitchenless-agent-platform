@@ -481,6 +481,8 @@ pure function over `services/seed/data/households.yaml` and `rules.yaml` (modell
 
 *Amended 2026-11-03 (experience, #271):* experience.md §14 adds safety and task cases and the setup keys `last_inbound_hours_ago`, `setup_incomplete` and `join_code`, each undone by the next reset (experience.md EX-A14).
 
+*Amended 2026-11-04 (#318):* experience.md §14 adds the setup key `held_approval: {phone}`: an expired pending approval with its `approval_request` held for that phone, so a `member_message` case checks the release on its own run. Undone by the next reset.
+
 ### 5. Runner contract
 
 **Flags.** `--tag <tag>` or `--all` (existing), `--cases-file <yaml list of ids>`,
