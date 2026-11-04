@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "Kitchenless Owner",
+    "name": "Spinach Business",
     "slug": "kitchenless-owner",
     "scheme": "kitchenless-owner",
     "version": "0.1.0",
@@ -12,7 +12,8 @@
     },
     "web": {
       "bundler": "metro",
-      "output": "single"
+      "output": "single",
+      "favicon": "./assets/spinach-icon.png"
     }
   }
 }

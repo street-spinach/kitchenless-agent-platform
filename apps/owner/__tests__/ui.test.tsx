@@ -1,6 +1,6 @@
 // EX-I43: a render test for each shared component.
 import { act, create, type ReactTestRenderer } from "react-test-renderer";
-import { Text } from "react-native";
+import { StyleSheet, Text } from "react-native";
 
 import {
   Banner,
@@ -44,6 +44,28 @@ test("Card renders its title and children, and is one tap target with onPress", 
     tree.root.findByProps({ testID: "card" }).props.onPress();
   });
   expect(onPress).toHaveBeenCalledTimes(1);
+});
+
+test("theme takes the brand values (showcase.md §3.2)", () => {
+  expect(theme.colors.primary).toBe(theme.brand.green500);
+  expect(theme.colors.primaryPressed).toBe(theme.brand.green700);
+  expect(theme.colors.background).toBe(theme.brand.bg);
+  expect(theme.colors.text).toBe(theme.brand.ink);
+  expect(theme.colors.accent).toBe(theme.brand.lime);
+  expect(theme.colors.tabActive).toBe(theme.brand.green700);
+  expect(theme.radius).toEqual({ sm: 12, md: 16, lg: 24 });
+});
+
+test("a hero Card is green-900 with a lime ring and a white title", async () => {
+  const tree = await render(<Card title="Discount" tone="hero" testID="hero" />);
+  const [view] = tree.root.findAll((n) => typeof n.type === "string" && n.props.testID === "hero");
+  const style = StyleSheet.flatten(view.props.style);
+  expect(style.backgroundColor).toBe(theme.brand.green900);
+  expect(style.borderColor).toBe(theme.brand.lime);
+  const [title] = tree.root.findAll(
+    (n) => typeof n.type === "string" && n.props.children === "Discount",
+  );
+  expect(StyleSheet.flatten(title.props.style).color).toBe(theme.brand.white);
 });
 
 test("Card without onPress is not a button", async () => {

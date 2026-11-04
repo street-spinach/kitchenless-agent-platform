@@ -22,7 +22,7 @@ export default function TabsLayout() {
     );
   }
   return (
-    <Tabs screenOptions={{ tabBarActiveTintColor: colors.primary }}>
+    <Tabs screenOptions={{ tabBarActiveTintColor: colors.tabActive }}>
       <Tabs.Screen name="index" options={{ title: "Home" }} />
       <Tabs.Screen name="orders" options={{ title: "Orders" }} />
       <Tabs.Screen name="insights" options={{ title: "Insights" }} />
