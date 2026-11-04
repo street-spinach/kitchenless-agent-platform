@@ -6,9 +6,10 @@ Context, besides base.html's:
   approvals  [{at, amount, status}]
   events     [{at, text}]              audit rows, as text built by code -#}
 {% extends "base.html" %}
+{% from "base.html" import state_logo %}
 {% block title %}History{% endblock %}
 {% block content %}
-<section class="card">
+<section class="card{% if not spending %} state{% endif %}">
   <h2>Spending</h2>
   {% if spending %}
   <ul class="rows">
@@ -26,24 +27,26 @@ Context, besides base.html's:
     {% endfor %}
   </ul>
   {% else %}
+  {{ state_logo() }}
   <p class="muted">No spending yet.</p>
   {% endif %}
 </section>
 
-<section class="card">
+<section class="card{% if not approvals %} state{% endif %}">
   <h2>Approvals</h2>
   {% if approvals %}
   <ul class="rows">
     {% for a in approvals %}
-    <li class="row"><span>{{ a.at }} · {{ a.amount }}</span><span class="muted">{{ a.status }}</span></li>
+    <li class="row"><span>{{ a.at }} · {{ a.amount }}</span><span class="pill {{ {'approved': 'pill-ok', 'pending': 'pill-attention', 'rejected': 'pill-refused'}.get(a.status, 'pill-quiet') }}">{{ a.status }}</span></li>
     {% endfor %}
   </ul>
   {% else %}
+  {{ state_logo() }}
   <p class="muted">No approvals yet.</p>
   {% endif %}
 </section>
 
-<section class="card">
+<section class="card{% if not events %} state{% endif %}">
   <h2>Activity</h2>
   {% if events %}
   <ul class="rows">
@@ -52,6 +55,7 @@ Context, besides base.html's:
     {% endfor %}
   </ul>
   {% else %}
+  {{ state_logo() }}
   <p class="muted">Nothing yet.</p>
   {% endif %}
 </section>

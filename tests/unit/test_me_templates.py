@@ -5,7 +5,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from starlette.applications import Starlette
 from starlette.templating import Jinja2Templates
+from starlette.testclient import TestClient
+
+from services.api.routes import me
 
 TEMPLATES = Path("services/api/templates")
 CSS = Path("services/api/static/me.css")
@@ -225,4 +229,92 @@ def test_stylesheet() -> None:
     css = CSS.read_text()
     assert "system-ui" in css
     assert "width=device-width" in (TEMPLATES / "base.html").read_text()
-    assert "@import" not in css and "url(" not in css  # nothing fetched from elsewhere
+    # Nothing fetched from elsewhere: the one import is the sibling brand.css (next test).
+    assert css.count("@import") == 1 and "url(" not in css
+
+
+def test_stylesheet_imports_brand_first() -> None:
+    """me.css sits on brand.css's tokens (showcase.md §3.1), imported before any rule."""
+    css = re.sub(r"/\*.*?\*/", "", CSS.read_text(), flags=re.S).lstrip()
+    assert css.startswith('@import "brand.css";')
+    assert "var(--brand-" in css
+    assert (CSS.parent / "brand.css").is_file()
+
+
+def test_brand_assets_are_served_under_me_static() -> None:
+    """What me.css imports and the pages show resolve under /me/static/ (§3.1)."""
+    client = TestClient(Starlette(routes=me.routes))
+    css = client.get("/me/static/brand.css")
+    assert css.status_code == 200 and "--brand-green-900" in css.text
+    logo = client.get("/me/static/brand/spinach-icon.png")
+    assert logo.status_code == 200 and logo.headers["content-type"] == "image/png"
+
+
+def test_status_page_is_branded() -> None:
+    """`_page()` renders through base.html: the stylesheet, the logo, no tabs (§3.1)."""
+    page = me._page("Sign in to Kitchenless", "<p class='x'>Body</p>")
+    out = bytes(page.body).decode()
+    assert page.status_code == 200
+    assert out.startswith("<!doctype html>")
+    assert '<link rel="stylesheet" href="/me/static/me.css">' in out
+    assert 'src="/me/static/brand/spinach-icon.png"' in out
+    assert "<nav" not in out and 'href="/me/household"' not in out
+    assert "<title>Sign in to Kitchenless</title>" in out
+    assert "<h1>Sign in to Kitchenless</h1>" in out
+    assert "<p class='x'>Body</p>" in out  # the caller's HTML, unchanged
+    assert 'class="who"' not in out  # nobody signed in
+    assert 'class="state-logo"' not in out
+
+
+def test_status_page_error_state_and_title_escaped() -> None:
+    page = me._page("<script>alert(1)</script>", "<p>Ask for a new link.</p>", 410)
+    out = bytes(page.body).decode()
+    assert page.status_code == 410
+    assert "<script" not in out
+    assert out.count("&lt;script&gt;") == 2  # title and heading, escaped once
+    assert 'class="state-logo"' in out and 'width="48"' in out
+
+
+def test_empty_and_error_states_show_the_logo(templates: Jinja2Templates) -> None:
+    logo = 'class="state-logo"'
+    assert logo in _render(templates, "error")
+    assert logo in _render(templates, "pantry", enabled=False)
+    assert logo in _render(templates, "pantry", items=[])
+    assert logo in _render(templates, "agents", agents=[])
+    assert logo in _render(templates, "history", spending=[], approvals=[], events=[])
+    assert logo in _render(templates, "household", order=None, meals=[])
+    # A page with content has none, and the week's order is the hero card.
+    full = _render(templates, "household")
+    assert logo not in full
+    assert '<section class="card hero">' in full
+    assert "hero" not in _render(templates, "household", order=None)
+
+
+def test_every_page_has_the_header_logo(templates: Jinja2Templates) -> None:
+    for page in PAGES:
+        out = _render(templates, page)
+        assert 'src="/me/static/brand/spinach-icon.png"' in out, page
+        assert 'width="32"' in out and ">Kitchenless</span>" in out, page
+
+
+def test_pantry_pills_and_destructive_button(templates: Jinja2Templates) -> None:
+    pantry = _render(templates, "pantry")
+    assert '<h2 class="pill pill-ok">At home</h2>' in pantry
+    assert '<h2 class="pill pill-attention">Not sure</h2>' in pantry
+    assert '<h2 class="pill pill-refused">Out</h2>' in pantry
+    assert pantry.count('<button class="destructive"') == 3
+
+
+@pytest.mark.parametrize(
+    ("status", "pill"),
+    [
+        ("approved", "pill-ok"),
+        ("pending", "pill-attention"),
+        ("rejected", "pill-refused"),
+        ("expired", "pill-quiet"),
+    ],
+)
+def test_history_approval_pills(templates: Jinja2Templates, status: str, pill: str) -> None:
+    row = {"at": "Tue 4 Nov 18:02", "amount": "$84.20", "status": status}
+    out = _render(templates, "history", approvals=[row])
+    assert f'<span class="pill {pill}">{status}</span>' in out

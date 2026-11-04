@@ -5,30 +5,47 @@ Context, set by every /me route:
   household {name}             their household
   tab       "household" | "pantry" | "history" | none   the selected tab
 Child templates fill `title` and `content`. Every form includes `csrf_field(token)`, the
-route's itsdangerous token over the session id and that form's name (checked first). -#}
+route's itsdangerous token over the session id and that form's name (checked first).
+Empty and error states start with `state_logo()`.
+
+`me._page()` renders this file directly (showcase.md §3.1), with:
+  hide_tabs  true                no tab nav: the person may not be signed in yet
+  heading    the page's title
+  page_body  HTML built and escaped by `_page()`'s callers
+  page_error true for a status of 400 or more, shown as an error state -#}
 {%- macro csrf_field(token) -%}
 <input type="hidden" name="csrf" value="{{ token }}">
+{%- endmacro -%}
+{%- macro state_logo() -%}
+<img class="state-logo" src="/me/static/brand/spinach-icon.png" alt="" width="48" height="48">
 {%- endmacro -%}
 <!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{% block title %}Kitchenless{% endblock %}</title>
+<title>{% block title %}{{ heading or "Kitchenless" }}{% endblock %}</title>
 <link rel="stylesheet" href="/me/static/me.css">
 </head>
 <body>
 <header class="top">
-  <p class="who">{% if person %}<strong>{{ person.name }}</strong>{% endif %}{% if household %} · {{ household.name }}{% endif %}</p>
+  <div class="bar">
+    <span class="brand"><img src="/me/static/brand/spinach-icon.png" alt="" width="32" height="32">Kitchenless</span>
+    {% if person or household %}<p class="who">{% if person %}<strong>{{ person.name }}</strong>{% endif %}{% if household %} · {{ household.name }}{% endif %}</p>{% endif %}
+  </div>
+  {% if not hide_tabs %}
   <nav class="tabs" aria-label="Pages">
     <a href="/me/household"{% if tab == "household" %} aria-current="page"{% endif %}>Household</a>
     <a href="/me/pantry"{% if tab == "pantry" %} aria-current="page"{% endif %}>Pantry</a>
     <a href="/me/history"{% if tab == "history" %} aria-current="page"{% endif %}>History</a>
   </nav>
+  {% endif %}
 </header>
 <main>
 <h1>{{ self.title() }}</h1>
-{% block content %}{% endblock %}
+{% block content %}{% if page_body %}
+<section class="card{% if page_error %} state{% endif %}">{% if page_error %}{{ state_logo() }}{% endif %}{{ page_body | safe }}</section>
+{% endif %}{% endblock %}
 </main>
 </body>
 </html>

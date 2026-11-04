@@ -279,13 +279,18 @@ def _csrf_refused() -> HTMLResponse:
 
 
 def _page(title: str, body: str, status_code: int = 200) -> HTMLResponse:
-    return HTMLResponse(
-        f"<!doctype html><html><head><meta charset='utf-8'>"
-        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
-        f"<link rel='stylesheet' href='/me/static/me.css'><title>{html.escape(title)}</title>"
-        f"</head><body><main><h1>{html.escape(title)}</h1>{body}</main></body></html>",
-        status_code=status_code,
+    """A status page (sign-in results, consent done, errors) through `base.html`, without
+    tabs (showcase.md §3.1). `title` is plain text; `body` is HTML, escaped by the caller."""
+    page = TEMPLATES.get_template("base.html").render(
+        person=None,
+        household=None,
+        tab=None,
+        hide_tabs=True,
+        heading=title,
+        page_body=body,
+        page_error=status_code >= 400,
     )
+    return HTMLResponse(page, status_code=status_code)
 
 
 def _signed_out() -> HTMLResponse:
@@ -333,7 +338,8 @@ async def link(request: Request) -> Response:
         action = html.escape(f"/me/l/{token}{suffix}", quote=True)
         return _page(
             "Sign in to Kitchenless",
-            f"<form method='post' action='{action}'><button type='submit'>Continue</button></form>",
+            f"<form method='post' action='{action}'>"
+            "<button class='primary' type='submit'>Continue</button></form>",
         )
     async with _connect(request) as conn:
         try:

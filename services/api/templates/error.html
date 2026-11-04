@@ -5,7 +5,8 @@ Context, besides base.html's (person and household may be none):
   message  the page copy, for example "This page timed out. Write *my page* in WhatsApp for
            a new link." -#}
 {% extends "base.html" %}
+{% from "base.html" import state_logo %}
 {% block title %}{{ heading or "Something went wrong" }}{% endblock %}
 {% block content %}
-<p class="card error">{{ message }}</p>
+<section class="card state">{{ state_logo() }}<p>{{ message }}</p></section>
 {% endblock %}
