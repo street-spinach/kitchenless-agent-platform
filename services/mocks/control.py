@@ -573,6 +573,34 @@ async def _apply_join_code(
     )
 
 
+def _check_no_grant_for(name: str, value: list[Any]) -> list[str]:
+    """A non-empty list of agent ids (identity-authz I35)."""
+    if not value or not all(isinstance(agent, str) and agent for agent in value):
+        raise ControlRefused(f"setup key {name!r} must be a non-empty list of agent ids")
+    return value
+
+
+async def _apply_no_grant_for(conn: AsyncConnection, household_id: str, value: list[str]) -> None:
+    """Mark those agents' seeded mock grants `revoked` (evals.md §4). An agent with no
+    active grant in this household is refused, so a case never tests nothing."""
+    for agent_id in value:
+        cur = await unscoped(conn, "control.reset").execute(
+            "UPDATE agent_grants SET status = 'revoked', revoked_at = now(),"
+            " revoke_reason = 'eval_setup'"
+            " WHERE agent_id = %s AND household_id = %s AND status = 'active'",
+            (agent_id, household_id),
+        )
+        if cur.rowcount == 0:
+            raise ControlRefused(f"no_grant_for: {agent_id} has no active grant")
+
+
+async def _undo_no_grant_for(
+    conn: AsyncConnection, household_id: str, seeded: Mapping[str, int | None]
+) -> None:
+    """Nothing here: `_renew_eval_grants` sets the eval grants back to `active` in every
+    reset, after the undos and before `setup`."""
+
+
 async def _undo_join_code(
     conn: AsyncConnection, household_id: str, seeded: Mapping[str, int | None]
 ) -> None:
@@ -593,6 +621,7 @@ SETUP_KEYS: Mapping[str, SetupKey] = {
     ),
     "setup_incomplete": SetupKey(bool, _apply_setup_incomplete, _undo_setup_incomplete),
     "join_code": SetupKey(dict, _apply_join_code, _undo_join_code, _check_join_code),
+    "no_grant_for": SetupKey(list, _apply_no_grant_for, _undo_no_grant_for, _check_no_grant_for),
 }
 
 

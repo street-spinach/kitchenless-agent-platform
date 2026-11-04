@@ -24,6 +24,13 @@
 *   `GET /panel/evals` is the eval results page (evals.md §14, EG7): a real-mode headline,
     a labelled stub section and a per-case table linking each attempt to
     `/panel/runs/live?run_id=`. With no history rows or tables it says so.
+*   `GET /panel/identity?household=` (identity-authz I29): the household's grants, a Revoke
+    button per active grant, the identity fields of each agent's last guarded call (never a
+    token), and the flags "placed before revoke" and "re-consent needed". JSON, or a page
+    for an HTML client.
+*   `POST /panel/grants/{grant_id}/revoke` is §11's panel rule: `grants.revoke` with no
+    actor and `detail.via = 'panel'`, then `grants.after_revoke`. 409 when the grant is not
+    active, 404 when it is unknown.
 *   `GET /panel/experience?household=` (experience §12, EX-I22): decisions asked per adult
     this week and last, the guard metrics, pending held items and the configured Meta
     templates, as JSON or (for an HTML client) a three-line page. No actions.
@@ -39,7 +46,7 @@ import yaml
 from psycopg import AsyncConnection, errors
 from psycopg.rows import dict_row
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.routing import Route
 
 from services.api.whatsapp import templates
@@ -48,6 +55,7 @@ from services.common.config import get_settings
 from services.common.protocol import schemas
 from services.common.protocol.a2a import AgentMessageRow, QuoteRow, to_a2a_message
 from services.common.protocol.catalog import render_summary
+from services.identity import grants
 from services.mocks import control
 from services.safety.scope import unscoped
 
@@ -709,6 +717,150 @@ async def experience(request: Request) -> Response:
     return JSONResponse(data)
 
 
+# --- identity (identity-authz I29) ------------------------------------------------------------
+
+PANEL_VIA = "panel"
+REVOKE_REASON = "panel"
+PLACED_BEFORE_REVOKE = "placed before revoke"
+RECONSENT_NEEDED = "re-consent needed"
+
+_GRANTS_SQL = """
+SELECT DISTINCT ON (agent_id, user_id) grant_id, agent_id, agent_kind, user_id, status,
+       expires_at, revoked_at
+FROM agent_grants WHERE household_id = %s
+ORDER BY agent_id, user_id, (status = 'active') DESC, created_at DESC
+"""
+
+# The identity fields only: `args` and `result` can hold profile data.
+_LAST_CALLS_SQL = """
+SELECT DISTINCT ON (t.agent_id) t.agent_id, t.ts, t.payload->>'tool' AS tool,
+       t.payload->>'sub_user_id' AS sub_user_id, t.payload->>'act_agent_id' AS act_agent_id,
+       t.payload->>'token_source' AS token_source, t.payload->'authz' AS authz
+FROM agent_traces t JOIN runs r ON r.run_id = t.run_id
+WHERE r.household_id = %s AND t.kind = 'tool_call' AND t.payload ? 'act_agent_id'
+ORDER BY t.agent_id, t.ts DESC, t.seq DESC
+"""
+
+_PLACED_ORDERS_SQL = """
+SELECT order_id, state FROM orders
+WHERE household_id = %s AND state IN ('placed', 'courier_booked', 'in_delivery', 'delivered')
+  AND created_at <= %s
+ORDER BY created_at DESC, order_id
+"""
+
+
+async def _identity_data(cur: Any, household: str) -> dict[str, Any]:
+    await cur.execute(_GRANTS_SQL, (household,))
+    rows = await cur.fetchall()
+    await cur.execute(_LAST_CALLS_SQL, (household,))
+    calls = await cur.fetchall()
+    # The household agent's revoke is what lets an order finish without it (§11).
+    revoked = [r for r in rows if r["agent_kind"] == "household" and r["status"] == "revoked"]
+    placed: list[dict[str, Any]] = []
+    if revoked:
+        await cur.execute(_PLACED_ORDERS_SQL, (household, revoked[0]["revoked_at"]))
+        placed = await cur.fetchall()
+    return {
+        "grants": [
+            {
+                "grant_id": str(r["grant_id"]),
+                "agent_id": r["agent_id"],
+                "user_id": str(r["user_id"]),
+                "status": r["status"],
+                "expires_at": _iso(r["expires_at"]),
+                "flags": [] if r["status"] == "active" else [RECONSENT_NEEDED],
+            }
+            for r in rows
+        ],
+        "last_guarded_calls": [
+            {
+                "agent_id": c["agent_id"],
+                "ts": _iso(c["ts"]),
+                "tool": c["tool"],
+                "sub_user_id": c["sub_user_id"],
+                "act_agent_id": c["act_agent_id"],
+                "token_source": c["token_source"],
+                "authz": c["authz"],
+            }
+            for c in calls
+        ],
+        "orders": [
+            {"order_id": str(o["order_id"]), "state": o["state"], "flag": PLACED_BEFORE_REVOKE}
+            for o in placed
+        ],
+    }
+
+
+def _identity_page(household: str, data: dict[str, Any]) -> HTMLResponse:
+    rows = []
+    for g in data["grants"]:
+        button = ""
+        if g["status"] == "active":
+            button = (
+                f'<form method="post" action="/panel/grants/{_e(g["grant_id"])}/revoke">'
+                "<button>Revoke</button></form>"
+            )
+        flags = ", ".join(g["flags"])
+        rows.append(
+            f"<tr><td>{_e(g['agent_id'])}</td><td>{_e(g['status'])}</td>"
+            f"<td>{_e(flags)}</td><td>{button}</td></tr>"
+        )
+    calls = "".join(
+        f"<tr><td>{_e(c['agent_id'])}</td><td>{_e(c['tool'])}</td><td>{_e(c['sub_user_id'])}</td>"
+        f"<td>{_e(c['act_agent_id'])}</td><td>{_e(c['authz'])}</td></tr>"
+        for c in data["last_guarded_calls"]
+    )
+    orders = "".join(
+        f"<li>{_e(o['order_id'])} ({_e(o['state'])}): {_e(o['flag'])}</li>" for o in data["orders"]
+    )
+    return HTMLResponse(
+        f"<h1>Identity: {_e(household)}</h1>"
+        f"<table><tr><th>Agent</th><th>Grant</th><th>Flags</th><th></th></tr>{''.join(rows)}</table>"
+        "<h2>Last guarded call</h2><table><tr><th>Agent</th><th>Tool</th><th>sub</th>"
+        f"<th>act</th><th>authz</th></tr>{calls}</table>"
+        f"<h2>Orders</h2><ul>{orders}</ul>"
+    )
+
+
+async def identity(request: Request) -> Response:
+    """`GET /panel/identity?household=`. An unknown household is 404."""
+    household = request.query_params.get("household")
+    if not household:
+        return _error(400, "household is required")
+    async with (
+        request.app.state.connect() as conn,
+        unscoped(conn, "panel").cursor(row_factory=dict_row) as cur,
+    ):
+        await cur.execute("SELECT 1 FROM households WHERE household_id = %s", (household,))
+        if await cur.fetchone() is None:
+            return _error(404, "unknown household")
+        data = await _identity_data(cur, household)
+    if "text/html" in request.headers.get("accept", ""):
+        return _identity_page(household, data)
+    return JSONResponse(data)
+
+
+async def revoke_grant(request: Request) -> Response:
+    """`POST /panel/grants/{grant_id}/revoke` (§11 panel rule)."""
+    grant_id = _uuid(request.path_params["grant_id"])
+    if grant_id is None:
+        return _error(400, "grant_id must be a uuid")
+    async with request.app.state.connect() as conn:
+        cur = await unscoped(conn, "panel").execute(
+            "SELECT household_id FROM agent_grants WHERE grant_id = %s", (grant_id,)
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return _error(404, "unknown grant")
+        if not await grants.revoke(conn, grant_id, None, REVOKE_REASON, via=PANEL_VIA):
+            return _error(409, "the grant is not active")
+        await conn.commit()
+        await grants.after_revoke(conn, grant_id)
+    if "text/html" in request.headers.get("accept", ""):
+        return RedirectResponse(f"/panel/identity?household={row[0]}", status_code=303)
+    return JSONResponse({"revoked": True})
+
+
 routes = [
     Route("/panel/reset", reset, methods=["POST"]),
     Route("/panel/events", events, methods=["POST"]),
@@ -718,4 +870,6 @@ routes = [
     Route("/panel/messages/{message_id}", message_detail, methods=["GET"]),
     Route("/panel/evals", evals_page, methods=["GET"]),
     Route("/panel/experience", experience, methods=["GET"]),
+    Route("/panel/identity", identity, methods=["GET"]),
+    Route("/panel/grants/{grant_id}/revoke", revoke_grant, methods=["POST"]),
 ]

@@ -14,6 +14,7 @@ from services.agents.household import graph as hg
 from services.agents.household import stubs
 from services.common import ids
 from services.common.consumer import StepResult
+from services.common.mcp_client import ToolRefused
 from tests.unit.test_household_graph import HOUSEHOLD, MEMBERS, STARTER, World
 
 A = "consumer:us-1-a"  # the starter, STARTER
@@ -270,3 +271,30 @@ def test_old_checkpoint_entry_without_dislikes_reads_empty() -> None:
     assert hg.turn_holder(owners_constraints, MEMBERS, 0) == B_USER
     outcome = hg.apply_dislike_rule(LIST, {STARTER: [], B_USER: ["tomatoes"]}, frozenset())
     assert outcome.dropped == [] and outcome.kept == [("Tomato soup", ["tomatoes"])]
+
+
+def test_skipped_member_allergies_and_diets_still_filter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """I-CUJ 11: B's agent has no grant and answers empty; Postgres still has B's rows."""
+    _list(monkeypatch, LIST)
+    w = World()
+    w.household.members = [
+        {"user_id": STARTER, "allergies": [], "diets": []},
+        {"user_id": "b", "allergies": ["peanuts"], "diets": ["halal"]},
+    ]
+    w.start()
+    _answer(w, A, allergens=["milk"])
+    result = _answer(w, B)
+    assert _quote_request(result)["constraints"] == {
+        "allergens": ["milk", "peanuts"],
+        "diets": ["halal"],
+    }
+    [call] = w.household.of("get_constraints")
+    assert call["args"] == {"user_id": min(MEMBERS.values())}
+
+
+def test_household_read_refused_fails_closed() -> None:
+    """A run never goes on without every member's allergies."""
+    w = World()
+    w.household.refuse["get_constraints"] = "authz_denied"
+    with pytest.raises(ToolRefused):
+        w.start()

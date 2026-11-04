@@ -86,6 +86,7 @@ from services.common.consumer import (
 from services.common.directory import AgentCard
 from services.common.mcp_client import ToolRefused
 from services.common.run_context import RunContext
+from services.identity.errors import GrantError
 from services.safety.scope import unscoped
 
 __all__ = [
@@ -913,8 +914,9 @@ class SellerHandler:
                 },
                 quote.conversation_id,
             )
-        except ToolRefused as refused:
+        except (ToolRefused, GrantError) as refused:
             # Fails closed: nothing is placed, and the household is told (§7 seller reject).
+            # After a revoke, its next guarded call then ends the run (identity-authz §11).
             step.updates.clear()
             step.close(quote, "rejected", "seller")
             reason = "items_changed" if refused.reason == "items_changed" else "other"

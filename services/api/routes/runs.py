@@ -43,6 +43,8 @@ ALLOWED_OVERRIDES = frozenset(
         "FAIL_FIRST_ATTEMPT",
         "CRASH_BEFORE_FINISH",
         "STUB_SHORTFALL_UNSAFE_SUBSTITUTE",
+        # Identity-authz I35.
+        "STUB_NEGOTIATE_HOLD_SECONDS",
     }
 )
 

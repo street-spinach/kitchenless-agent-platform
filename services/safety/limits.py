@@ -9,6 +9,8 @@ AG-A8, #186, and identity-authz §8 step 3): allergens, approval needed (the ban
 budget as one check, `check_approval_needed`, identity-authz §9), child requester,
 currency, `a2a_demo`.
 
+`check_household_grant()` is the `place_order` limit of identity-authz §8 step 3 (I-D22).
+
 `authorize_amendment()` and `check_amend_order()` are the shortfall amendment limits
 (agent-protocol §10 "Applying" and "Amending", P28, #67).
 """
@@ -24,6 +26,7 @@ from psycopg import AsyncConnection
 from services.common import ids, money, orders
 from services.common.directory import AgentCard
 from services.common.money import Money
+from services.identity.errors import GrantRevoked
 from services.mcp.knowledge.adapters.neo4j_knowledge import Knowledge
 from services.safety.guard import GuardRefused
 from services.safety.scope import unscoped
@@ -55,6 +58,7 @@ __all__ = [
     "check_child_requester",
     "check_coverage",
     "check_currency",
+    "check_household_grant",
     "check_window",
 ]
 
@@ -310,6 +314,22 @@ async def check_approver(conn: AsyncConnection, household_id: str, user_id: Any)
     row = await cur.fetchone()
     if row is None or str(row[0]) != str(user_id):
         raise WrongApprover()
+
+
+async def check_household_grant(conn: AsyncConnection, household_id: str) -> None:
+    """Raise `GrantRevoked` unless the household agent has an active, unexpired grant.
+
+    `place_order` runs on a seller's service token, so nothing else stops an authorized
+    order after a revoke (identity-authz §8 step 3, I-D22). Any other state, a missing or
+    expired grant included, is `grant_revoked` too (fails closed).
+    """
+    cur = await unscoped(conn, "limits").execute(
+        "SELECT 1 FROM agent_grants WHERE agent_id = %s AND agent_kind = 'household'"
+        " AND status = 'active' AND expires_at > now() LIMIT 1",
+        (f"household:{household_id}",),
+    )
+    if await cur.fetchone() is None:
+        raise GrantRevoked()
 
 
 async def check_currency(conn: AsyncConnection, order_id: uuid.UUID, total: Money) -> None:

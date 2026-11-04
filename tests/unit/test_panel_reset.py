@@ -1185,3 +1185,31 @@ def test_reset_clears_experience_tables(world: dict[str, Any]) -> None:
                 )
                 == 1
             )
+
+
+CONSUMER_2 = "consumer:us-1-b-eval"
+
+
+def _grant_status(pg: str, agent_id: str) -> list[str]:
+    with psycopg.connect(pg) as conn:
+        rows = conn.execute(
+            "SELECT status FROM agent_grants WHERE agent_id = %s", (agent_id,)
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
+@pytest.mark.db
+def test_no_grant_for_setup_then_undone(world: dict[str, Any]) -> None:
+    pg = world["pg"]
+    _reset_setup(pg, {"no_grant_for": [CONSUMER_2]})
+    assert _grant_status(pg, CONSUMER_2) == ["revoked"]
+    assert _grant_status(pg, f"household:{EVAL}") == ["active"]
+    _reset_setup(pg, {})
+    assert _grant_status(pg, CONSUMER_2) == ["active"]
+
+
+@pytest.mark.db
+@pytest.mark.parametrize("value", [[], [""], [1], ["consumer:nobody"], "consumer:us-1-b-eval"])
+def test_no_grant_for_bad_value_refused(world: dict[str, Any], value: Any) -> None:
+    with pytest.raises(control.ControlRefused):
+        _reset_setup(world["pg"], {"no_grant_for": value})

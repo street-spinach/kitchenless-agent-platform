@@ -7,7 +7,7 @@ writer of `outcome`: the first call that moves the run out of `running`/`awaitin
 wins, and every later call changes nothing. When that call ends the run with `error` or
 `timeout`, it also sends the retry prompt from `system:runs`, in the same transaction,
 unless the run is `a2a_demo` or the reason is in `NO_RETRY_PROMPT` (those callers send
-their own message).
+their own message). A `grant_*` reason sends the renew text instead (identity-authz §12).
 
 Identity (identity-authz I39, build step 5): `start` refuses a household run when the
 household agent has no active grant (`GrantMissing`, `GrantRevoked` or `GrantExpired`),
@@ -33,7 +33,7 @@ from services.common.orders import BEFORE_PLACED
 from services.common.outbox import _on_behalf_of
 from services.common.trace import TraceStore
 from services.identity import grants
-from services.identity.claims import GRANT_REVOKED
+from services.identity.claims import GRANT_EXPIRED, GRANT_MISSING, GRANT_REVOKED
 from services.safety.scope import unscoped
 
 __all__ = [
@@ -53,6 +53,8 @@ __all__ = [
 RUNS_AGENT = "system:runs"
 WHATSAPP = "channel:whatsapp"
 RETRY_PROMPT_TEMPLATE = "retry_prompt"
+# Reasons that get the renew text, not the retry prompt (identity-authz §12).
+GRANT_REASONS = frozenset({GRANT_REVOKED, GRANT_EXPIRED, GRANT_MISSING})
 
 # Reasons whose callers send their own message instead (architecture §9, agent-protocol §12).
 NO_RETRY_PROMPT = frozenset({"delivery_failed", "nothing_to_deliver", "no_offers"})
@@ -230,7 +232,21 @@ async def finish(
             on_behalf_of=await _on_behalf_of(conn, agent_id),
             conn=conn,
         )
-        if status in _RETRY_STATUSES and kind != A2A_DEMO and reason not in NO_RETRY_PROMPT:
+        if status in _RETRY_STATUSES and kind != A2A_DEMO and reason in GRANT_REASONS:
+            body = await grants.renew_body(conn, agent_id, trigger["user_id"])
+            if body is not None:
+                await outbox.send(
+                    conn,
+                    message_id=ids.message_id(run_id, 0),
+                    run_id=run_id,
+                    conversation_id=None,
+                    causation_id=None,
+                    from_agent=RUNS_AGENT,
+                    to_agent=WHATSAPP,
+                    type="whatsapp_out",
+                    body=body,
+                )
+        elif status in _RETRY_STATUSES and kind != A2A_DEMO and reason not in NO_RETRY_PROMPT:
             await outbox.send(
                 conn,
                 message_id=ids.retry_prompt_id(run_id),

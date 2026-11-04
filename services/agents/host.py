@@ -9,6 +9,13 @@ Run with `python -m services.agents.host`. At startup it loads the enabled cards
     cards seeded after startup are picked up without a restart (#59). A card still not
     loaded, or a class with no handler, raises `NoHandler`: an ordinary step failure,
     retried and then poisoned.
+*   A `GrantError` from a step (identity-authz I28, §11): a household agent's ends the run
+    with its reason. A consumer agent's, on a message from the household agent, skips that
+    step with the trace note `MEMBER_SKIPPED`: a `constraints_request` is answered with
+    empty lists, so the household stops waiting, and that member's preferences are not
+    used. The household reads every member's allergies and diets itself. A consumer agent's
+    on any other message (the member's own chat) ends the run, as it has no household run
+    to continue.
 *   The consumer is given `finish_run=runs.finish`, so an exception after the last attempt
     finishes the run with `status=error`.
 *   `/health` reports Postgres reachability, the loaded card count and the message backlog
@@ -39,16 +46,18 @@ from services.agents.delivery import handler as delivery_handler
 from services.agents.grocery import handler as grocery_handler
 from services.agents.household import graph as household_graph
 from services.agents.restaurant import handler as restaurant_handler
-from services.common import db, directory, runs
+from services.common import db, directory, ids, runs
 from services.common import logging as app_logging
 from services.common.config import Settings, get_settings
-from services.common.consumer import Inbound, StepResult, consume_forever
+from services.common.consumer import Inbound, Outgoing, RunFinish, StepResult, consume_forever
 from services.common.directory import AgentCard
+from services.identity.errors import GrantError
 
 __all__ = [
     "BACKLOG_HOSTS",
     "HANDLERS",
     "HOST",
+    "MEMBER_SKIPPED",
     "ClassHandler",
     "Dispatcher",
     "NoHandler",
@@ -63,6 +72,8 @@ HOST = "agents"
 PORT = 8003
 DB_TIMEOUT_SECONDS = 2
 EXTERNAL = "external"
+# The trace note of a consumer step skipped for want of a grant (identity-authz I28).
+MEMBER_SKIPPED = "member without consent: preferences skipped"
 # Hosts always listed in the backlog, with zeros when they have no rows.
 BACKLOG_HOSTS = ("agents", "api")
 
@@ -94,6 +105,43 @@ GROUP BY to_host
 
 class NoHandler(LookupError):
     """This host has no handler for the message's `to_agent`."""
+
+
+def _skip_consumer_step(msg: Inbound, card: AgentCard) -> StepResult:
+    """The step of a consumer agent with no active grant, inside a household run. Nothing of
+    the member's is read or sent: the `constraints` reply is empty, and only frees the
+    household agent, which waits for every member (identity-authz §11, I-CUJ 11)."""
+    row = msg.row
+    messages: list[Outgoing] = []
+    if row.type == "constraints_request":
+        messages.append(
+            Outgoing(
+                message_id=ids.message_id(row.message_id, 0),
+                from_agent=card.agent_id,
+                to_agent=row.from_agent,
+                type="constraints",
+                body={
+                    "order_id": str(row.body["order_id"]),
+                    "allergens": [],
+                    "diets": [],
+                    "dislikes": [],
+                },
+                conversation_id=row.conversation_id,
+                causation_id=row.message_id,
+            )
+        )
+    note = {"node": row.type, "choice": "skipped", "explanation": MEMBER_SKIPPED}
+    return StepResult(messages=messages, decisions=[note])
+
+
+def _on_grant_error(msg: Inbound, card: AgentCard, exc: GrantError) -> StepResult:
+    """Identity-authz I28. Other classes hold no grant and re-raise, under the poison rule."""
+    if card.agent_class == "consumer":
+        if ids.parse_agent_id(msg.row.from_agent)[0] == "household":
+            return _skip_consumer_step(msg, card)
+    elif card.agent_class != "household":
+        raise exc
+    return StepResult(finish=RunFinish("error", exc.reason))
 
 
 class Dispatcher:
@@ -133,7 +181,11 @@ class Dispatcher:
         handler = self.handlers.get(to_agent)
         if handler is None:
             raise NoHandler(f"no handler on host {HOST!r} for {to_agent!r}")
-        return await handler(msg, self.cards[to_agent])
+        card = self.cards[to_agent]
+        try:
+            return await handler(msg, card)
+        except GrantError as exc:
+            return _on_grant_error(msg, card, exc)
 
 
 async def postgres_reachable() -> bool:
