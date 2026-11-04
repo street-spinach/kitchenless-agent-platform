@@ -50,6 +50,15 @@
     finished `completed` at once, since every agent message needs a run.
 6.  Anything else: `runs.start(...)` and send `user_message` to the member's consumer agent.
 
+Joining (experience §9, EX-I32): `JOIN <code>` from the code's phone, with the code unused
+and unexpired, is checked before step 2's `unknown_number`. `create_person` registers the
+person as `member` and `last_inbound_at` is set to the message's `received_at`; a household
+`chat` run with `source: "join"` is committed; `complete_join` moves the code's allergies
+and diets onto the person; then `joined` and the consent link are sent. If `create_person`
+fails nothing is kept but the inbound row, and the phone gets `retry_prompt` straight
+through the Graph API. A person registered by an earlier JOIN that did not finish can send
+it again, so the same check also admits a known phone in the code's household.
+
 The member's text is kept in `runs.trigger.text`, where the consumer agent reads it.
 
 Held items (experience §5, EX-I20): on every known-person path, once the path's run exists
@@ -104,12 +113,14 @@ __all__ = [
     "HELD_CANCELLED_LINE",
     "HELD_NODE",
     "HELD_RELEASE_CAP",
+    "JOINED",
     "UNKNOWN_NUMBER",
     "WHATSAPP",
     "Content",
     "ingest",
     "parse_shortfall_button",
     "release_held",
+    "send_retry_prompt",
     "send_unknown_number",
 ]
 
@@ -180,6 +191,12 @@ REMINDER_COMMANDS: dict[str, bool] = {"reminders off": True, "reminders on": Fal
 HELD_RELEASE_CAP = 3
 HELD_CANCELLED_LINE = "held_cancelled_line"
 HELD_NODE = "held_release"
+# Joining (experience §3, §9, §15; EX-I32).
+COMPLETE_JOIN = "complete_join"
+JOINED = "joined"
+JOIN_SOURCE = "join"
+JOIN_NODE = "join"
+JOIN_REFUSED = "refused"
 RELEASED = "released"
 DROPPED = "dropped"
 STALE = "stale"
@@ -193,7 +210,17 @@ async def send_unknown_number(phone: str) -> None:
     """The `unknown_number` reply, sent straight through the Graph API (no run, so no outbox
     row). The person has just written, so they are inside the window. Best effort: a failed
     send is logged and not retried, and nothing else happens (fails closed)."""
-    body = {"template": UNKNOWN_NUMBER, "params": {}, "buttons": []}
+    await _send_direct(phone, UNKNOWN_NUMBER)
+
+
+async def send_retry_prompt(phone: str) -> None:
+    """`retry_prompt` to a phone whose JOIN failed in `create_person` (experience §16): it
+    has no person yet, so no run and no outbox row. Sent like `unknown_number`."""
+    await _send_direct(phone, runs.RETRY_PROMPT_TEMPLATE)
+
+
+async def _send_direct(phone: str, template: str) -> None:
+    body = {"template": template, "params": {}, "buttons": []}
     try:
         settings = get_settings()
         sender = GraphSender(
@@ -326,6 +353,32 @@ class _Unregistered:
 _UNREGISTERED = _Unregistered()
 
 
+class _JoinFailed:
+    """`_ingest`'s result for a JOIN whose `create_person` failed: nothing was registered."""
+
+
+_JOIN_FAILED = _JoinFailed()
+
+
+@dataclass(frozen=True)
+class _JoinCode:
+    code: str
+    household_id: str
+    display_name: str
+    household: str
+
+
+@dataclass(frozen=True)
+class _Joining:
+    """`_ingest`'s result for a JOIN whose run is started; `_finish_join` runs once it is
+    committed, so that the guard sees the run."""
+
+    join: _JoinCode
+    member: _Member
+    run_id: uuid.UUID
+    inbound: uuid.UUID
+
+
 async def ingest(
     conn: AsyncConnection,
     channel: str,
@@ -338,6 +391,7 @@ async def ingest(
     run_id: uuid.UUID | None = None,
     call_tool: CallTool = mcp_client.call_tool_as,
     reply_unknown: SendUnknownNumber = send_unknown_number,
+    reply_retry: SendUnknownNumber = send_retry_prompt,
     add_child: AddChild = onboarding.create_child,
 ) -> uuid.UUID | None:
     """Handle one inbound message in one transaction; return the run it started, if any
@@ -347,6 +401,7 @@ async def ingest(
     `chat` run and the consumer agent classifies it. `call_tool` reaches `/mcp/household`
     for an approval button. `reply_unknown` sends the `unknown_number` reply to a phone
     that is not registered, after the inbound row is committed (a duplicate gets none).
+    `reply_retry` sends `retry_prompt` to a phone whose JOIN failed in `create_person`.
     `add_child` registers each new child on a setup "Yes, save" tap (identity-authz I23).
     """
     result = await _ingest(
@@ -355,6 +410,13 @@ async def ingest(
     if isinstance(result, _Unregistered):
         await reply_unknown(phone)
         return None
+    if isinstance(result, _JoinFailed):
+        await reply_retry(phone)
+        return None
+    if isinstance(result, _Joining):
+        await conn.commit()
+        await _finish_join(conn, result, call_tool=call_tool)
+        return result.run_id
     return result
 
 
@@ -369,7 +431,7 @@ async def _ingest(
     run_id: uuid.UUID | None,
     call_tool: CallTool,
     add_child: AddChild,
-) -> uuid.UUID | _Unregistered | None:
+) -> uuid.UUID | _Unregistered | _JoinFailed | _Joining | None:
     async with conn.transaction():
         cur = await unscoped(conn, "ingest").execute(_INSERT_INBOUND_SQL, (channel, external_id))
         inserted = await cur.fetchone()
@@ -381,11 +443,18 @@ async def _ingest(
         await unscoped(conn, "ingest").execute(_SET_LAST_INBOUND_SQL, (inserted[1], phone))
 
         member = await _member(conn, phone)
+        inbound = ids.inbound_id(channel, external_id)
+        join = await _open_join_code(conn, phone, content) if kind == CHAT else None
+        if join is not None and (member is None or member.household_id == join.household_id):
+            joining = await _start_join(conn, join, phone, inserted[1], inbound)
+            if isinstance(joining, _Joining | uuid.UUID):
+                run = joining.run_id if isinstance(joining, _Joining) else joining
+                await unscoped(conn, "ingest").execute(_SET_RUN_SQL, (run, channel, external_id))
+            return joining
         if member is None:
             log.info("inbound %s message from an unregistered phone", channel)
             return _UNREGISTERED
 
-        inbound = ids.inbound_id(channel, external_id)
         trigger: dict[str, Any] = {
             "source": channel,
             "user_id": member.user_id,
@@ -454,6 +523,118 @@ async def _ingest(
     order_id, on = take_turns
     await _take_turns_tap(conn, started, member, inbound, order_id, on, call_tool=call_tool)
     return started
+
+
+# The phone's open join code (experience §9): a code of any other phone is no code at all.
+_JOIN_LOOKUP_SQL = """
+SELECT j.code, j.household_id, j.display_name, h.name AS household
+FROM join_codes j
+JOIN households h ON h.household_id = j.household_id
+WHERE j.code = %s AND j.phone_e164 = %s AND j.used_at IS NULL AND j.expires_at > now()
+"""
+
+
+async def _open_join_code(conn: AsyncConnection, phone: str, content: Content) -> _JoinCode | None:
+    """The open join code this message names for this phone, or `None`."""
+    code = ids.parse_join_text(content.text) if content.kind == "text" else None
+    if code is None:
+        return None
+    async with unscoped(conn, "join_lookup").cursor(row_factory=dict_row) as cur:
+        await cur.execute(_JOIN_LOOKUP_SQL, (code, phone))
+        row = await cur.fetchone()
+    return None if row is None else _JoinCode(**row)
+
+
+async def _start_join(
+    conn: AsyncConnection,
+    join: _JoinCode,
+    phone: str,
+    received_at: Any,
+    inbound: uuid.UUID,
+) -> _Joining | uuid.UUID | _Unregistered | _JoinFailed:
+    """Register the person and start the join run (experience §3, §9), in the caller's
+    transaction. A phone in another household is treated as unknown. Any other failure
+    undoes the registration (§16). If the household agent's grant refuses the run, the
+    person stays registered, the code stays open and the approver gets the renew text; the
+    JOIN can be sent again."""
+    try:
+        async with conn.transaction():
+            await onboarding.create_person(
+                conn, phone, join.display_name, join.household_id, "member"
+            )
+            member = await _member(conn, phone)
+            if member is None:
+                raise LookupError("the registered person has no consumer agent")
+    except onboarding.PhoneTaken:
+        log.info("join refused: the phone is in another household")
+        return _UNREGISTERED
+    except Exception as exc:  # §16: nothing kept, and the JOIN can be repeated
+        log.warning("join not registered: %s", type(exc).__name__)
+        return _JOIN_FAILED
+    await unscoped(conn, "ingest").execute(_SET_LAST_INBOUND_SQL, (received_at, phone))
+    started, ok = await _start(
+        conn,
+        member,
+        inbound,
+        household_id=join.household_id,
+        kind=CHAT,
+        trigger={"source": JOIN_SOURCE, "user_id": member.user_id, "inbound_id": inbound},
+    )
+    return _Joining(join, member, started, inbound) if ok else started
+
+
+async def _finish_join(conn: AsyncConnection, joining: _Joining, *, call_tool: CallTool) -> None:
+    """`complete_join` in the committed run, then `joined` and the consent link. A refusal
+    ends the run `error`, which sends `retry_prompt`; the code stays open, so its codes stay
+    merged and the JOIN can be sent again. If the tool cannot be reached the error
+    propagates and the run is left to its `run_timeout`, as for a take-turns tap."""
+    join, member, run_id, inbound = joining.join, joining.member, joining.run_id, joining.inbound
+    args = {"code": join.code, "user_id": str(member.user_id)}
+    ctx = RunContext(run_id=run_id, agent_id=API_AGENT, conversation_id=None)
+    reason: str | None = None
+    try:
+        await call_tool(HOUSEHOLD_SERVER, COMPLETE_JOIN, args, ctx=ctx)
+    except ToolRefused as refused:
+        log.info("join refused: %s", refused.reason)
+        reason = refused.reason
+    async with conn.transaction():
+        await _TRACES.write(
+            run_id,
+            API_AGENT,
+            "decision",
+            {
+                "node": JOIN_NODE,
+                "choice": JOINED if reason is None else JOIN_REFUSED,
+                "reason": reason,
+                "explanation": "",
+            },
+            on_behalf_of=f"user:{member.user_id}",
+            conn=conn,
+        )
+        if reason is not None:
+            await runs.finish(conn, run_id, API_AGENT, "error", reason)
+            return
+        params = {"name": join.display_name, "household": join.household}
+        consent = {
+            "household_id": join.household_id,
+            "agent_ids": [member.consumer],
+            "purpose": "consent",
+        }
+        for ordinal, extra in enumerate(
+            ({"template": JOINED, "params": params}, {"template": ME_LINK, "link": consent})
+        ):
+            await outbox.send(
+                conn,
+                message_id=ids.message_id(inbound, ordinal),
+                run_id=run_id,
+                conversation_id=None,
+                causation_id=None,
+                from_agent=API_AGENT,
+                to_agent=WHATSAPP,
+                type="whatsapp_out",
+                body={"user_id": str(member.user_id), "params": {}, "buttons": [], **extra},
+            )
+        await runs.finish(conn, run_id, API_AGENT, "completed", JOINED)
 
 
 # The household approver's display name (experience EX-I2).

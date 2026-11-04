@@ -78,6 +78,9 @@ def test_tool_scope_table() -> None:
                 # A delegated token without the scope (but with every other) is refused.
                 assert _refused(tool, _claims(CLASS_AGENT[cls], kind, all_scopes - {row.scope}))
     assert _refused("no_such_tool", _claims(HOUSEHOLD_AGENT, "people", all_scopes))
+    # Experience EX-A11 (EX-I31): only `svc.api` completes a join.
+    assert not _refused("complete_join", _claims("system:api", "service"))
+    assert _refused("complete_join", _claims(HOUSEHOLD_AGENT, "people", all_scopes))
 
 
 def test_system_rows_admit_only_svc_api() -> None:
@@ -108,6 +111,7 @@ def test_scope_table_matches_design() -> None:
         "apply_setup": ("service", {"system"}, None),
         "set_household_take_turns": ("service", {"system"}, None),
         "react_to_meal": ("service", {"system"}, None),
+        "complete_join": ("service", {"system"}, None),
     }
     actual = {
         tool: (row.caller, set(row.agent_classes), row.scope)

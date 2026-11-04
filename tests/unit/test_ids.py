@@ -293,6 +293,14 @@ def test_page_button_round_trips_and_rejects_anything_else() -> None:
         assert ids.parse_page_button(payload) is None, payload
 
 
+def test_parse_join_text() -> None:
+    code = ids.new_join_code()
+    assert ids.parse_join_text(f"JOIN {code}") == code
+    assert ids.parse_join_text(f"  join   {code.lower()}\n") == code
+    for text in ("", None, "JOIN", code, f"JOIN {code} now", "JOIN K7Q2M9XD", "JOIN ABC"):
+        assert ids.parse_join_text(text) is None, text
+
+
 def test_proposal_id_is_derived_from_run_id() -> None:
     run = uuid4()
     assert ids.proposal_id(run) == uuid5(run, "proposal") == ids.proposal_id(run)

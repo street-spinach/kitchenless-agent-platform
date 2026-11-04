@@ -55,6 +55,9 @@ The setup tools (experience §9, EX-I26), for the consumer agent:
     the household's `pending` proposal, with `phones_taken`.
 *   `apply_setup(proposal_id, answer, removal, child_user_ids, user_id)` *guarded*, `api`
     service token, admins only: "Yes, save", "No", and each removal's second tap (EX-I27).
+*   `complete_join(code, user_id)` *guarded*, `api` service token: moves a join code's
+    `pending` onto the new user and marks the code used (EX-I31). Until then the codes of
+    open join codes are part of the household's merged allergens and constraints.
 
 The household is always the run's household (`runs.household_id`), never an argument.
 """
@@ -104,6 +107,7 @@ __all__ = [
     "authorize_amendment",
     "authorize_spend",
     "choose_shortfall_option",
+    "complete_join",
     "create_order",
     "decide_approval",
     "format_reply_by",
@@ -167,6 +171,8 @@ SETUP_EXPIRED = "setup_expired"
 _SETUP_ANSWERS = frozenset({"yes", "no", "remove", "keep"})
 _REMOVAL_ANSWERS = frozenset({"remove", "keep"})
 _JOIN_CODE_TRIES = 3
+# `complete_join`: not the household's open code for this person's phone (experience §9).
+JOIN_CODE_INVALID = "join_code_invalid"
 
 server = MCPServer(name=AREA)
 
@@ -237,7 +243,21 @@ async def _order(conn: AsyncConnection, order_id: uuid.UUID, household: str) -> 
     return {"household_id": household_id, "kind": kind, "state": state, "currency": currency}
 
 
+async def _open_join_codes(
+    conn: AsyncConnection, household: str | None
+) -> list[tuple[str, dict[str, list[str]]]]:
+    """`(code, pending)` of the household's unused, unexpired join codes (experience EX-A9).
+    `pending` is `{allergies: [...], diets: [...]}`, as `apply_setup` and the `join_code`
+    setup key write it; a row of any other shape raises, so nothing is ordered without it."""
+    rows = await _scoped(conn, household).fetch(
+        "SELECT code, pending FROM join_codes WHERE household_id = %(household)s"
+        " AND used_at IS NULL AND expires_at > now() ORDER BY code"
+    )
+    return [(str(code), pending) for code, pending in rows]
+
+
 async def _member_allergens(conn: AsyncConnection, household: str) -> dict[str, list[str]]:
+    """Each member's allergen codes, plus one `join:<code>` entry per open join code."""
     rows = await _scoped(conn, household).fetch(
         "SELECT m.user_id, c.value FROM household_members m"
         " JOIN member_constraints c ON c.user_id = m.user_id AND c.kind = 'allergy'"
@@ -246,6 +266,8 @@ async def _member_allergens(conn: AsyncConnection, household: str) -> dict[str, 
     allergens: dict[str, list[str]] = {}
     for user_id, code in rows:
         allergens.setdefault(str(user_id), []).append(code)
+    for code, pending in await _open_join_codes(conn, household):
+        allergens[f"join:{code}"] = sorted(pending["allergies"])
     return allergens
 
 
@@ -329,6 +351,7 @@ async def _household_constraints(ctx: CallContext, user_id: uuid.UUID) -> dict[s
                 "  AND c.kind IN ('allergy', 'diet')"
                 " WHERE m.household_id = %(household)s ORDER BY m.user_id, c.kind, c.value"
             )
+            open_codes = await _open_join_codes(conn, household)
         members: dict[str, dict[str, Any]] = {}
         for member, kind, value in rows:
             entry = members.setdefault(
@@ -338,6 +361,13 @@ async def _household_constraints(ctx: CallContext, user_id: uuid.UUID) -> dict[s
                 entry["allergies"].append(value)
             elif kind == "diet":
                 entry["diets"].append(value)
+        # A joining adult is protected before they join (experience EX-A9).
+        for code, pending in open_codes:
+            members[f"join:{code}"] = {
+                "user_id": f"join:{code}",
+                "allergies": sorted(pending["allergies"]),
+                "diets": sorted(pending["diets"]),
+            }
         return {"household_id": household, "members": list(members.values())}
 
     return await run_guarded(
@@ -826,7 +856,8 @@ async def record_delivery(ctx: CallContext, *, order_id: uuid.UUID) -> dict[str,
 
 
 async def get_household_allergens(ctx: CallContext) -> dict[str, Any]:
-    """The sorted union of every member's allergen codes and nothing else (agents §6, §9).
+    """The sorted union of every member's allergen codes and those of the household's open
+    join codes, and nothing else (agents §6, §9; experience EX-A9).
 
     Relation `agent acts_for household:<run household>`; read only.
     """
@@ -2002,6 +2033,90 @@ async def apply_setup(
     )
 
 
+async def complete_join(ctx: CallContext, *, code: str, user_id: uuid.UUID) -> dict[str, Any]:
+    """Finish a join (experience §9, EX-I31), from `api` with its service token. `user_id`
+    is the new user: a member of the run's household whose phone is the code's.
+
+    In one transaction, moves the code's `pending` into `member_constraints`
+    (`source = 'join'`) and marks the code used. A code of another household, another
+    phone, expired or used by someone else is refused `join_code_invalid`. The same user
+    repeating a used code gets `outcome: already_joined` and nothing is written.
+    """
+    household = await _run_household(ctx)
+
+    async def find(conn: AsyncConnection, *, lock: bool = False) -> tuple[Any, ...] | None:
+        """`(pending, used_by, expired)` if the code is the household's and the user's."""
+        rows = await _scoped(conn, household).fetch(
+            "SELECT j.pending, j.used_by, j.expires_at <= now() FROM join_codes j"
+            " JOIN channel_identities ci ON ci.phone_e164 = j.phone_e164"
+            " AND ci.user_id = %(user)s"
+            " JOIN household_members m ON m.user_id = ci.user_id"
+            " AND m.household_id = j.household_id"
+            " WHERE j.code = %(code)s AND j.household_id = %(household)s"
+            + (" FOR UPDATE OF j" if lock else ""),
+            code=code,
+            user=user_id,
+        )
+        return tuple(rows[0]) if rows else None
+
+    def refused(found: tuple[Any, ...] | None) -> bool:
+        if found is None:
+            return True
+        _, used_by, expired = found
+        return used_by != user_id if used_by is not None else bool(expired)
+
+    async def check(conn: AsyncConnection) -> None:
+        if ctx.agent_id != API_AGENT:
+            raise GuardRefused(AUTHZ_DENIED)
+        _require_household(household)
+        if refused(await find(conn)):
+            raise GuardRefused(JOIN_CODE_INVALID)
+
+    async def call() -> dict[str, Any]:
+        async with db.get_pool().connection() as conn, conn.transaction():
+            q = _scoped(conn, household)
+            found = await find(conn, lock=True)
+            if found is None or refused(found):  # checked by the limits; a lost race only
+                raise GuardRefused(JOIN_CODE_INVALID)
+            pending, used_by, _ = found
+            if used_by is not None:
+                return {"outcome": "already_joined"}
+            codes = [("allergy", c) for c in pending["allergies"]] + [
+                ("diet", c) for c in pending["diets"]
+            ]
+            for kind, value in codes:
+                await q.execute(
+                    "INSERT INTO member_constraints (user_id, kind, value, source)"
+                    " SELECT m.user_id, %(kind)s, %(value)s, 'join'"
+                    " FROM household_members m"
+                    " WHERE m.household_id = %(household)s AND m.user_id = %(user)s"
+                    " AND NOT EXISTS (SELECT 1 FROM member_constraints c"
+                    " WHERE c.user_id = m.user_id AND c.kind = %(kind)s"
+                    " AND c.value = %(value)s)",
+                    user=user_id,
+                    kind=kind,
+                    value=value,
+                )
+            await q.execute(
+                "UPDATE join_codes SET used_at = now(), used_by = %(user)s"
+                " WHERE code = %(code)s AND household_id = %(household)s",
+                user=user_id,
+                code=code,
+            )
+        return {"outcome": "joined"}
+
+    return await run_guarded(
+        ctx,
+        tool=f"{AREA}.complete_join",
+        relation=None,
+        limits=check,
+        key=None,
+        request={"code": code, "user_id": str(user_id)},
+        call=call,
+        apply=None,
+    )
+
+
 # --- MCP registration -----------------------------------------------------------------
 
 
@@ -2196,6 +2311,11 @@ async def _apply_setup_tool(
         child_user_ids=child_user_ids,
         user_id=user_id,
     )
+
+
+@server.tool(name="complete_join")
+async def _complete_join_tool(code: str, user_id: uuid.UUID, ctx: Context) -> CallToolResult:
+    return await _serve(ctx, complete_join, code=code, user_id=user_id)
 
 
 @server.tool(name="authorize_amendment")

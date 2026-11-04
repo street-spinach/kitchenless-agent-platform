@@ -113,6 +113,7 @@ TOOL_SCOPES: Mapping[str, ToolScope] = {
     "apply_setup": _service("system"),
     "set_household_take_turns": _service("system"),
     "react_to_meal": _service("system"),
+    "complete_join": _service("system"),
 }
 
 
