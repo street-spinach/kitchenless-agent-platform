@@ -363,6 +363,10 @@ services:
       AGENTS_URL: ${AGENTS_URL:-http://agents:8003}
       SEED_US1_PHONES: ${SEED_US1_PHONES:-}
       ORCHESTRATOR_URL: http://api:8000
+      # The eval runner (evals E-A11). infra/eval-nightly.sh passes GIT_SHA with `run -e`.
+      GIT_SHA: ${GIT_SHA:-}
+      EVAL_DEADLINE_SECONDS: ${EVAL_DEADLINE_SECONDS:-3000}
+      RUN_TOKEN_CEILING: ${RUN_TOKEN_CEILING}
 
   # The ci profile is reserved for CI-only helpers (for example a stub token issuer).
   # Today `--profile ci` starts the same services as `make up`.

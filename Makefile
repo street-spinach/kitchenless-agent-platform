@@ -1,13 +1,17 @@
 COMPOSE := docker compose -f infra/docker-compose.yml --env-file infra/.env
 CONTRACT_PATH := tests/contract$(if $(SERVICE),/$(SERVICE))
 
+# A make started from a recipe (`make test-unit` runs tests that call `make -n`) keeps its
+# output to the recipe lines, without GNU make 4's "Entering directory" banners.
+MAKEFLAGS += --no-print-directory
+
 # pytest exits 5 when it collects no tests. The contract and scenario suites stay empty until the
 # adapter and scenario designs land, so only those two treat "no tests yet" as a pass.
 define allow_empty
 s=$$?; if [ $$s -eq 5 ]; then echo "No $(1) tests yet."; exit 0; fi; exit $$s
 endef
 
-.PHONY: up down lint test-unit test-contract fga-test smoke a2a-smoke scenario scenario-identity eval-fast eval-safety eval-full seed seed-local app-deps app-lint app-test
+.PHONY: up down lint test-unit test-contract fga-test smoke a2a-smoke scenario scenario-identity eval-fast eval-safety eval-full eval-nightly seed seed-local app-deps app-lint app-test
 
 up:
 	$(COMPOSE) up -d --build --remove-orphans --wait
@@ -70,6 +74,10 @@ eval-full:
 	else \
 		$(COMPOSE) run --rm testrunner python -m evals.run --all; \
 	fi
+
+# One night's eval run on the VM (evals §10). BUSINESS_MODEL makes it a D4 run.
+eval-nightly:
+	infra/eval-nightly.sh $(BUSINESS_MODEL)
 
 # SEED_ARGS, for example --env eval (architecture items 55 and 73).
 seed:
