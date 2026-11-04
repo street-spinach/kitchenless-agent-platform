@@ -18,6 +18,7 @@ negotiate and order food on behalf of people. See docs/designs/SITEMAP.md.
   (the full suite runs nightly; make eval-fast runs every fast case locally)
 - MODE=mock is the default. Never switch tests to real integrations.
 - MODEL_MODE=stub is the default for tests. Never switch tests to real.
+- Tests use TOKEN_SOURCE=mock.
 
 ## Conventions
 - Python 3.12, uv, ruff, pytest. Type hints on public functions.
@@ -40,6 +41,9 @@ negotiate and order food on behalf of people. See docs/designs/SITEMAP.md.
   enforced in code, never left to the model.
 - Business agents receive intent and constraints, never raw consumer profiles.
 - Never read, print or edit .env files or secrets. Use .env.example for new variables.
+- Household-owned tables are accessed only through services/safety/scope.py.
+- Tokens and link tokens are never written to checkpoints, messages, traces, logs or
+  tool arguments.
 
 ## Tests and evals
 - Never weaken, skip or delete tests or eval cases to make checks pass.
