@@ -1,0 +1,16 @@
+# Pantry §8 case 1 (PT-CUJ 1): the weekly order skips only the trusted item. Milk is fresh;
+# eggs ran out; rice is past its window; bread and bananas have no events.
+id: task-weekly-order-skips-pantry-items
+category: task
+tags: [fast]
+model_modes: [stub]
+household: us-1-eval
+run: weekly_grocery_order
+setup:
+  pantry:
+    milk: [{kind: add, age_hours: 1}]
+    eggs: [{kind: add, age_hours: 5}, {kind: out, age_hours: 1}]
+    rice: [{kind: add, age_hours: 400}]
+expect:
+  - {check: pantry_decisions_traced}
+  - {check: run_status, args: {status: completed}}
