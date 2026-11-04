@@ -803,6 +803,15 @@ uses it, through one of two profiles:
 
 The rest of this section describes the `people` profile unless it says otherwise.
 
+*Amended 2026-11-04 (#392):* Muse Glimmer is open-weight and is not served by the Meta
+Model API (developer.meta.com/ai lists it for your own hardware), so "the same
+OpenAI-compatible API" above would fail every business call in `real` mode. The business
+profile may use its own OpenAI-compatible host through `MODEL_BUSINESS_BASE_URL` and
+`MODEL_BUSINESS_API_KEY`. When the URL is set, its own key goes with it, even if empty, and
+the primary key is never sent there; when it is empty, the profile uses `MODEL_BASE_URL` and
+`MODEL_API_KEY` as before. The host is an operator choice. A scale-to-zero host's cold
+start is longer than the 5 s timeout, so keep one replica warm for the demo.
+
 *   **`MODEL_MODE=real`** calls the primary model, set by `MODEL_BASE_URL` and `MODEL_NAME`.
     This is Muse Spark, Meta's hosted reasoning model (brief §4.3), called through its
     OpenAI-compatible API.
@@ -2929,7 +2938,7 @@ and values; none of these may be renamed or dropped.
 | `APPROVAL_TTL_SECONDS` (14400), `RUN_TIMEOUT_SECONDS` (300), `QUOTE_ROUND_SECONDS` (30) | All app | Run overrides win (item 36) |
 | `MODE`, `MODE_FORCE_MOCK`, `MODE_<VENDOR>` | `api`, `testrunner` | Resolved once at run start |
 | `MODEL_MODE`, `MODEL_BASE_URL`, `MODEL_NAME`, `MODEL_API_KEY`, `MODEL_FALLBACK_BASE_URL`, `MODEL_FALLBACK_NAME`, `MODEL_FALLBACK_API_KEY`, `RUN_TOKEN_CEILING` | `agents`, `testrunner` | `deploy.sh` exports `MODEL_MODE=stub` |
-| `MODEL_BUSINESS_NAME` (Muse Glimmer), `MODEL_BUSINESS_TIMEOUT_SECONDS` (5) | `agents`, `testrunner` | Same base URL and key as `MODEL_*` |
+| `MODEL_BUSINESS_NAME` (Muse Glimmer), `MODEL_BUSINESS_TIMEOUT_SECONDS` (5), `MODEL_BUSINESS_BASE_URL`, `MODEL_BUSINESS_API_KEY` | `agents`, `testrunner` | Empty business URL: same base URL and key as `MODEL_*` (amended 2026-11-04, #392) |
 | `MOCK_TOKEN_SECRET` | All app | Q4. Retired by identity-authz (I-A12); its §13 variable table replaces this row and adds the identity variables |
 | `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD` | `mcp`, `testrunner` | |
 | `OPENFGA_API_URL`, `OPENFGA_STORE_ID` | `mcp`, `testrunner` | `OPENFGA_STORE_ID` retired by identity-authz (I-A12); the store id is read from `fga_models` |

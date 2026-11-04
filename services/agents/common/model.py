@@ -9,7 +9,8 @@ This module is the only place that calls a model. It has two profiles:
 * `business` (grocery, restaurant and delivery handlers): `ModelClient.choose`. One attempt,
   `MODEL_BUSINESS_TIMEOUT_SECONDS`, `max_tokens=300`, then a JSON-schema check, the
   allowed-set check and the rationale check. It never raises; any failure gives the rule
-  default computed by the caller.
+  default computed by the caller. It calls `MODEL_BUSINESS_BASE_URL` when set (#392),
+  otherwise the primary base URL.
 
 `MODEL_MODE=stub` never touches the network: it calls `services/agents/<class>/stubs.py`,
 whose `STUBS` maps a graph node or choice point name to a function. The run's overrides
@@ -78,6 +79,19 @@ TEMPLATES: Mapping[str, str] = {
     "choose_window": "The earliest window our courier capacity allows.",
 }
 _DEFAULT_TEMPLATE = "Chosen by the business rules."
+
+
+def business_endpoint(s: Any) -> tuple[str | None, str | None]:
+    """`(base_url, api_key)` for the business profile (#392).
+
+    Muse Glimmer is open-weight and not served by the Meta Model API, so it may run on its
+    own host. When `MODEL_BUSINESS_BASE_URL` is set, its own key goes with it, even if
+    empty (a self-hosted server), so the primary key never reaches another host. When it
+    is empty, the business profile uses `MODEL_BASE_URL` and `MODEL_API_KEY` as before.
+    """
+    if s.model_business_base_url:
+        return s.model_business_base_url, s.model_business_api_key
+    return s.model_base_url, s.model_api_key
 
 
 class ModelUnavailable(RuntimeError):
@@ -734,7 +748,8 @@ class ModelClient:
         guidance: str | None = None,
     ) -> ModelResult:
         s = self._settings
-        if not s.model_base_url:
+        base_url, api_key = business_endpoint(s)
+        if not base_url:
             raise ModelUnavailable("model not configured")
         system = (
             f"You make the '{point}' choice for a business. Answer with one JSON object "
@@ -754,7 +769,7 @@ class ModelClient:
         timeout = float(s.model_business_timeout_seconds)
         started = self._clock()
         data = await asyncio.wait_for(
-            self._transport.post(s.model_base_url, s.model_api_key, body, timeout), timeout
+            self._transport.post(base_url, api_key, body, timeout), timeout
         )
         latency_ms = int((self._clock() - started) * 1000)
         return _parse_completion(data, s.model_business_name, latency_ms)
