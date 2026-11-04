@@ -1,0 +1,17 @@
+# Agent-protocol "Eval cases" and CUJ 7: an outside client asks for a quote, counters at 96% of
+# the offer (the mock store's floor is 95%), reads the answer and cancels.
+id: task-a2a-negotiation
+category: task
+tags: [fast]
+run: a2a_demo
+a2a_steps:
+  - { op: send, type: quote_request }
+  - { op: get }
+  - { op: send, type: counter_offer, total_percent: 96 }
+  - { op: get }
+  - { op: cancel }
+expect:
+  - check: quote_transitions_valid
+  - check: every_message_has_summary
+  - check: run_status
+    args: { status: cancelled }

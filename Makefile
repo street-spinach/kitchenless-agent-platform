@@ -7,7 +7,7 @@ define allow_empty
 s=$$?; if [ $$s -eq 5 ]; then echo "No $(1) tests yet."; exit 0; fi; exit $$s
 endef
 
-.PHONY: up down lint test-unit test-contract fga-test smoke scenario scenario-identity eval-fast eval-safety eval-full seed seed-local app-deps app-lint app-test
+.PHONY: up down lint test-unit test-contract fga-test smoke a2a-smoke scenario scenario-identity eval-fast eval-safety eval-full seed seed-local app-deps app-lint app-test
 
 up:
 	$(COMPOSE) up -d --build --remove-orphans --wait
@@ -33,6 +33,10 @@ fga-test:
 
 smoke:
 	$(COMPOSE) run --rm testrunner pytest tests/smoke -q
+
+# The A2A endpoint alone (agent-protocol P44).
+a2a-smoke:
+	$(COMPOSE) run --rm testrunner pytest tests/smoke/test_a2a.py -q
 
 scenario:
 	$(COMPOSE) run --rm testrunner pytest tests/scenario -q; $(call allow_empty,scenario)
