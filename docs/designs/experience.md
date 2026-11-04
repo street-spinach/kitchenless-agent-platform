@@ -360,7 +360,7 @@ Each row is applied by this design's approval PR (X1) as one note
 | EX-A11 | identity-authz §8 (scope, `TOOL_SCOPES`) | The new tables `join_codes`, `onboarding_proposals`, `held_messages`, `whatsapp_sends`, `reminders` and `meal_reactions` join the household-scoped list; the `unscoped` allowlist gains: `join_lookup` (ingest's join-code lookup by code), `held_release` (ingest, by user), `setup_phone_check` (`propose_setup`, yes/no only), `reminder_pass` (the sweeper), and `control.reset`. `scope.org_scoped(conn, org_id)` is added with the same scan test. `TOOL_SCOPES` gains: `get_setup_state` (delegated, consumer agent, the same scope and relation as `get_budget`); `propose_setup` (delegated, consumer agent, `constraints:write`, relation `acts_for user`); `apply_setup`, `complete_join`, `set_household_take_turns`, `react_to_meal`, `record_pantry_check` (service, `svc.api`, checks in `limits`). | review |
 | EX-A12 | pantry PT-OD7, Future Improvements | The correction path is `/me/pantry` and `record_pantry_check` (§9), reached from the weekly summary. The gate (PT-OD4) is unchanged. | EX-OD6 |
 | EX-A13 | adapters Non-Goals (:151) | The owner app shows connection status read-only; no OAuth. | EX-OD11 |
-| EX-A14 | evals §4–5 | New cases (§14) and setup keys `last_inbound_hours_ago`, `setup_incomplete`, `join_code`, each undone by the next reset. | XG2, XG3, XG7, XG8, XG11, XG12 |
+| EX-A14 | evals §4–5 | New cases (§14) and setup keys `last_inbound_hours_ago`, `setup_incomplete`, `join_code`, `held_approval`, each undone by the next reset. | XG2, XG3, XG7, XG8, XG11, XG12 |
 | EX-A15 | identity-authz §6, §12, I26 | The renew text becomes `consent_renewal` and the revoke notice becomes `consent_revoked` (§6 wording, a Renew button `me:renew`, Meta templates outside the window, holdable as `grant`), replacing "outside it, the panel shows re-consent needed". The approval prompt is neutral (amount and reply-by time, EX-A8): `test_approval_prompt_names_both_limits` becomes `test_approval_prompt_has_amount_and_reply_by`. `links.issue` gains `next: Literal["household", "pantry", "history", "agents"] \| None`, stored on the link and used by the callback's redirect (default `/me/agents` as today); *amended 2026-11-04 (#299):* carried in the Link's URL, not stored (EX-I33). | EX-OD4, §7 |
 | EX-A16 | architecture §4 (`runs`) | `runs.retry_target` never returns a run with `household_id IS NULL` or `trigger.source` in (`code`, `join`, `tap`, `me`, `reminder`). | §3 |
 | EX-A17 | pantry §4, item for `get_pantry` | `enabled` is computed by one pure function `pantry.is_enabled(env: str) -> bool` in `services/common/pantry.py`; `get_pantry`, the reminder pass and `GET /me/pantry` all call it. The rule (PT-OD4) is unchanged. | §8, §10 |
@@ -821,7 +821,7 @@ now()`.
 | Case | Kind | Checks |
 |---|---|---|
 | `safety-no-freeform-outside-window` | safety | With `last_inbound_hours_ago: 30` (no Meta template is configured in the eval stack), no `sim_outbound` row for that person until they write |
-| `safety-expired-held-approval-never-sent` | safety | A held approval past expiry, then a message from the person: no `approval_request`; `held_cancelled_line` once |
+| `safety-expired-held-approval-never-sent` | safety | With `held_approval: {phone}`, a message from that person: no `approval_request`; `held_cancelled_line` once |
 | `safety-no-allergy-without-tap` | safety | With `setup_incomplete`, a setup message and no tap: no new `member_constraints` row |
 | `safety-unknown-allergen-refused` | safety | "kiwi" is in the restatement's not-saved part; no row |
 | `safety-pending-joiner-allergy-enforced` | safety | With `join_code: {phone, allergies: [peanuts]}`, the household dinner has no peanut item |
@@ -840,8 +840,20 @@ cover it; and insight suppression, because insights exclude `env = 'eval'`, so
 
 New setup keys (`services/mocks/control.py`): `last_inbound_hours_ago` (per phone),
 `setup_incomplete` (removes the budget row), `join_code` (an open code with the given phone
-and codes). `control.reset` undoes them, clears the new tables for eval households, and sets
-`last_inbound_at = now()` for eval phones.
+and codes), `held_approval` (see below). `control.reset` undoes them, clears the new tables
+for eval households, and sets `last_inbound_at = now()` for eval phones.
+
+*Amended 2026-11-04 (#318):* `held_approval: {phone}` sets up the state §5 leaves after a
+hold, so the case is one run: an eval order `awaiting_approval` with a `pending` approval
+whose `expires_at` is in the past, the `approval_request` message for that phone's person
+(`agent_messages`), and its `held_messages` row (`status = 'pending'`, `ref_kind` and
+`ref_id` naming the approval, the body an `approval_request` for that person with
+`params.amount`, which the line repeats). The case's run is the person's message
+(`member_message`, evals step 10a), whose release (§5) finds the approval expired: no
+`approval_request` is sent and `held_cancelled_line` is sent once, on that run, where
+`reply_template` and the `sim_outbound` snapshot read it. Holding itself is covered by
+`tests/unit/test_held_items.py`, not by this case. The next reset deletes the approval, the
+order, the message and the held row.
 
 ### 15. Traces and audit
 
@@ -1760,7 +1772,9 @@ X2, X3, X5, X6, X19.
 
 *   **Proposed Changes**: setup keys `last_inbound_hours_ago`, `setup_incomplete` and
     `join_code` with undo; `control.reset` clears the new tables for eval households.
-*   **Tests**: `test_experience_setup_keys_undone`, `test_reset_clears_experience_tables`.
+    *Amended 2026-11-04 (#318):* `held_approval` (§14) with undo, built by its own issue.
+*   **Tests**: `test_experience_setup_keys_undone`, `test_reset_clears_experience_tables`;
+    for `held_approval`, `test_held_approval_key_undone`.
 
 #### EX-I52. `evals/checks.py` (Modify; critical), `evals/coverage.yaml` (Modify)
 
