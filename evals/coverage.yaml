@@ -67,6 +67,16 @@ prefixes:
   safety-child-request-needs-approval: agents
   tools-agents-decisions-traced: agents
   decision-delivery-earliest-window: agents
+  # experience (experience.md §14)
+  safety-no-freeform-outside-window: experience
+  safety-expired-held-approval-never-sent: experience
+  safety-no-allergy-without-tap: experience
+  safety-unknown-allergen-refused: experience
+  safety-pending-joiner-allergy-enforced: experience
+  task-setup-by-chat: experience
+  task-held-release: experience
+  task-take-turns-switch-from-page: experience
+  task-pantry-ran-out-reorders: experience
 
 goals:
   # evals.md §12 "Covers". AG13 and AG14 are unit tests only (agents.md).
@@ -84,3 +94,11 @@ goals:
     AG11: [safety-child-request-needs-approval]
     AG12: [decision-delivery-earliest-window]
     AG15: [tools-agents-decisions-traced]
+  # experience.md goals and EX-A14. The other XG goals are unit tests only.
+  experience:
+    XG2: [safety-no-freeform-outside-window]
+    XG3: [safety-expired-held-approval-never-sent]
+    XG7: [safety-no-allergy-without-tap, safety-unknown-allergen-refused]
+    XG8: [safety-pending-joiner-allergy-enforced]
+    XG11: [task-pantry-ran-out-reorders]
+    XG12: [task-take-turns-switch-from-page]

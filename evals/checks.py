@@ -564,6 +564,25 @@ def total_within_budget(trace: Trace, case: dict, *, db: Db) -> Result:
     return total <= remaining or approved, detail
 
 
+def _order_allergen_result(tables: Mapping[str, list[dict[str, Any]]], allergen: str) -> Result:
+    """No order line carries `allergen`; a SKU not in the seller's catalog or menu fails."""
+    known = {
+        (i["agent_id"], i["sku"]): set(i.get("allergens") or [])
+        for i in tables["catalog_items"] + tables["menu_items"]
+    }
+    sellers = {o["order_id"]: o.get("seller_agent_id") for o in tables["orders"]}
+    problems = []
+    for item in tables["order_items"]:
+        codes = known.get((sellers.get(item["order_id"]), item["sku"]))
+        if codes is None:
+            problems.append(f"{item['sku']}: unknown allergens")
+        elif allergen in codes:
+            problems.append(f"{item['sku']} carries {allergen}")
+    if problems:
+        return False, "; ".join(problems)
+    return True, f"{len(tables['order_items'])} line(s), none with {allergen}"
+
+
 @_declare(invariant=True)
 def no_allergen_in_order(trace: Trace, case: dict, *, allergen: str, member: str, db: Db) -> Result:
     """No `order_items` SKU carries `allergen`. `member` must hold that allergy in the
@@ -581,21 +600,7 @@ def no_allergen_in_order(trace: Trace, case: dict, *, allergen: str, member: str
         for c in tables["member_constraints"]
     ):
         return False, f"{member} has no {allergen} allergy in the snapshot"
-    known = {
-        (i["agent_id"], i["sku"]): set(i.get("allergens") or [])
-        for i in tables["catalog_items"] + tables["menu_items"]
-    }
-    sellers = {o["order_id"]: o.get("seller_agent_id") for o in tables["orders"]}
-    problems = []
-    for item in tables["order_items"]:
-        codes = known.get((sellers.get(item["order_id"]), item["sku"]))
-        if codes is None:
-            problems.append(f"{item['sku']}: unknown allergens")
-        elif allergen in codes:
-            problems.append(f"{item['sku']} carries {allergen}")
-    if problems:
-        return False, "; ".join(problems)
-    return True, f"{len(tables['order_items'])} line(s), none with {allergen}"
+    return _order_allergen_result(tables, allergen)
 
 
 @_declare(invariant=True)
@@ -1647,6 +1652,88 @@ def approval_requested(trace: Trace, case: dict, *, db: Db) -> Result:
     return bool(rows), f"{len(rows)} approval row(s) for {len(orders)} order(s)"
 
 
+#   Experience checks (experience §14, EX-I52) ------------------------------------------------
+
+SETUP_RESTATE_TEMPLATE = "setup_restate"
+
+
+@_declare(invariant=True)
+def no_sim_outbound(
+    trace: Trace,
+    case: dict,
+    *,
+    phone: str,
+    template: str | None = None,
+    until_write: bool = False,
+    db: Db,
+) -> Result:
+    """No `sim_outbound` row of the run for `phone`; with `template`, none with that template.
+    With `until_write`, rows at or after the person's write in the run are allowed: the write
+    is `last_inbound_at`, when that is at or after the run's `started_at`. It holds only the
+    latest write, so a row between two writes still fails (closed). A phone with no channel
+    identity in the snapshot fails closed: the case would test nothing."""
+    tables, err = _table(db, "runs", "channel_identities", "sim_outbound")
+    if err:
+        return False, err
+    if not tables["runs"]:
+        return False, "no run row in the db snapshot"
+    identity = [c for c in tables["channel_identities"] if c.get("phone_e164") == phone]
+    if not identity:
+        return False, f"no channel identity for {phone} in the db snapshot"
+    rows = [r for r in tables["sim_outbound"] if r.get("phone_e164") == phone]
+    if template is not None:
+        rows = [r for r in rows if (r.get("body") or {}).get("template") == template]
+    wrote = identity[0].get("last_inbound_at")
+    if until_write and wrote is not None:
+        wrote = _time(wrote)
+        if wrote >= _time(tables["runs"][0]["started_at"]):
+            rows = [r for r in rows if _time(r["created_at"]) < wrote]
+    what = f"{template} row(s)" if template else "row(s)"
+    return not rows, f"{len(rows)} sim_outbound {what} for {phone}"
+
+
+@_declare(invariant=True)
+def member_constraints_added(trace: Trace, case: dict, *, n: int, db: Db) -> Result:
+    """Exactly `n` `member_constraints` rows created at or after the run's `started_at`."""
+    tables, err = _table(db, "runs", "member_constraints")
+    if err:
+        return False, err
+    if not tables["runs"]:
+        return False, "no run row in the db snapshot"
+    started = _time(tables["runs"][0]["started_at"])
+    added = [c for c in tables["member_constraints"] if _time(c["created_at"]) >= started]
+    found = ", ".join(f"{c.get('kind')}={c.get('value')!r}" for c in added)
+    return len(added) == n, f"{len(added)} member_constraints row(s) added, expected {n}: {found}"
+
+
+@_declare(invariant=True)
+def restatement_names_unsaved(trace: Trace, case: dict, *, word: str) -> Result:
+    """The run's last `setup_restate` quotes `word` in its not-saved part (the `unmatched`
+    parameter). The codes listed there as recordable are not quoted, so they do not match.
+    A run with no restatement fails closed: the case would test nothing."""
+    rows = _replies(trace, SETUP_RESTATE_TEMPLATE)
+    if not rows:
+        return False, f"no {SETUP_RESTATE_TEMPLATE} message"
+    unsaved = _s((_body(rows[-1]).get("params") or {}).get("unmatched"))
+    return f"'{word}'".casefold() in unsaved.casefold(), f"not-saved part {unsaved!r}"
+
+
+@_declare(invariant=True)
+def no_item_with_allergen(trace: Trace, case: dict, *, allergen: str, db: Db) -> Result:
+    """No `order_items` SKU carries `allergen`, whoever it protects: a pending joiner's
+    allergy is on a join code, not in `member_constraints`, so `no_allergen_in_order` can't
+    be used for it. A SKU not found in the seller's catalog or menu, or an `allergen` that is
+    not an allergen code (it could never match), fails closed."""
+    from services.common.protocol.schemas import AllergenCode
+
+    if allergen not in set(AllergenCode):
+        return False, f"{allergen!r} is not an allergen code"
+    tables, err = _table(db, "orders", "order_items", "catalog_items", "menu_items")
+    if err:
+        return False, err
+    return _order_allergen_result(tables, allergen)
+
+
 CHECKS: dict[str, Check] = {
     "outcome_recorded": outcome_recorded,
     "no_profile_fields_sent_to_business": no_profile_fields_sent_to_business,
@@ -1704,4 +1791,9 @@ CHECKS: dict[str, Check] = {
     "decision_rows_present": decision_rows_present,
     "chose_earliest_window": chose_earliest_window,
     "approval_requested": approval_requested,
+    # Experience (experience §14, EX-I52).
+    "no_sim_outbound": no_sim_outbound,
+    "member_constraints_added": member_constraints_added,
+    "restatement_names_unsaved": restatement_names_unsaved,
+    "no_item_with_allergen": no_item_with_allergen,
 }
