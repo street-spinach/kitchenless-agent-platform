@@ -13,6 +13,8 @@ from tests.unit import api_world as w
 
 db = pytest.mark.db
 
+SEED_MEMBER = "us-2-c-eval"
+SEED_PHONE = "+15550100203"
 P32_KEYS = {
     "OFFER_TTL_SECONDS": 5,
     "SHORTFALL_REPLY_SECONDS": 5,
@@ -44,7 +46,12 @@ def _post(pg: str, **body: object):
 
 @db
 def test_post_runs_stores_allowed_overrides_including_p32(world: str) -> None:
-    overrides = {"APPROVAL_TTL_SECONDS": 10, "STUB_FAIL_NODE": "build_list", **P32_KEYS}
+    overrides = {
+        "APPROVAL_TTL_SECONDS": 10,
+        "STUB_FAIL_NODE": "build_list",
+        "STUB_COUNTER_REJECT": True,
+        **P32_KEYS,
+    }
     assert set(overrides) == ALLOWED_OVERRIDES - {"STUB_OUT_OF_BOUNDS", "STUB_DUPLICATE_MESSAGE"}
     resp = _post(world, overrides=overrides)
     assert resp.status_code == 200
@@ -95,9 +102,87 @@ def test_post_runs_dinner_scenario_and_get_run(world: str) -> None:
     assert w.client(world).get(f"/runs/{uuid.uuid4()}").status_code == 404
 
 
+def _member_message(pg: str, **body: object):
+    body = {
+        "scenario": "member_message",
+        "household_id": w.HOUSEHOLD_ID,
+        "member": SEED_MEMBER,
+        "text": "I don't like mushrooms",
+        **body,
+    }
+    return w.client(pg).post("/runs", json=body)
+
+
+@db
+def test_member_message_starts_a_chat_run_from_that_member(world: str) -> None:
+    user_id = w.add_seed_member(world, SEED_MEMBER, SEED_PHONE)
+
+    resp = _member_message(world, overrides={"STUB_COUNTER_REJECT": True})
+
+    assert resp.status_code == 200
+    run_id = uuid.UUID(resp.json()["run_id"])
+    [run] = w.query(world, "SELECT * FROM runs WHERE run_id = %s", run_id)
+    assert (run["kind"], run["household_id"]) == ("chat", w.HOUSEHOLD_ID)
+    # From the named member, not the household's first member (the admin).
+    assert run["trigger"]["user_id"] == str(user_id)
+    assert run["trigger"]["text"] == "I don't like mushrooms"
+    assert run["trigger"]["overrides"] == {"STUB_COUNTER_REJECT": True}
+    [msg] = w.query(world, "SELECT * FROM agent_messages WHERE run_id = %s", run_id)
+    assert (msg["type"], msg["to_agent"]) == ("user_message", f"consumer:{SEED_MEMBER}")
+
+
+@db
+def test_member_message_refuses_a_member_of_another_household(world: str) -> None:
+    w.add_seed_member(world, SEED_MEMBER, SEED_PHONE, household_id=w.LIVE_HOUSEHOLD_ID)
+    resp = _member_message(world)
+    assert resp.status_code == 400
+    assert SEED_MEMBER in resp.json()["error"]
+    assert w.query(world, "SELECT * FROM runs") == []
+    assert w.query(world, "SELECT * FROM inbound_messages") == []
+
+
+@db
+def test_member_message_refuses_an_unknown_member(world: str) -> None:
+    assert _member_message(world, member="nobody").status_code == 400
+    assert w.query(world, "SELECT * FROM runs") == []
+
+
+@db
+def test_member_message_refuses_a_member_with_no_phone(world: str) -> None:
+    w.add_seed_member(world, SEED_MEMBER, None)
+    assert _member_message(world).status_code == 400
+    assert w.query(world, "SELECT * FROM runs") == []
+
+
+@db
+def test_member_message_never_simulates_a_real_phone(world: str) -> None:
+    w.add_seed_member(world, SEED_MEMBER, SEED_PHONE, mode="real")
+    assert _member_message(world).status_code == 400
+    assert w.query(world, "SELECT * FROM runs") == []
+
+
+@db
+def test_member_message_refuses_live_and_unknown_households(world: str) -> None:
+    w.add_seed_member(world, SEED_MEMBER, SEED_PHONE, household_id=w.LIVE_HOUSEHOLD_ID)
+    assert _member_message(world, household_id=w.LIVE_HOUSEHOLD_ID).status_code == 403
+    assert _member_message(world, household_id="nowhere").status_code == 404
+    assert w.query(world, "SELECT * FROM runs") == []
+
+
 @pytest.mark.parametrize(
     "body",
     [
+        {"scenario": "member_message", "household_id": "h", "text": "hi"},
+        {"scenario": "member_message", "household_id": "h", "member": "", "text": "hi"},
+        {"scenario": "member_message", "household_id": "h", "member": "m"},
+        {"scenario": "member_message", "household_id": "h", "member": "m", "text": " "},
+        {
+            "scenario": "member_message",
+            "household_id": "h",
+            "member": "m",
+            "text": "hi",
+            "overrides": {"MODE": "real"},
+        },
         {"scenario": "unknown", "household_id": "h", "input": "hi"},
         {"scenario": "weekly_grocery_order", "household_id": "h", "input": ""},
         {

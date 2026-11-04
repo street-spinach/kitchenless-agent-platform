@@ -1,6 +1,7 @@
 """Fakes for the grocery and restaurant handler tests (test_handlers.py,
 test_grocery_handler.py): a seller MCP server over a small catalog, and stub choosers."""
 
+import functools
 import json
 import uuid
 from collections.abc import Mapping
@@ -119,12 +120,14 @@ class RecordingStubs:
 
     def mapping(self) -> dict[str, Any]:
         def wrap(name: str, fn: Any) -> Any:
-            def stub(inputs: Any, default: Any, *, out_of_bounds: bool = False) -> ModelResult:
+            # `wraps` keeps `fn`'s signature, so `_choose` sees the keywords `fn` takes.
+            @functools.wraps(fn)
+            def stub(inputs: Any, default: Any, **keywords: Any) -> ModelResult:
                 self.seen.append((name, json.loads(json.dumps(inputs, default=str))))
                 if name in self.answers:
                     pick = self.answers[name]
                     return ModelResult(text=json.dumps({"pick": pick, "rationale": "ok"}))
-                return fn(inputs, default, out_of_bounds=out_of_bounds)
+                return fn(inputs, default, **keywords)
 
             return stub
 

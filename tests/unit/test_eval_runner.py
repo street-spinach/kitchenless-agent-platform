@@ -557,6 +557,26 @@ def test_busy_night_dinner_posts_runs(api: FakeApi) -> None:
     assert api.calls == [("/runs", body)]
 
 
+def test_member_message_posts_runs_from_the_named_member(api: FakeApi) -> None:
+    given = {"member": "us-1-c-eval", "text": "I don't like mushrooms"}
+    started = run.SCENARIOS["member_message"](
+        case(run="member_message", input=given, overrides={"STUB_COUNTER_REJECT": True})
+    )
+    assert started == api.run_id
+    body = {
+        "scenario": "member_message",
+        "household_id": "us-1-eval",
+        **given,
+        "overrides": {"STUB_COUNTER_REJECT": True},
+    }
+    assert api.calls == [("/runs", body)]
+
+
+def test_member_message_is_a_known_scenario() -> None:
+    given = {"member": "us-1-c-eval", "text": "hi"}
+    validate(case(run="member_message", input=given))
+
+
 def test_approve_as_taps_approve_when_prompt_shows(
     api: FakeApi, monkeypatch: pytest.MonkeyPatch
 ) -> None:

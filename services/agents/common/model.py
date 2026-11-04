@@ -20,6 +20,7 @@ are loaded by `ctx.run_id`.
 
 import asyncio
 import importlib
+import inspect
 import json
 import logging
 import math
@@ -701,8 +702,10 @@ class ModelClient:
             if stub is None:
                 result = ModelResult(text=json.dumps({"pick": default, "rationale": template}))
             else:
-                out_of_bounds = overrides.get("STUB_OUT_OF_BOUNDS") == point
-                result = stub(inputs, default, out_of_bounds=out_of_bounds)
+                keywords = {"out_of_bounds": overrides.get("STUB_OUT_OF_BOUNDS") == point}
+                if "counter_reject" in inspect.signature(stub).parameters:
+                    keywords["counter_reject"] = bool(overrides.get("STUB_COUNTER_REJECT"))
+                result = stub(inputs, default, **keywords)
         else:
             try:
                 result = await self._choose_real(point, allowed, inputs, guidance)

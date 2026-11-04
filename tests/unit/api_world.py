@@ -13,7 +13,7 @@ from psycopg.types.json import Jsonb
 from starlette.testclient import TestClient
 
 from services.api import main as api
-from services.common import modes, runs
+from services.common import ids, modes, runs
 from services.common.config import Settings
 from tests.unit.identity_world import grant_household
 
@@ -71,6 +71,32 @@ def seed(pg: str) -> None:
             "INSERT INTO agent_clients (agent_id, client_id, kind)"
             " VALUES ('system:api', 'svc.api', 'service')"
         )
+
+
+def add_seed_member(
+    pg: str,
+    member_id: str,
+    phone: str | None,
+    *,
+    household_id: str = HOUSEHOLD_ID,
+    mode: str = "sim",
+) -> uuid.UUID:
+    """A member whose `user_id` comes from the seed id, as `POST /runs` `member` expects."""
+    user_id = ids.seed_user_id(member_id)
+    with psycopg.connect(pg) as conn:
+        conn.execute("INSERT INTO users (user_id, display_name) VALUES (%s, 'Member')", (user_id,))
+        conn.execute(
+            "INSERT INTO household_members (household_id, user_id, role) VALUES (%s, %s, 'member')",
+            (household_id, user_id),
+        )
+        if phone is not None:
+            conn.execute(
+                "INSERT INTO channel_identities (phone_e164, user_id, channel_mode,"
+                " last_inbound_at) VALUES (%s, %s, %s, now())",
+                (phone, user_id, mode),
+            )
+        _card(conn, f"consumer:{member_id}", "consumer", f"user:{user_id}", "agents")
+    return user_id
 
 
 def _card(conn: psycopg.Connection, agent_id: str, cls: str, owner: str, host: str) -> None:

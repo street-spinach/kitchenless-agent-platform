@@ -2,8 +2,10 @@
 A21 and P32). Internal: the eval runner and the control panel call them.
 
 A run is started by `ingest` with a simulated message from the household's first member,
-so it follows the same path as a WhatsApp message. Only the allowed `overrides` are stored,
-in `runs.trigger.overrides`; any other key refuses the request.
+so it follows the same path as a WhatsApp message. The `member_message` scenario (evals E-A6)
+sends the message from a named seed member instead and starts a `chat` run, the kind a
+WhatsApp text gets. Only the allowed `overrides` are stored, in `runs.trigger.overrides`; any
+other key refuses the request.
 
 `GET /runs/{run_id}` names the run's seller and courier with
 `vendors.vendor_label(area, card, org_name, runs.modes).text` (adapters §6), or `null`
@@ -19,7 +21,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from services.api.ingest import Content, ingest
+from services.api.ingest import CHAT, Content, ingest
 from services.common import directory, ids, vendors
 from services.safety.scope import unscoped
 
@@ -28,6 +30,7 @@ __all__ = ["ALLOWED_OVERRIDES", "RUNS_CHANNEL", "SCENARIOS", "routes"]
 RUNS_CHANNEL = "runs"
 SCENARIOS = {"weekly_grocery_order": "weekly", "busy_night_dinner": "dinner"}
 PAIR_SCENARIO = "weekly_grocery_order_pair"
+MEMBER_MESSAGE = "member_message"
 
 ALLOWED_OVERRIDES = frozenset(
     {
@@ -45,6 +48,8 @@ ALLOWED_OVERRIDES = frozenset(
         "STUB_SHORTFALL_UNSAFE_SUBSTITUTE",
         # Identity-authz I35.
         "STUB_NEGOTIATE_HOLD_SECONDS",
+        # Evals E-A6.
+        "STUB_COUNTER_REJECT",
     }
 )
 
@@ -55,6 +60,16 @@ FROM household_members hm
 JOIN channel_identities ci ON ci.user_id = hm.user_id
 WHERE hm.household_id = %s
 ORDER BY hm.role = 'admin' DESC, hm.created_at, ci.created_at, ci.phone_e164
+LIMIT 1
+"""
+
+# A named member's simulated phone, only if they belong to the household.
+_MEMBER_PHONE_SQL = """
+SELECT ci.phone_e164
+FROM household_members hm
+JOIN channel_identities ci ON ci.user_id = hm.user_id
+WHERE hm.household_id = %s AND hm.user_id = %s AND ci.channel_mode = 'sim'
+ORDER BY ci.created_at, ci.phone_e164
 LIMIT 1
 """
 
@@ -98,8 +113,8 @@ def _overrides(raw: object) -> dict[str, Any]:
     return dict(raw)
 
 
-async def _first_member_phone(conn: AsyncConnection, household_id: object) -> str:
-    """The phone to simulate. Refuses unknown and `live` households.
+async def _require_eval_household(conn: AsyncConnection, household_id: object) -> str:
+    """The household id. Refuses unknown and `live` households.
 
     The control panel exception for `live` households waits for the panel routes (#74); until
     then every `live` household is refused.
@@ -114,10 +129,28 @@ async def _first_member_phone(conn: AsyncConnection, household_id: object) -> st
         raise _Refused(404, f"unknown household {household_id}")
     if row[0] != "eval":
         raise _Refused(403, "runs for live households are refused")
-    cur = await unscoped(conn, "runs_route").execute(_FIRST_MEMBER_SQL, (household_id,))
+    return household_id
+
+
+async def _first_member_phone(conn: AsyncConnection, household_id: object) -> str:
+    """The phone to simulate: the household's first member's."""
+    household = await _require_eval_household(conn, household_id)
+    cur = await unscoped(conn, "runs_route").execute(_FIRST_MEMBER_SQL, (household,))
     phone = await cur.fetchone()
     if phone is None:
-        raise _Refused(409, f"household {household_id} has no member with a phone")
+        raise _Refused(409, f"household {household} has no member with a phone")
+    return phone[0]
+
+
+async def _member_phone(conn: AsyncConnection, household_id: object, member: str) -> str:
+    """The phone to simulate: seed member `member`'s, who must belong to the household."""
+    household = await _require_eval_household(conn, household_id)
+    cur = await unscoped(conn, "runs_route").execute(
+        _MEMBER_PHONE_SQL, (household, ids.seed_user_id(member))
+    )
+    phone = await cur.fetchone()
+    if phone is None:
+        raise _Refused(400, f"{member} is not a member of {household} with a phone")
     return phone[0]
 
 
@@ -136,8 +169,22 @@ async def _start(
         run_id=run_id,
     )
     if started is None:
-        raise _Refused(409, "the household's first member has no consumer agent")
+        raise _Refused(409, "the member has no consumer agent")
     return started
+
+
+async def _start_member_message(request: Request, body: dict[str, Any]) -> JSONResponse:
+    """`{scenario, household_id, member, text, overrides?}`: a `chat` run (evals E-A6)."""
+    member, text = body.get("member"), body.get("text")
+    if not isinstance(member, str) or not member:
+        raise _Refused(400, "member must be a seed member id")
+    if not isinstance(text, str) or not text.strip():
+        raise _Refused(400, "text must be the member's message text")
+    overrides = _overrides(body.get("overrides"))
+    async with request.app.state.connect() as conn, conn.transaction():
+        phone = await _member_phone(conn, body.get("household_id"), member)
+        run_id = await _start(conn, phone, CHAT, text, overrides)
+    return JSONResponse({"run_id": str(run_id)})
 
 
 async def _label(
@@ -154,7 +201,8 @@ async def _label(
 
 
 async def start_run(request: Request) -> JSONResponse:
-    """`{scenario, household_id, input, overrides?}` returns `{run_id}`."""
+    """`{scenario, household_id, input, overrides?}` returns `{run_id}`; `member_message`
+    takes `member` and `text` in place of `input`."""
     try:
         body = await request.json()
     except ValueError:
@@ -164,6 +212,8 @@ async def start_run(request: Request) -> JSONResponse:
     scenario = body.get("scenario")
     text = body.get("input")
     try:
+        if scenario == MEMBER_MESSAGE:
+            return await _start_member_message(request, body)
         if scenario not in SCENARIOS and scenario != PAIR_SCENARIO:
             raise _Refused(400, f"unknown scenario {scenario!r}")
         if not isinstance(text, str) or not text.strip():

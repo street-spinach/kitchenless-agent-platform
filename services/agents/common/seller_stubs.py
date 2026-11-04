@@ -9,6 +9,9 @@ out_of_bounds)`. Normally each returns the rule default with a fixed rationale. 
 *   `respond_to_counter`: `agree`, whatever the floor total.
 
 The handler's own allowed-set check turns both into the rule default.
+
+`respond_to_counter` also takes the keyword `counter_reject`. With `STUB_COUNTER_REJECT:
+true` it returns `reject`, which the allowed set always holds (evals E-A13).
 """
 
 import json
@@ -17,7 +20,14 @@ from typing import Any
 
 from services.agents.common.model import ModelResult
 
-__all__ = ["RATIONALES", "STUBS", "UNSAFE_SKU", "rank_substitutes", "respond_to_counter"]
+__all__ = [
+    "COUNTER_REJECT_RATIONALE",
+    "RATIONALES",
+    "STUBS",
+    "UNSAFE_SKU",
+    "rank_substitutes",
+    "respond_to_counter",
+]
 
 # The seeded tree-nut item of `grocery:mock-us` (services/seed/data/catalog_mock.yaml).
 UNSAFE_SKU = "MOCK-MILK-ALMOND"
@@ -25,6 +35,7 @@ RATIONALES: Mapping[str, str] = {
     "rank_substitutes": "Substitutes are the closest matches we have in stock.",
     "respond_to_counter": "We can meet you on this order.",
 }
+COUNTER_REJECT_RATIONALE = "We can't meet that price on this order."
 
 
 def _answer(pick: Any, rationale: str) -> ModelResult:
@@ -47,8 +58,14 @@ def rank_substitutes(
 
 
 def respond_to_counter(
-    inputs: Mapping[str, Any], default: Any, *, out_of_bounds: bool = False
+    inputs: Mapping[str, Any],
+    default: Any,
+    *,
+    out_of_bounds: bool = False,
+    counter_reject: bool = False,
 ) -> ModelResult:
+    if counter_reject:
+        return _answer({"action": "reject"}, COUNTER_REJECT_RATIONALE)
     if out_of_bounds:
         return _answer({"action": "agree"}, RATIONALES["respond_to_counter"])
     return _answer(default, RATIONALES["respond_to_counter"])

@@ -1,6 +1,7 @@
 """The model client, `people` profile (architecture §6, item 22; issue #52)."""
 
 import asyncio
+import json
 
 import httpx
 import pytest
@@ -9,6 +10,7 @@ from services.agents.common.model import (
     ModelHTTPError,
     ModelResult,
     ModelUnavailable,
+    OneOf,
     TokenBudgetExceeded,
 )
 from tests.unit.model_fakes import (
@@ -107,6 +109,27 @@ def test_stub_mode_never_calls_network(monkeypatch: pytest.MonkeyPatch) -> None:
     assert seen == [{"quotes": {}}]
     (decision,) = traces.of("decision")
     assert decision["model"] == "stub"
+
+
+def test_choose_stub_without_counter_reject_called_as_before() -> None:
+    calls = []
+
+    def stub(inputs: dict, default: str, *, out_of_bounds: bool = False) -> ModelResult:
+        calls.append(out_of_bounds)
+        return ModelResult(text=json.dumps({"pick": default, "rationale": "Rules."}))
+
+    c = client(
+        mode="stub",
+        run_state=FakeRunState({"STUB_COUNTER_REJECT": True}),
+        stubs={"choose_window": stub},
+    )
+
+    choice = asyncio.run(
+        c.choose(ctx("delivery"), "choose_window", OneOf(["w1"]), "w1", {"windows": ["w1"]})
+    )
+
+    assert (choice.value, choice.source) == ("w1", "model")
+    assert calls == [False]
 
 
 def test_stub_fail_node_raises() -> None:

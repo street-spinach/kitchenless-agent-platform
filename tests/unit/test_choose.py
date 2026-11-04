@@ -175,6 +175,30 @@ def test_stub_out_of_bounds_override() -> None:
     assert (choice.source, choice.reason) == ("rule_default", "model_unavailable")
 
 
+def test_stub_counter_reject_override_reaches_the_stub() -> None:
+    seen: list[bool] = []
+
+    def stub(
+        inputs: Any, default: Any, *, out_of_bounds: bool = False, counter_reject: bool = False
+    ) -> ModelResult:
+        seen.append(counter_reject)
+        return stub_answer({"action": "reject"} if counter_reject else default, "Rules.")
+
+    allowed = Actions({"reject": None, "counter": Range(FLOOR, OFFER)})
+    on = client(
+        mode="stub",
+        run_state=FakeRunState({"STUB_COUNTER_REJECT": True}),
+        stubs={"respond_to_counter": stub},
+    )
+    choice = _choose(on, "respond_to_counter", allowed, COUNTER_DEFAULT, COUNTER_INPUTS)
+    assert (choice.value, choice.source) == ({"action": "reject"}, "model")
+
+    off = client(mode="stub", stubs={"respond_to_counter": stub})
+    choice = _choose(off, "respond_to_counter", allowed, COUNTER_DEFAULT, COUNTER_INPUTS)
+    assert choice.value == COUNTER_DEFAULT
+    assert seen == [True, False]
+
+
 def test_subset_checker_rejects_non_members_and_duplicates() -> None:
     subset = Subset(["a", "b", "c", "d"], max_len=3)
     assert subset.check(["b", "a"])
