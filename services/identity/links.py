@@ -12,6 +12,7 @@
 *   `next_path(value)`: the page the sign-in callback opens, `/me/<next>` for a page in
     `NEXT_PAGES`, else `/me/agents` (experience EX-A15, amended for #299: `next` travels
     in the link's URL, not on the row, and is checked against the closed set on use).
+    `story` opens `/me/orders/latest` (showcase SC-A7).
 
 The caller commits: `use` raises after writing `link_rejected`, so a caller catches
 `LinkInvalid` inside its connection block to keep that row.
@@ -38,6 +39,7 @@ __all__ = [
     "LINK_SECONDS",
     "NEXT_PAGES",
     "PURPOSES",
+    "STORY_PATH",
     "Link",
     "LinkInvalid",
     "NotGuardian",
@@ -52,9 +54,11 @@ PURPOSES = ("consent", "me")
 
 Purpose = Literal["consent", "me"]
 # The /me pages a Link may open after sign-in (experience EX-A15).
-NEXT_PAGES = ("household", "pantry", "history", "agents")
-Next = Literal["household", "pantry", "history", "agents"]
+NEXT_PAGES = ("household", "pantry", "history", "agents", "story")
+Next = Literal["household", "pantry", "history", "agents", "story"]
 DEFAULT_NEXT = "agents"
+# The newest order's story (showcase SC-A7): the one page that isn't `/me/<page>`.
+STORY_PATH = "/me/orders/latest"
 
 
 class NotGuardian(IdentityError):
@@ -83,10 +87,11 @@ def url(token: str, next: Next | None = None) -> str:
 
 
 def next_path(value: object) -> str:
-    """`/me/<value>` for a page in `NEXT_PAGES`, else `/me/agents`. The value comes from
-    the link's URL, so anything outside the closed set falls back to the default."""
+    """`/me/<value>` for a page in `NEXT_PAGES` (`story` is `STORY_PATH`), else `/me/agents`.
+    The value comes from the link's URL, so anything outside the closed set falls back to
+    the default."""
     page = value if isinstance(value, str) and value in NEXT_PAGES else DEFAULT_NEXT
-    return f"/me/{page}"
+    return STORY_PATH if page == "story" else f"/me/{page}"
 
 
 async def _is_child(conn: AsyncConnection, household_id: str, user_id: UUID) -> bool:

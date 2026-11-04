@@ -439,10 +439,10 @@ def parse_setup_button(payload: str) -> tuple[UUID, str, int | None] | None:
 # The "Stop these" button on a reminder (§10).
 REMINDER_STOP = "rs:stop"
 
-PAGES = ("household", "pantry", "renew")
+PAGES = ("household", "pantry", "renew", "story")
 
 
-def page_button(page: Literal["household", "pantry", "renew"]) -> str:
+def page_button(page: Literal["household", "pantry", "renew", "story"]) -> str:
     """The button payload that opens a `/me` page (§8): `me:<page>`."""
     if page not in PAGES:
         raise ValueError(f"page must be one of {PAGES}, got {page!r}")

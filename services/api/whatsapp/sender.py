@@ -8,6 +8,8 @@
 2.  Inside the window (`last_inbound_at` within 23 h 45 min): send; outcome `sent`.
     *   `sim`: insert into `sim_outbound`, with the Graph payload under `graph`. The Graph
         API is never called.
+    *   Inside the window `order_summary` and `approval_request` also get the **See how**
+        button (showcase §5). It is never added to a Meta template or stored in a held body.
     *   `real`: call `send_real`. `main.py` passes `GraphSender`, which calls the Graph API
         (issue #73): 3 attempts in total over about a minute, then `StepFailed`, so the row
         becomes `failed` and the run is unaffected (§9). A Graph 131047 (outside the window
@@ -40,6 +42,7 @@ from psycopg.types.json import Jsonb
 
 from services.api.connect import Connect, pool_connect
 from services.api.whatsapp import templates
+from services.common import ids
 from services.common.config import Settings
 from services.common.consumer import Inbound, StepFailed, StepResult
 from services.common.trace import TraceStore
@@ -58,6 +61,8 @@ __all__ = [
     "MAX_TITLE_CHARS",
     "REFUSED",
     "RETRY_DELAYS_SECONDS",
+    "SEE_HOW_BUTTON",
+    "SEE_HOW_KEYS",
     "SEND_FAILED",
     "SENT",
     "SKIPPED",
@@ -150,6 +155,10 @@ REQUEST_TIMEOUT_SECONDS = 8.0
 MAX_BUTTONS = 3
 MAX_TITLE_CHARS = 20
 MAX_BODY_CHARS = 1024
+# The in-window button that opens the newest order's story (showcase §5, SC-A1). `me:` is
+# not a decision prefix, so it asks nothing.
+SEE_HOW_BUTTON: dict[str, str] = {"payload": ids.page_button("story"), "title": "See how"}
+SEE_HOW_KEYS: frozenset[str] = frozenset({"order_summary", "approval_request"})
 # The `decision` trace row for a send's outcome (experience §5 and §15).
 WINDOW_NODE = "whatsapp_window"
 # Outcomes and reasons (experience §5).
@@ -186,6 +195,12 @@ TEXTS: dict[str, str] = {
     # Agents §11.
     "chat_reply": "{text}",
     "order_summary": "{text}",
+    # Showcase §5, SC-A1: not in `templates`, so outside the window it is skipped, never
+    # held and never a Meta template.
+    "order_progress": (
+        "On it. Asking {sellers} for {items}. Every line is checked for {checks}, "
+        "and your {budget} {period} budget."
+    ),
     "no_offers": "No store could fill this order right now. Reply *retry* to try again.",
     "off_topic_reply": "I can only help with food: meals, groceries and dinner orders.",
     "dislike_saved": (
@@ -289,6 +304,15 @@ def graph_payload(phone: str, body: dict[str, Any]) -> dict[str, Any] | None:
         "type": "interactive",
         "interactive": {"type": "button", "body": {"text": text}, "action": {"buttons": replies}},
     }
+
+
+def _with_see_how(body: dict[str, Any]) -> dict[str, Any]:
+    """`body` for an in-window send: with the See how button if its key gets one and a
+    button is free, so a decision button is never pushed out (showcase §5)."""
+    buttons = body.get("buttons") or []
+    if body.get("template") not in SEE_HOW_KEYS or len(buttons) >= MAX_BUTTONS:
+        return body
+    return {**body, "buttons": [*buttons, SEE_HOW_BUTTON]}
 
 
 def _base(phone: str) -> dict[str, Any]:
@@ -444,11 +468,14 @@ class Sender:
             if not phone["inside"]:
                 await self._outside(conn, msg, body, phone)
                 return StepResult()
+            # `body` itself stays without See how: it is what `_outside` templates or holds.
+            in_window = _with_see_how(body)
             if phone["channel_mode"] == "sim":
-                await _sim(conn, msg, phone["phone_e164"], {**body, "graph": graph}, SENT)
+                graph = graph_payload(phone["phone_e164"], in_window)
+                await _sim(conn, msg, phone["phone_e164"], {**in_window, "graph": graph}, SENT)
                 return StepResult()
             try:
-                graph_message_id = await self._send_real(phone["phone_e164"], body)
+                graph_message_id = await self._send_real(phone["phone_e164"], in_window)
             except GraphRefused as refused:
                 if refused.code != OUTSIDE_WINDOW_CODE:
                     await _refused(conn, msg, user_id, refused)

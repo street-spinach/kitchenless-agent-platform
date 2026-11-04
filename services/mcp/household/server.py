@@ -967,10 +967,12 @@ async def record_dislike(
 
 
 async def get_household_rules(ctx: CallContext) -> dict[str, Any]:
-    """Take-turns, the turn index and the approver (agents §10).
+    """Take-turns, the turn index, the approver (agents §10) and the weekly budget, which
+    `order_progress` names (showcase §5).
 
     Relation `agent acts_for household:<run household>`; read only. With no
-    `household_rules` row, take-turns is off and the index is 0.
+    `household_rules` row, take-turns is off and the index is 0. With no budget, `weekly`
+    is `None`.
     """
     household = await _run_household(ctx)
 
@@ -987,13 +989,21 @@ async def get_household_rules(ctx: CallContext) -> dict[str, Any]:
             approvers = await q.fetch(
                 "SELECT approver_user_id FROM approval_rules WHERE household_id = %(household)s"
             )
+            budgets = await q.fetch(
+                "SELECT amount_minor, currency FROM budgets"
+                " WHERE household_id = %(household)s AND period = 'weekly'"
+            )
         rules = found[0] if found else None
         approver = approvers[0] if approvers else None
+        budget = budgets[0] if budgets else None
         take_turns, turn_index = rules if rules is not None else (False, 0)
         return {
             "take_turns": bool(take_turns),
             "turn_index": int(turn_index),
             "approver_user_id": None if approver is None else str(approver[0]),
+            "weekly": None
+            if budget is None
+            else {"amount_minor": int(budget[0]), "currency": str(budget[1]).strip()},
         }
 
     return await run_guarded(

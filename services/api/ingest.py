@@ -40,8 +40,9 @@
     "my agents", "my page" and "my household" share one handler that sends `me_link` with
     a fresh `me` link to the matching page; "reminders off" (as the `rs:stop` tap) sets
     `channel_identities.reminders_off_at` and replies `reminders_off`; "reminders on"
-    clears it and replies `reminders_on`. A `me:household` or `me:pantry` tap sends
-    `me_link` to that page; `me:renew` sends `me_link` with a `consent` link for the
+    clears it and replies `reminders_on`. A `me:household`, `me:pantry` or `me:story` tap
+    (showcase §5: `next = "story"`, the newest order's story) sends `me_link` to that page;
+    `me:renew` sends `me_link` with a `consent` link for the
     person's consumer agent and, for an admin, the household agent. Each runs in a `chat`
     run with no household and `source: "code"` that ends `completed` at once (experience
     §3). The link is issued by the sender at send time (`WhatsAppOut.link`), so its token

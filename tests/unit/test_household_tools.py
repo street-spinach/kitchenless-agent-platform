@@ -599,13 +599,27 @@ def test_get_household_rules_default(pg: str, monkeypatch: pytest.MonkeyPatch) -
     def rules() -> dict[str, Any]:
         return _with_pool(pg, monkeypatch, lambda: household.get_household_rules(_ctx(run_id)))
 
-    assert rules() == {"take_turns": False, "turn_index": 0, "approver_user_id": str(USER)}
+    weekly = {"amount_minor": 100000, "currency": "USD"}
+    assert rules() == {
+        "take_turns": False,
+        "turn_index": 0,
+        "approver_user_id": str(USER),
+        "weekly": weekly,
+    }
     _exec(
         pg,
         "INSERT INTO household_rules (household_id, take_turns, turn_index) VALUES (%s, true, 3)",
         HOUSEHOLD,
     )
-    assert rules() == {"take_turns": True, "turn_index": 3, "approver_user_id": str(USER)}
+    assert rules() == {
+        "take_turns": True,
+        "turn_index": 3,
+        "approver_user_id": str(USER),
+        "weekly": weekly,
+    }
+    # No budget: `order_progress` has nothing to name (showcase §5).
+    _exec(pg, "DELETE FROM budgets WHERE household_id = %s", HOUSEHOLD)
+    assert rules()["weekly"] is None
 
 
 def _advance(
