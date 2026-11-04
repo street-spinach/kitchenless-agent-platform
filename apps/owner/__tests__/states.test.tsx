@@ -132,6 +132,6 @@ test("Account shows the connection, read-only, and always offers sign out", asyn
   expect(text(tree)).toContain("Square (restaurant)");
   expect(text(tree)).toContain("simulated");
   expect(has(tree, "sign-out")).toBe(true);
-  expect(modeName("real")).toBe("real");
-  expect(vendorName("unknown_vendor")).toBe("unknown_vendor");
+  expect(modeName("real")).toBe("Live: real orders");
+  expect(vendorName("unknown_vendor")).toBe("Your store");
 });

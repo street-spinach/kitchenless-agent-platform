@@ -15,8 +15,14 @@ export default function TabsLayout() {
   if (!accessToken()) {
     return (
       <View style={styles.page}>
-        <Card accessibilityLabel="Sign in" onPress={signIn} testID="sign-in" title="Kitchenless">
-          <Text style={type.body}>Sign in</Text>
+        <Card
+          accessibilityLabel="Sign in"
+          onPress={signIn}
+          testID="sign-in"
+          title="Kitchenless for business"
+        >
+          <Text style={type.body}>See your orders, how each deal went, and set your discount.</Text>
+          <Text style={[type.body, styles.cta]}>Sign in →</Text>
         </Card>
       </View>
     );
@@ -32,5 +38,6 @@ export default function TabsLayout() {
 }
 
 const styles = StyleSheet.create({
+  cta: { fontWeight: "700", marginTop: spacing.md },
   page: { flex: 1, justifyContent: "center", padding: spacing.lg },
 });

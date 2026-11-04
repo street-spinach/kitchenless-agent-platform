@@ -6,11 +6,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ScrollView, StyleSheet } from "react-native";
 
 import { api, money, type OrderRow, type Turn, type Turns } from "../../src/api";
+import { when } from "../../src/when";
 import { Card, Empty, ErrorState, ListRow, Sheet, Skeleton, spacing } from "../../src/ui";
 
 export const REFRESH_MS = 5000;
 
 const STATE_LABEL: Record<string, string> = {
+  quoting: "Getting quotes",
+  negotiating: "Negotiating",
   open: "Offer sent",
   countered: "Counter-offer",
   awaiting_approval: "Awaiting approval",
@@ -18,6 +21,12 @@ const STATE_LABEL: Record<string, string> = {
   placed: "Placed",
   courier_booked: "Courier booked",
   in_delivery: "Out for delivery",
+  delivered: "Delivered",
+  accepted: "Won",
+  rejected: "Not chosen",
+  expired: "Expired",
+  cancelled: "Cancelled",
+  failed: "Didn't go through",
 };
 
 // §6: an order is live while it is quoting or negotiating; an open or countered quote is a
@@ -25,7 +34,18 @@ const STATE_LABEL: Record<string, string> = {
 const LIVE_STATES = new Set(["quoting", "negotiating"]);
 
 export function stateLabel(state: string): string {
-  return STATE_LABEL[state] ?? state.replace(/_/g, " ");
+  return STATE_LABEL[state] ?? "In progress";
+}
+
+/** The row's title: what it is and where it stands, e.g. "Order · Counter-offer" (#434). */
+export function rowTitle(row: OrderRow): string {
+  return `${row.kind === "quote" ? "Price request" : "Order"} · ${stateLabel(row.state)}`;
+}
+
+/** The row's second line: the agent's reason, then the short reference and the time. */
+export function rowSubtitle(row: OrderRow, now?: Date): string {
+  const meta = [`Ref ${row.ref}`, when(row.updated_at, now)].filter(Boolean).join(" · ");
+  return row.rationale ? `${row.rationale}\n${meta}` : meta;
 }
 
 export function isLive(row: OrderRow): boolean {
@@ -120,7 +140,7 @@ function TurnsSheet({ row, onClose }: { row: OrderRow | null; onClose: () => voi
     <Sheet
       onClose={onClose}
       testID="turns-sheet"
-      title={ref ? `Negotiation · ${ref}` : ""}
+      title={ref ? `How it went · Ref ${ref}` : ""}
       visible={ref !== null}
     >
       {ref ? body : null}
@@ -156,7 +176,7 @@ export default function Orders() {
 
   if (failed && !loaded.current) return <ErrorState onRetry={load} testID="orders-error" />;
   if (rows === null) return <Skeleton testID="orders-loading" />;
-  if (rows.length === 0) return <Empty testID="orders-empty" text="No live orders right now." />;
+  if (rows.length === 0) return <Empty testID="orders-empty" text="No orders right now. New price requests show up here." />;
   return (
     <ScrollView contentContainerStyle={styles.page}>
       {failed ? <ErrorState onRetry={load} testID="orders-error" /> : null}
@@ -166,9 +186,9 @@ export default function Orders() {
             badge={isLive(r) ? "Live" : undefined}
             key={`${r.kind}-${r.ref}`}
             onPress={() => setOpen(r)}
-            subtitle={r.rationale ?? undefined}
+            subtitle={rowSubtitle(r)}
             testID={`order-${r.ref}`}
-            title={`${r.ref} · ${stateLabel(r.state)}`}
+            title={rowTitle(r)}
             trailing={money(r.amount_minor, r.currency)}
           />
         ))}
