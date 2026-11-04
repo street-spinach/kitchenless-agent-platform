@@ -1,6 +1,10 @@
 COMPOSE := docker compose -f infra/docker-compose.yml --env-file infra/.env
 CONTRACT_PATH := tests/contract$(if $(SERVICE),/$(SERVICE))
 
+# A make started from a recipe (`make test-unit` runs tests that call `make -n`) keeps its
+# output to the recipe lines, without GNU make 4's "Entering directory" banners.
+MAKEFLAGS += --no-print-directory
+
 # pytest exits 5 when it collects no tests. The contract and scenario suites stay empty until the
 # adapter and scenario designs land, so only those two treat "no tests yet" as a pass.
 define allow_empty

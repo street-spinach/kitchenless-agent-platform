@@ -212,6 +212,20 @@ def test_makefile_target_passes_the_business_model() -> None:
     assert done.stdout.strip() == "infra/eval-nightly.sh meta-models/x"
 
 
+def test_makefile_target_output_is_the_same_under_an_outer_make(tmp_path: Path) -> None:
+    """`make test-unit` is an outer make: its children must not print directory banners."""
+    outer = tmp_path / "outer.mk"
+    outer.write_text("outer:\n\t@make -n eval-nightly BUSINESS_MODEL=meta-models/x\n")
+    done = subprocess.run(
+        ["make", "-f", "Makefile", "-f", str(outer), "outer"],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert done.stdout.strip() == "infra/eval-nightly.sh meta-models/x"
+
+
 def test_testrunner_gets_the_runner_settings() -> None:
     services = yaml.safe_load((REPO / "infra/docker-compose.yml").read_text())["services"]
     env = services["testrunner"]["environment"]
