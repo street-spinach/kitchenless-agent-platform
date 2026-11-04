@@ -35,6 +35,8 @@ from psycopg.types.json import Jsonb
 from services.common import directory, dislikes, ids, pantry, vendors
 from services.common.config import get_settings
 from services.common.modes import ALWAYS_MOCK, VENDORS
+from services.common.money import Money
+from services.common.money import format as money_format
 from services.common.protocol.schemas import AllergenCode, DietCode
 from services.identity import grants
 from services.safety.scope import unscoped
@@ -609,6 +611,104 @@ async def _undo_join_code(
     )
 
 
+HELD_APPROVAL_MINOR = 7600
+_HELD_REPLY_BY = "6:30 pm"  # the prompt's shape only: a stale held body is never sent
+_WHATSAPP = "channel:whatsapp"
+
+# The person with that phone, in this eval household, and the household's currency.
+_HELD_PERSON_SQL = """
+SELECT ci.user_id, h.currency FROM channel_identities ci
+JOIN household_members hm ON hm.user_id = ci.user_id
+JOIN households h ON h.household_id = hm.household_id
+WHERE ci.phone_e164 = %s AND h.household_id = %s AND h.env = 'eval'
+"""
+
+
+def _check_held_approval(name: str, value: Mapping[Any, Any]) -> dict[str, str]:
+    """`{phone}`."""
+    if set(value) != {"phone"}:
+        raise ControlRefused(f"setup key {name!r} must have exactly phone")
+    phone = value["phone"]
+    if not isinstance(phone, str) or not phone.startswith("+") or not phone[1:].isdigit():
+        raise ControlRefused(f"setup key {name!r}: phone must be E.164")
+    return {"phone": phone}
+
+
+async def _apply_held_approval(
+    conn: AsyncConnection, household_id: str, value: Mapping[str, str]
+) -> None:
+    """The state experience §5 leaves after a hold, once the approval has expired (§14,
+    amended 2026-11-04): an `awaiting_approval` order, its `pending` approval, the
+    `approval_request` message and that message's `pending` held row.
+
+    The approval has no `approval_expiry` timer, which `ingest.release_held` reads as
+    expired. A pending timer that was already due would be fired by the sweeper, which
+    would expire the approval and wake the household agent on a run with no thread. The
+    message is written `processed`, not through `outbox.send`: it was held, so nothing may
+    claim and deliver it."""
+    q = unscoped(conn, "control.reset")
+    cur = await q.execute(_HELD_PERSON_SQL, (value["phone"], household_id))
+    row = await cur.fetchone()
+    if row is None:
+        raise ControlRefused(f"held_approval: not a phone of {household_id}: {value['phone']}")
+    user_id, currency = row
+    run_id = ids.new_run_id()
+    order_id = ids.order_id(run_id)
+    approval_id = ids.approval_id(order_id)
+    message_id = ids.approval_prompt_id(approval_id)
+    amount = money_format(Money(HELD_APPROVAL_MINOR, currency), "en")
+    body = {
+        "user_id": str(user_id),
+        "template": "approval_request",
+        "params": {"amount": amount, "reply_by": _HELD_REPLY_BY},
+        "buttons": [
+            {"payload": ids.approval_button(approval_id, "approved"), "title": "Approve"},
+            {"payload": ids.approval_button(approval_id, "rejected"), "title": "Reject"},
+        ],
+        "ref": {"kind": "approval", "id": str(approval_id)},
+    }
+    await q.execute(
+        "INSERT INTO runs (run_id, household_id, kind, status, trigger, modes)"
+        " VALUES (%s, %s, 'weekly', 'awaiting_approval', %s, '{}')",
+        (run_id, household_id, Jsonb({"source": "eval_setup", "user_id": str(user_id)})),
+    )
+    await q.execute(
+        "INSERT INTO orders (order_id, run_id, household_id, kind, state, total_minor, currency,"
+        " address_ref) VALUES (%s, %s, %s, 'grocery', 'awaiting_approval', %s, %s, %s)",
+        (
+            order_id,
+            run_id,
+            household_id,
+            HELD_APPROVAL_MINOR,
+            currency,
+            ids.seed_address_ref(household_id),
+        ),
+    )
+    await q.execute(
+        "INSERT INTO approvals (approval_id, run_id, household_id, order_id, amount_minor,"
+        " currency) VALUES (%s, %s, %s, %s, %s, %s)",
+        (approval_id, run_id, household_id, order_id, HELD_APPROVAL_MINOR, currency),
+    )
+    await q.execute(
+        "INSERT INTO agent_messages (message_id, run_id, from_agent, to_agent, to_host, type,"
+        " body, status, processed_at)"
+        " VALUES (%s, %s, %s, %s, 'api', 'whatsapp_out', %s, 'processed', now())",
+        (message_id, run_id, f"household:{household_id}", _WHATSAPP, Jsonb(body)),
+    )
+    await q.execute(
+        "INSERT INTO held_messages (message_id, user_id, body, ref_kind, ref_id)"
+        " VALUES (%s, %s, %s, 'approval', %s)",
+        (message_id, user_id, Jsonb(body), str(approval_id)),
+    )
+
+
+async def _undo_held_approval(
+    conn: AsyncConnection, household_id: str, seeded: Mapping[str, int | None]
+) -> None:
+    # The reset's deletes already removed the rows: they all hang off an eval run.
+    return None
+
+
 SETUP_KEYS: Mapping[str, SetupKey] = {
     "budget_minor": SetupKey(int, _apply_budget, _undo_budget),
     "per_order_minor": SetupKey(int, _apply_per_order, _undo_per_order),
@@ -622,6 +722,9 @@ SETUP_KEYS: Mapping[str, SetupKey] = {
     "setup_incomplete": SetupKey(bool, _apply_setup_incomplete, _undo_setup_incomplete),
     "join_code": SetupKey(dict, _apply_join_code, _undo_join_code, _check_join_code),
     "no_grant_for": SetupKey(list, _apply_no_grant_for, _undo_no_grant_for, _check_no_grant_for),
+    "held_approval": SetupKey(
+        dict, _apply_held_approval, _undo_held_approval, _check_held_approval
+    ),
 }
 
 

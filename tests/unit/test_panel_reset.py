@@ -11,12 +11,15 @@ import psycopg
 import pytest
 from psycopg.types.json import Jsonb
 
+from services.api.ingest import HELD_CANCELLED_LINE, Content, ingest
 from services.common import ids
 from services.common.config import Settings
+from services.common.protocol.schemas import WhatsAppOut
 from services.identity import fga
 from services.mocks import control
 from services.seed import MOCK_STOCK_QTY, mock_stock_rows, seeded_limits
 from services.seed import __main__ as seed_mod
+from tests.unit import api_world
 
 LIVE = "us-1"
 EVAL = "us-1-eval"
@@ -1185,6 +1188,142 @@ def test_reset_clears_experience_tables(world: dict[str, Any]) -> None:
                 )
                 == 1
             )
+
+
+# --- held_approval (experience.md §14, amended 2026-11-04; EX-I51) ---------------------------
+
+HELD_AMOUNT = "$76.00"
+_HELD_ROWS_SQL = (
+    "SELECT o.state, a.status, a.amount_minor, m.status, m.type, m.body, x.status, x.ref_kind,"
+    " x.ref_id, x.body, x.user_id, r.household_id, a.approval_id, r.run_id"
+    " FROM held_messages x"
+    " JOIN agent_messages m ON m.message_id = x.message_id"
+    " JOIN runs r ON r.run_id = m.run_id"
+    " JOIN orders o ON o.run_id = r.run_id"
+    " JOIN approvals a ON a.order_id = o.order_id"
+)
+
+
+def _person(conn: psycopg.Connection, phone: str) -> uuid.UUID:
+    row = conn.execute(
+        "SELECT user_id FROM channel_identities WHERE phone_e164 = %s", (phone,)
+    ).fetchone()
+    assert row is not None
+    return row[0]
+
+
+def _held_counts(conn: psycopg.Connection, run_ids: list[uuid.UUID]) -> dict[str, int]:
+    """Rows of those runs, and every held row (only the key writes one in these tests)."""
+    counts = {"held_messages": _count(conn, "SELECT count(*) FROM held_messages")}
+    for table in ("approvals", "orders", "agent_messages", "runs"):
+        sql = f"SELECT count(*) FROM {table} WHERE run_id = ANY(%s)"  # noqa: S608
+        counts[table] = _count(conn, sql, run_ids)
+    return counts
+
+
+def _write(pg: str, external_id: str, phone: str = EVAL_PHONE) -> uuid.UUID:
+    """The person's message, as `member_message` sends it (`ingest`, the WhatsApp path)."""
+    run_id = _run(
+        pg, lambda conn: ingest(conn, "whatsapp", external_id, phone, Content("text", text="hi"))
+    )
+    assert run_id is not None
+    return run_id
+
+
+@pytest.mark.db
+def test_held_approval_key_undone(world: dict[str, Any]) -> None:
+    """The key writes the order, the approval, the message and its held row, and nothing
+    will send or expire them behind the case's back; the next reset removes all four."""
+    pg = world["pg"]
+    _reset_setup(pg, {"held_approval": {"phone": EVAL_PHONE}})
+
+    with psycopg.connect(pg) as conn:
+        user_id = _person(conn, EVAL_PHONE)
+        [row] = conn.execute(_HELD_ROWS_SQL).fetchall()
+        order, approval, minor, message, kind, message_body, held, ref_kind, ref_id = row[:9]
+        held_body, held_user, household, approval_id, run_id = row[9:]
+        assert (order, approval, minor) == ("awaiting_approval", "pending", 7600)
+        assert (held, ref_kind, ref_id) == ("pending", "approval", str(approval_id))
+        assert (held_user, household) == (user_id, EVAL)
+        # Written `processed`, so the sender never claims the message and delivers it.
+        assert (message, kind) == ("processed", "whatsapp_out")
+        assert held_body == message_body
+        parsed = WhatsAppOut.model_validate(held_body)
+        assert parsed.user_id == user_id
+        assert parsed.template == "approval_request"
+        assert parsed.params["amount"] == HELD_AMOUNT
+        assert parsed.ref is not None and parsed.ref.id == str(approval_id)
+        # No timer: a due one would be fired by the sweeper, racing the person's message.
+        assert _count(conn, "SELECT count(*) FROM timers WHERE run_id = %s", run_id) == 0
+        assert _held_counts(conn, [run_id]) == {
+            "held_messages": 1,
+            "approvals": 1,
+            "orders": 1,
+            "agent_messages": 1,
+            "runs": 1,
+        }
+
+    _reset(pg, "eval")
+    with psycopg.connect(pg) as conn:
+        assert set(_held_counts(conn, [run_id]).values()) == {0}
+
+
+@pytest.mark.db
+def test_held_approval_dropped_on_next_message(
+    world: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """XG3 on the key's rows: the person's next message drops the held row and sends
+    `held_cancelled_line` once, with the amount, and no `approval_request`."""
+    pg = world["pg"]
+    api_world.patch_settings(monkeypatch)
+    _reset_setup(pg, {"held_approval": {"phone": EVAL_PHONE}})
+
+    first = _write(pg, "wamid.held.1")
+    second = _write(pg, "wamid.held.2")
+
+    with psycopg.connect(pg) as conn:
+        assert conn.execute("SELECT status FROM held_messages").fetchall() == [("dropped",)]
+        user_id = _person(conn, EVAL_PHONE)
+        sent = conn.execute(
+            "SELECT run_id, body FROM agent_messages WHERE run_id = ANY(%s)"
+            " AND type = 'whatsapp_out'",
+            ([first, second],),
+        ).fetchall()
+        prompts = _count(
+            conn,
+            "SELECT count(*) FROM agent_messages WHERE body->>'template' = 'approval_request'"
+            " AND status <> 'processed'",
+        )
+    assert prompts == 0
+    assert not [b for _, b in sent if b["template"] == "approval_request"]
+    lines = [(r, b) for r, b in sent if b["template"] == HELD_CANCELLED_LINE]
+    assert len(lines) == 1
+    run_id, body = lines[0]
+    assert run_id == first
+    assert body["params"] == {"amount": HELD_AMOUNT}
+    assert body["user_id"] == str(user_id)
+
+
+@pytest.mark.db
+@pytest.mark.parametrize(
+    "value",
+    [
+        {},
+        {"phone": "555"},
+        {"phone": 15550100101},
+        {"phone": EVAL_PHONE, "extra": 1},
+        {"phone": LIVE_PHONE},  # a live household's phone
+        {"phone": "+15550100104"},  # a person of the other eval household
+        {"phone": JOINER_PHONE},  # nobody's phone
+    ],
+)
+def test_held_approval_refused(world: dict[str, Any], value: dict[str, Any]) -> None:
+    """Only a phone of this eval household; otherwise refused, and nothing is written."""
+    pg = world["pg"]
+    with pytest.raises(control.ControlRefused):
+        _reset_setup(pg, {"held_approval": value})
+    with psycopg.connect(pg) as conn:
+        assert _count(conn, "SELECT count(*) FROM held_messages") == 0
 
 
 CONSUMER_2 = "consumer:us-1-b-eval"
