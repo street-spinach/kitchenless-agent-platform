@@ -108,6 +108,12 @@ owner app its own palette.
     each used the model or the rule default, elapsed time). No member names appear next to
     any code.
 
+*Amended 2026-11-05 (product owner, #432):* the **Behind the scenes** card shows only
+agents involved, messages exchanged and elapsed time, in plain words. The token count and
+the model or rule-default split are not shown on `/me` pages; the live screen keeps them for
+the demo audience. `/me/history` shows each audit row as a plain sentence and `/me/agents`
+names agents ("Your household agent", "Your personal agent"), never by id.
+
 ### SC-CUJ 3: The restaurant owner watches a dinner negotiation
 
 *   **Given**: The owner of Mock Restaurant is signed in to the owner app and has set

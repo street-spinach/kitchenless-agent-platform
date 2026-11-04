@@ -163,6 +163,46 @@ _STATE_TEXT = {
     "failed": "Failed",
 }
 
+# What people see for each `audit_events.kind` on /me/history (#432). Ids and internal names
+# are never shown; `{agent}` is the agent's plain name from `_AGENT_LABELS`.
+_EVENT_TEXT = {
+    "user_onboarded": "You joined the household",
+    "agent_client_created": "{agent} was set up",
+    "link_issued": "A sign-in link was sent",
+    "link_used": "You signed in with a link",
+    "link_rejected": "A sign-in link didn't work",
+    "consent_granted": "You let {agent} act for you",
+    "consent_revoked": "{agent} can no longer act for you",
+    "grant_expired": "{agent}'s permission ran out",
+    "band_changed": "The approval limit changed",
+    "owner_rule_changed": "A shop changed its rules",
+    "approval_decided": "An order approval was answered",
+    "fga_reconciled": "Your access settings were updated",
+    "keycloak_revoke_failed": "Removing access didn't finish",
+}
+_EVENT_FALLBACK = "Account activity"
+# Plain names for a person's own agents (#432). An agent id is never shown.
+_AGENT_LABELS = {
+    "household": "Your household agent",
+    "consumer": "Your personal agent",
+    "channel": "Your WhatsApp agent",
+}
+_AGENT_FALLBACK = "An agent"
+
+
+def _agent_label(cls: str | None) -> str:
+    return _AGENT_LABELS.get(cls or "", _AGENT_FALLBACK)
+
+
+def _event_text(kind: str, cls: str | None) -> str:
+    text = _EVENT_TEXT.get(kind, _EVENT_FALLBACK)
+    if "{agent}" not in text:
+        return text
+    label = _agent_label(cls)
+    # "Your personal agent" mid-sentence reads "your personal agent".
+    return text.format(agent=label if text.startswith("{agent}") else label[0].lower() + label[1:])
+
+
 # Nonces of states already used, with when they stop mattering (their signature expires).
 # `api` is one process, so this is the whole record.
 _spent_states: dict[str, float] = {}
@@ -1002,7 +1042,7 @@ async def agents(request: Request) -> Response:
         listed.append(
             {
                 "agent_id": agent_id,
-                "label": "Household agent" if cls == "household" else agent_id,
+                "label": _agent_label(cls),
                 "until": None if grant is None else f"{grant[2]:%Y-%m-%d}",
                 # §11: the grant holder, or any admin for the household agent.
                 "can_revoke": grant is not None
@@ -1106,9 +1146,11 @@ async def history(request: Request) -> Response:
         q = scope.scoped(conn, scope.from_session(session))
         context = await _frame(q, session, "history")
         events = await q.fetch(
-            "SELECT ts, kind, agent_id FROM audit_events WHERE household_id = %(household)s"
-            " AND (actor_user_id = %(user)s OR subject_user_id = %(user)s)"
-            " ORDER BY ts DESC, event_id DESC LIMIT 100",
+            "SELECT e.ts, e.kind, c.class FROM audit_events e"
+            " LEFT JOIN agent_cards c ON c.agent_id = e.agent_id"
+            " WHERE e.household_id = %(household)s"
+            " AND (e.actor_user_id = %(user)s OR e.subject_user_id = %(user)s)"
+            " ORDER BY e.ts DESC, e.event_id DESC LIMIT 100",
             user=session.user_id,
         )
         approvals = await q.fetch(
@@ -1121,8 +1163,7 @@ async def history(request: Request) -> Response:
         )
         context["spending"] = await _spending_history(q, viewer)
     context["events"] = [
-        {"at": f"{ts:%Y-%m-%d %H:%M}", "text": kind + (f" {agent}" if agent else "")}
-        for ts, kind, agent in events
+        {"at": f"{ts:%Y-%m-%d %H:%M}", "text": _event_text(kind, cls)} for ts, kind, cls in events
     ]
     context["approvals"] = [
         {"at": f"{ts:%Y-%m-%d %H:%M}", "amount": _money(amount, currency), "status": status}
