@@ -111,6 +111,8 @@ TOOL_SCOPES: Mapping[str, ToolScope] = {
     "get_setup_state": _delegated("consumer", scope=None),
     "propose_setup": _delegated("consumer", scope="constraints:write"),
     "apply_setup": _service("system"),
+    "set_household_take_turns": _service("system"),
+    "react_to_meal": _service("system"),
     # Experience EX-A11 (EX-I39): the `/me/pantry` correction, checks in `limits`.
     "record_pantry_check": _service("system"),
     "complete_join": _service("system"),

@@ -1,6 +1,7 @@
 """`/me/household`, spending in `/me/history`, CSRF and the stylesheet (experience.md §4,
 §8, EX-I36)."""
 
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
@@ -16,6 +17,7 @@ from services.api.routes import me
 from services.common import db as common_db
 from services.common import pantry
 from services.common.mcp_client import AdapterUnavailable, ToolRefused
+from services.common.run_context import RunContext
 from services.identity.errors import AuthzUnavailable
 from services.mcp.household import server as household
 from services.mcp.meta import CallContext
@@ -539,3 +541,267 @@ def test_static_css_served(world: World, kc: FakeKeycloak) -> None:
     assert page.status_code == 401
     assert "This page timed out. Write *my page* in WhatsApp for a new link." in page.text
     assert '<link rel="stylesheet" href="/me/static/me.css">' in page.text
+
+
+# --- EX-I37: the take-turns switch and meal reactions ------------------------------------
+
+
+def _tool_fake(pg: str, monkeypatch: pytest.MonkeyPatch, calls: list[dict[str, Any]]) -> None:
+    """`me.call_tool_as` as the in-process household server, called with `api`'s token."""
+
+    async def call(server: str, tool: str, args: dict, *, ctx: RunContext) -> dict:
+        assert server == "household"
+        assert ctx.agent_id == "system:api"
+        calls.append({"tool": tool, "args": dict(args), "run_id": ctx.run_id})
+        fn = {
+            "set_household_take_turns": household.set_household_take_turns,
+            "react_to_meal": household.react_to_meal,
+        }[tool]
+        typed = {k: uuid.UUID(v) if k in ("user_id", "order_id") else v for k, v in args.items()}
+        context = CallContext(
+            run_id=ctx.run_id,
+            agent_id=ctx.agent_id,
+            conversation_id=ctx.conversation_id,
+            attempt=1,
+            token=w.service_token(ctx.agent_id),
+            env="eval",
+            modes={},
+            on_behalf_of=None,
+            household_id=HOUSEHOLD,
+        )
+        async with AsyncConnectionPool(pg, min_size=1, max_size=3, open=False) as pool:
+            monkeypatch.setattr(common_db, "get_pool", lambda: pool)
+            try:
+                return await fn(context, **typed)
+            except GuardRefused as refused:
+                raise ToolRefused(refused.reason) from None
+
+    monkeypatch.setattr(me, "call_tool_as", call)
+
+
+def _with_grant(world: World) -> None:
+    with psycopg.connect(world.pg) as conn:
+        w.add_grant(conn, HOUSEHOLD_AGENT, world.admin, HOUSEHOLD)
+        # `api`'s client, for its service token (identity-authz I39).
+        conn.execute(
+            "INSERT INTO agent_clients (agent_id, client_id, kind) VALUES (%s, %s, 'service')",
+            (w.API_AGENT, w.API_CLIENT),
+        )
+
+
+def _post(
+    world: World,
+    person: w.Person,
+    path: str,
+    data: dict[str, str],
+    household_id: str = HOUSEHOLD,
+) -> Any:
+    client = _client(world.pg)
+    client.cookies.update(_session_cookie(person, household_id))
+    return client.post(path, data=data, follow_redirects=False)
+
+
+def _take_turns(world: World) -> bool | None:
+    rows = aw.query(
+        world.pg, "SELECT take_turns FROM household_rules WHERE household_id = %s", HOUSEHOLD
+    )
+    return rows[0]["take_turns"] if rows else None
+
+
+def _me_runs(world: World) -> list[dict[str, Any]]:
+    return aw.query(
+        world.pg,
+        "SELECT kind, status, reason, trigger FROM runs WHERE household_id = %s"
+        " AND trigger->>'source' = 'me' ORDER BY started_at",
+        HOUSEHOLD,
+    )
+
+
+@db
+def test_take_turns_switch(world: World, kc: FakeKeycloak, monkeypatch: pytest.MonkeyPatch) -> None:
+    _with_grant(world)
+    calls: list[dict[str, Any]] = []
+    _tool_fake(world.pg, monkeypatch, calls)
+    csrf = _csrf(world.admin, me.FORM_TAKE_TURNS)
+
+    on = _post(world, world.admin, "/me/household/take-turns", {"csrf": csrf, "on": "1"})
+    assert on.status_code == 303
+    assert on.headers["location"] == "/me/household"
+    assert _take_turns(world) is True
+    assert calls[-1]["args"] == {"on": True, "user_id": str(world.admin.user_id)}
+
+    # Unticked: the checkbox sends nothing, so `on` is absent.
+    off = _post(world, world.admin, "/me/household/take-turns", {"csrf": csrf})
+    assert off.status_code == 303
+    assert _take_turns(world) is False
+    assert calls[-1]["args"]["on"] is False
+
+    # Each POST is its own household `chat` run started by `api` (§3), finished `completed`.
+    runs = _me_runs(world)
+    assert len(runs) == 2
+    for run in runs:
+        assert run["kind"] == "chat"
+        assert run["status"] == "completed"
+        assert run["trigger"] == {"user_id": str(world.admin.user_id), "source": "me"}
+    assert {c["run_id"] for c in calls} == {
+        r["run_id"]
+        for r in aw.query(world.pg, "SELECT run_id FROM runs WHERE trigger->>'source' = 'me'")
+    }
+    # The guard traced the tool call in that run.
+    traced = aw.query(
+        world.pg,
+        "SELECT count(*) AS n FROM agent_traces WHERE run_id = %s",
+        calls[0]["run_id"],
+    )
+    assert traced[0]["n"] > 0
+
+    # The page shows the switch's new state.
+    page = _page(world, world.admin)
+    assert 'name="on" value="1" onchange' in page.text
+
+
+@db
+def test_switch_read_only_for_non_approver(
+    world: World, kc: FakeKeycloak, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _with_grant(world)
+    calls: list[dict[str, Any]] = []
+    _tool_fake(world.pg, monkeypatch, calls)
+
+    # The member's page has no switch form.
+    page = _page(world, world.member)
+    assert 'action="/me/household/take-turns"' not in page.text
+
+    # A forged post from the member is refused by the tool, not the page.
+    refused = _post(
+        world,
+        world.member,
+        "/me/household/take-turns",
+        {"csrf": _csrf(world.member, me.FORM_TAKE_TURNS), "on": "1"},
+    )
+    assert refused.status_code == 403
+    assert "Only the approver can change this." in refused.text
+    assert _take_turns(world) is None
+    [run] = _me_runs(world)
+    assert (run["status"], run["reason"]) == ("completed", "wrong_approver")
+
+    # The child is refused too; nothing changes.
+    child = _post(
+        world,
+        world.child,
+        "/me/household/take-turns",
+        {"csrf": _csrf(world.child, me.FORM_TAKE_TURNS), "on": "1"},
+    )
+    assert child.status_code == 403
+    assert _take_turns(world) is None
+
+    # Without a CSRF token no run starts.
+    _post(world, world.admin, "/me/household/take-turns", {"on": "1"})
+    assert len(_me_runs(world)) == 2
+    assert _take_turns(world) is None
+
+
+@db
+def test_take_turns_without_household_grant(
+    world: World, kc: FakeKeycloak, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[dict[str, Any]] = []
+    _tool_fake(world.pg, monkeypatch, calls)
+    page = _post(
+        world,
+        world.admin,
+        "/me/household/take-turns",
+        {"csrf": _csrf(world.admin, me.FORM_TAKE_TURNS), "on": "1"},
+    )
+    assert page.status_code == 403
+    assert "consent needs renewing" in page.text
+    assert calls == []
+    assert _me_runs(world) == []
+    assert _take_turns(world) is None
+
+
+def _reactions(world: World, order_id: uuid.UUID) -> dict[uuid.UUID, int]:
+    rows = aw.query(
+        world.pg, "SELECT user_id, value FROM meal_reactions WHERE order_id = %s", order_id
+    )
+    return {r["user_id"]: r["value"] for r in rows}
+
+
+@db
+def test_reaction_once_per_person(
+    world: World, kc: FakeKeycloak, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _with_grant(world)
+    week = _week(world.pg, world)
+    calls: list[dict[str, Any]] = []
+    _tool_fake(world.pg, monkeypatch, calls)
+    dinner = week["dinners"][1]
+    path = f"/me/meals/{dinner}/reaction"
+
+    for person in (world.member, world.child):
+        csrf = _csrf(person, me.FORM_REACTION)
+        assert _post(world, person, path, {"csrf": csrf, "value": "1"}).status_code == 303
+        # A second tap replaces the first: one row per person.
+        again = _post(world, person, path, {"csrf": csrf, "value": "-1"})
+        assert again.status_code == 303
+        assert again.headers["location"] == "/me/household"
+    assert _reactions(world, dinner) == {world.member.user_id: -1, world.child.user_id: -1}
+    assert calls[-1]["args"] == {
+        "order_id": str(dinner),
+        "value": -1,
+        "user_id": str(world.child.user_id),
+    }
+
+    # The member's own reaction is pressed on the page.
+    page = _page(world, world.member)
+    assert page.text.count('aria-pressed="true"') == 2  # both dinners
+
+    # Bad values never reach the tool.
+    before = len(calls)
+    csrf = _csrf(world.member, me.FORM_REACTION)
+    assert _post(world, world.member, path, {"csrf": csrf, "value": "2"}).status_code == 400
+    assert _post(world, world.member, path, {"csrf": csrf}).status_code == 400
+    bad = _post(world, world.member, "/me/meals/not-a-uuid/reaction", {"csrf": csrf, "value": "1"})
+    assert bad.status_code == 404
+    assert _post(world, world.member, path, {"value": "1"}).status_code == 403
+    assert len(calls) == before
+
+
+@db
+def test_reaction_on_other_household_refused(
+    world: World, kc: FakeKeycloak, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _with_grant(world)
+    week = _week(world.pg, world)
+    calls: list[dict[str, Any]] = []
+    _tool_fake(world.pg, monkeypatch, calls)
+    with psycopg.connect(world.pg) as conn:
+        other, _ = ew.order(conn, "h-other", "delivered", datetime.now(UTC))
+    not_delivered = week["order"]
+    csrf = _csrf(world.member, me.FORM_REACTION)
+
+    # Another household's dinner: refused, nothing written.
+    refused = _post(
+        world, world.member, f"/me/meals/{other}/reaction", {"csrf": csrf, "value": "1"}
+    )
+    assert refused.status_code == 403
+    assert _reactions(world, other) == {}
+    # An order of the household that isn't delivered yet.
+    early = _post(
+        world, world.member, f"/me/meals/{not_delivered}/reaction", {"csrf": csrf, "value": "1"}
+    )
+    assert early.status_code == 403
+    assert _reactions(world, not_delivered) == {}
+    assert [r["reason"] for r in _me_runs(world)] == ["authz_denied", "wrong_order_state"]
+    # Another household's admin is signed into their own household, which has no
+    # household grant here: no run starts and nothing is written.
+    outsider = _post(
+        world,
+        world.other_admin,
+        f"/me/meals/{week['dinners'][0]}/reaction",
+        {"csrf": _csrf(world.other_admin, me.FORM_REACTION, "h-other"), "value": "1"},
+        "h-other",
+    )
+    assert outsider.status_code == 403
+    assert "consent needs renewing" in outsider.text
+    assert world.other_admin.user_id not in _reactions(world, week["dinners"][0])

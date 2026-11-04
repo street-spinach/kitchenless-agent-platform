@@ -22,6 +22,10 @@ Pages render from `services/api/templates/` with `/me/static/me.css`.
     budget, take-turns (the switch for the approver), the last delivered dinners with
     reactions, and the allergies and diets the viewer may see. Every read goes through
     `scope.scoped` and `visibility.can_see`; a child sees only their own row.
+*   `POST /me/household/take-turns` (`on` present means on) and
+    `POST /me/meals/{order_id}/reaction` (`value` 1 or -1) start the `/me` run and call
+    `set_household_take_turns` or `react_to_meal` for the signed-in person (EX-I37), then
+    go back to `/me/household`.
 *   `GET /me/pantry`: on households where `pantry.is_enabled(households.env)`, each
     vocabulary item as At home, Not sure or Out with its "last checked" age, for adults (a
     child sees no household-wide row, §4); otherwise the "isn't on" line. `POST
@@ -118,6 +122,9 @@ FORM_PANTRY = "pantry"
 API_AGENT = "system:api"
 HOUSEHOLD_SERVER = "household"
 RECORD_PANTRY_CHECK = "record_pantry_check"
+SET_HOUSEHOLD_TAKE_TURNS = "set_household_take_turns"
+REACT_TO_MEAL = "react_to_meal"
+REACTION_VALUES = {"1": 1, "-1": -1}
 PANTRY_CHECK_KINDS = ("verify", "out")
 
 # §8 page copy.
@@ -132,6 +139,7 @@ _REFUSED_PAGES = {
     "not_adult": ("Not allowed", "Only an adult can change this.", 403),
     "pantry_off": ("Not allowed", "Pantry tracking isn't on for your household yet.", 403),
     "unknown_pantry_item": ("Not found", "We don't track that item.", 404),
+    "wrong_approver": ("Not allowed", "Only the approver can change this.", 403),
 }
 LOCALE = "en"
 MEALS_SHOWN = 7
@@ -764,6 +772,41 @@ async def _tool_run(
     return page
 
 
+# --- household actions (EX-I37) -------------------------------------------------------
+
+
+async def take_turns(request: Request) -> Response:
+    """`POST /me/household/take-turns`: the approver's switch (`on` present means on)."""
+    session = _session(request)
+    if session is None:
+        return _signed_out()
+    if not csrf_ok(session, FORM_TAKE_TURNS, await _posted_token(request)):
+        return _csrf_refused()
+    on = (await request.form()).get("on") is not None
+    args = {"on": on, "user_id": str(session.user_id)}
+    refused = await _tool_run(request, session, SET_HOUSEHOLD_TAKE_TURNS, args)
+    return refused or RedirectResponse("/me/household", status_code=303)
+
+
+async def reaction(request: Request) -> Response:
+    """`POST /me/meals/{order_id}/reaction`: `value` 1 or -1 for the signed-in person."""
+    session = _session(request)
+    if session is None:
+        return _signed_out()
+    if not csrf_ok(session, FORM_REACTION, await _posted_token(request)):
+        return _csrf_refused()
+    try:
+        order_id = UUID(request.path_params["order_id"])
+    except ValueError:
+        return _error("Not found", "That meal isn't there.", 404)
+    value = REACTION_VALUES.get(str((await request.form()).get("value")))
+    if value is None:
+        return _error("Not saved", "Go back, reload the page and try again.", 400)
+    args = {"order_id": str(order_id), "value": value, "user_id": str(session.user_id)}
+    refused = await _tool_run(request, session, REACT_TO_MEAL, args)
+    return refused or RedirectResponse("/me/household", status_code=303)
+
+
 # --- pantry ---------------------------------------------------------------------------
 
 
@@ -1134,6 +1177,8 @@ routes = [
     Route("/me/callback", callback, methods=["GET"]),
     Route("/me/consent/done", consent_done, methods=["GET"]),
     Route("/me/household", household_page, methods=["GET"]),
+    Route("/me/household/take-turns", take_turns, methods=["POST"]),
+    Route("/me/meals/{order_id}/reaction", reaction, methods=["POST"]),
     Route("/me/pantry", pantry_page, methods=["GET"]),
     Route("/me/pantry/{pantry_item}", pantry_check, methods=["POST"]),
     Route("/me/agents", agents, methods=["GET"]),

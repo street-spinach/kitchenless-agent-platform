@@ -116,6 +116,8 @@ def test_scope_table_matches_design() -> None:
         "get_setup_state": ("delegated", {"consumer"}, None),
         "propose_setup": ("delegated", {"consumer"}, "constraints:write"),
         "apply_setup": ("service", {"system"}, None),
+        "set_household_take_turns": ("service", {"system"}, None),
+        "react_to_meal": ("service", {"system"}, None),
         "record_pantry_check": ("service", {"system"}, None),
         "complete_join": ("service", {"system"}, None),
     }
