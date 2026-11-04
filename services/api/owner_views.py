@@ -16,10 +16,16 @@ person or address.
     constraint code and quotes won, from live households only (`env = 'live'`). A cell
     covering fewer than `INSIGHTS_MIN_HOUSEHOLDS` distinct households is hidden. Text is
     built by code. `sample_insights(now)` is the fixed, labelled sample.
+*   `turns(conn, org, ref)` (showcase.md §6): the org agent's own messages for the order
+    shown as `ref` as a timeline (request, offer, counter, accept, reject, cancel, courier,
+    status), with `floor_minor` on a counter the owner rule bound (identity-authz I33's
+    `owner_floor` decision row). Never a household, member, address or another seller's
+    offer. `live` while the order is `quoting` or `negotiating`.
 *   `connection(conn, org)`: the org's vendor key, its resolved mode and the panel
     override's `set_at`. No health probe is made.
 """
 
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -34,6 +40,7 @@ from services.safety import scope
 
 __all__ = [
     "INSIGHTS_MIN_HOUSEHOLDS",
+    "LIVE_ORDER_STATES",
     "LIVE_QUOTE_STATUSES",
     "MAX_ROWS",
     "NOTICE_TEXT",
@@ -43,6 +50,7 @@ __all__ = [
     "orders",
     "sample_insights",
     "summary",
+    "turns",
 ]
 
 MAX_ROWS = 50
@@ -287,6 +295,142 @@ def sample_insights(now: datetime) -> dict[str, Any]:
         for c in data["cells"]
     ]
     return {"week": iso_week(now)[0], "sample": True, "cells": cells}
+
+
+# --- negotiation turns (showcase.md §6) --------------------------------------------------------
+
+LIVE_ORDER_STATES = ("quoting", "negotiating")
+TURN_KINDS = {
+    "quote_request": "request",
+    "offer": "offer",
+    "counter_offer": "counter",
+    "accept": "accept",
+    "reject": "reject",
+    "cancel": "cancel",
+    "order_confirm": "status",
+    "delivery_booked": "courier",
+    "order_status": "status",
+}
+_SYSTEM_TYPES = ("delivery_booked", "order_status")
+_REF = re.compile(r"^[A-Z2-7]{8}$")
+
+# The org's orders (by its quotes) and each order's state.
+_TURN_ORDERS_SQL = """
+SELECT DISTINCT q.order_id, o.state
+  FROM quotes q
+  JOIN orders o ON o.order_id = q.order_id
+ WHERE q.seller_agent_id IN (SELECT agent_id FROM agent_cards
+                              WHERE owner_ref = 'org:' || %(org)s)
+"""
+
+# The org agent's own messages for the order (sent or received), and the courier status
+# the api sends for an order the org sold. Another seller's conversation is never read.
+_TURNS_SQL = """
+SELECT m.message_id, m.type, m.body, m.created_at,
+       m.from_agent IN (SELECT agent_id FROM agent_cards
+                         WHERE owner_ref = 'org:' || %(org)s) AS mine
+  FROM agent_messages m
+ WHERE m.body ->> 'order_id' = %(order_id)s
+   AND m.type = ANY(%(types)s)
+   AND (m.from_agent IN (SELECT agent_id FROM agent_cards
+                          WHERE owner_ref = 'org:' || %(org)s)
+        OR m.to_agent IN (SELECT agent_id FROM agent_cards
+                           WHERE owner_ref = 'org:' || %(org)s)
+        OR (m.type = 'order_status'
+            AND EXISTS (SELECT 1 FROM orders o
+                         WHERE o.order_id::text = %(order_id)s
+                           AND o.seller_agent_id IN (SELECT agent_id FROM agent_cards
+                                                      WHERE owner_ref = 'org:' || %(org)s))))
+ ORDER BY m.created_at, m.message_id
+"""
+
+# identity-authz I33: the owner rule bound a counter (`ref` is the counter's message id).
+_FLOORS_SQL = """
+SELECT t.payload ->> 'ref', t.payload -> 'floor_minor'
+  FROM agent_traces t
+ WHERE t.kind = 'decision' AND t.payload ->> 'node' = 'owner_floor'
+   AND t.agent_id IN (SELECT agent_id FROM agent_cards
+                       WHERE owner_ref = 'org:' || %(org)s)
+   AND t.payload ->> 'ref' = ANY(%(refs)s)
+"""
+
+
+def _words(code: Any) -> str:
+    return str(code).replace("_", " ")
+
+
+def _request_text(body: dict[str, Any]) -> str:
+    items = body.get("items")
+    n = len(items) if isinstance(items, list) else 0
+    text = f"{n} item" if n == 1 else f"{n} items"
+    constraints = body.get("constraints")
+    constraints = constraints if isinstance(constraints, dict) else {}
+    tags = [
+        _tag_text(kind, code)
+        for kind, key, known in (("allergen", "allergens", _ALLERGENS), ("diet", "diets", _DIETS))
+        if isinstance(constraints.get(key), list)
+        for code in constraints[key]
+        if code in known
+    ]
+    return f"{text} · {', '.join(tags)}" if tags else text
+
+
+def _amount(body: dict[str, Any]) -> int | None:
+    value = body.get("total_minor")
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _turn(mtype: str, body: Any, at: datetime, mine: bool) -> dict[str, Any]:
+    body = body if isinstance(body, dict) else {}
+    kind = TURN_KINDS[mtype]
+    by = "you" if mine else "system" if mtype in _SYSTEM_TYPES else "them"
+    turn: dict[str, Any] = {"at": at.isoformat(), "by": by, "kind": kind}
+    if kind == "request":
+        turn["text"] = _request_text(body)
+    elif kind == "courier":
+        turn["text"] = "Courier booked"
+    elif kind == "status":
+        state = body.get("state")
+        turn["text"] = _words(state).capitalize() if isinstance(state, str) else "Updated"
+    elif kind in ("reject", "cancel") and isinstance(body.get("reason"), str):
+        turn["text"] = _words(body["reason"])
+    if kind in ("offer", "counter", "accept"):
+        amount = _amount(body)
+        if amount is not None:
+            turn["amount_minor"] = amount
+    if kind == "offer":
+        turn["rationale"] = _rationale(body)
+    return turn
+
+
+async def turns(conn: AsyncConnection, org: scope.OrgScope, ref: str) -> dict[str, Any] | None:
+    """The org's negotiation turns for the order shown as `ref`, or None when `ref` is not
+    one of the org's orders. Names no household, member, address or other seller."""
+    if not _REF.match(ref):
+        return None
+    q = scope.org_scoped(conn, org)
+    matches = [
+        (order_id, state)
+        for order_id, state in await q.fetch(_TURN_ORDERS_SQL)
+        if ids.org_order_ref(org.org_id, order_id) == ref
+    ]
+    if len(matches) != 1:
+        return None  # unknown, or (never in practice) ambiguous: fail closed
+    order_id, state = matches[0]
+    rows = await q.fetch(_TURNS_SQL, order_id=str(order_id), types=list(TURN_KINDS))
+    counters = [str(mid) for mid, mtype, _, _, _ in rows if mtype == "counter_offer"]
+    floors: dict[str, int] = {}
+    if counters:
+        for mid, floor in await q.fetch(_FLOORS_SQL, refs=counters):
+            if isinstance(floor, int) and not isinstance(floor, bool):
+                floors[mid] = floor
+    out = []
+    for mid, mtype, body, at, mine in rows:
+        turn = _turn(mtype, body, at, bool(mine))
+        if str(mid) in floors:
+            turn["floor_minor"] = floors[str(mid)]
+        out.append(turn)
+    return {"ref": ref, "state": state, "live": state in LIVE_ORDER_STATES, "turns": out}
 
 
 # --- connection ----------------------------------------------------------------------------

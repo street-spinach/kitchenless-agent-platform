@@ -13,7 +13,18 @@ export type OrderRow = {
   updated_at: string;
   rationale: string | null;
 };
-export type Notice = { kind: string; text: string; at: string };
+// One turn of the negotiation sheet (showcase.md §6).
+export type Turn = {
+  at: string;
+  by: "you" | "them" | "system";
+  kind: "request" | "offer" | "counter" | "accept" | "reject" | "cancel" | "courier" | "status";
+  text?: string;
+  amount_minor?: number;
+  rationale?: string | null;
+  floor_minor?: number;
+};
+export type Turns = { ref: string; state: string; live: boolean; turns: Turn[] };
+export type Notice ={ kind: string; text: string; at: string };
 export type InsightCell =
   | { metric: string; label: string; value: string; hidden?: undefined }
   | { metric: string; hidden: true };
@@ -77,6 +88,7 @@ export const api = {
     }),
   summary: () => call<Summary>("/app/orders?summary=1"),
   orders: () => call<{ orders: OrderRow[] }>("/app/orders").then((r) => r.orders),
+  turns: (ref: string) => call<Turns>(`/app/orders/${encodeURIComponent(ref)}/turns`),
   notices: (limit: number) =>
     call<{ notices: Notice[] }>(`/app/notices?limit=${limit}`).then((r) => r.notices),
   insights: () => call<Insights>("/app/insights"),
