@@ -1,6 +1,10 @@
 {#- /me/household (experience.md §8, EX-OD8, EX-OD9).
 
 Context, besides base.html's:
+  household_wide bool      the viewer sees household-wide rows (adults; a child sees only
+                           their own row, experience §4); when false only `people` shows
+  people     [{name, allergies, diets}]               the people whose constraints the viewer
+             may see (visibility.can_see): an admin everyone, others only themselves
   order      none | {summary, state, explanation}   this week's order; all text built by code
   spending   {spent, budget}                          formatted money strings; budget may be none
   take_turns {on, can_switch, csrf}                   can_switch: the viewer is the approver
@@ -12,6 +16,7 @@ The switch posts `on` (present when ticked) to /me/household/take-turns; a react
 {% from "base.html" import csrf_field %}
 {% block title %}Household{% endblock %}
 {% block content %}
+{% if household_wide %}
 <section class="card">
   <h2>This week</h2>
   {% if order %}
@@ -78,4 +83,19 @@ The switch posts `on` (present when ticked) to /me/household/take-turns; a react
   <p class="muted">No delivered meals yet.</p>
   {% endif %}
 </section>
+{% endif %}
+
+{% if people %}
+<section class="card">
+  <h2>Allergies and diets</h2>
+  <ul class="rows">
+    {% for p in people %}
+    <li>
+      <strong>{{ p.name }}</strong>
+      <div class="muted">{% if p.allergies %}No {{ p.allergies | join(", ") }}{% else %}No allergies saved{% endif %}{% if p.diets %} · {{ p.diets | join(", ") }}{% endif %}</div>
+    </li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
 {% endblock %}

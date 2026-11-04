@@ -73,6 +73,11 @@ class FakeKeycloak:
 
 @pytest.fixture
 def kc(monkeypatch: pytest.MonkeyPatch) -> FakeKeycloak:
+    return make_kc(monkeypatch)
+
+
+def make_kc(monkeypatch: pytest.MonkeyPatch) -> FakeKeycloak:
+    """The fake Keycloak and test settings (shared with `test_me_household.py`)."""
     settings = _Settings()
     for module in (me, links, grants):
         monkeypatch.setattr(module, "get_settings", lambda: settings)
@@ -95,6 +100,11 @@ class World:
 
 @pytest.fixture
 def world(pg: str, kc: FakeKeycloak) -> World:
+    return make_world(pg, kc)
+
+
+def make_world(pg: str, kc: FakeKeycloak) -> World:
+    """The `/me` test household (shared with `test_me_household.py`)."""
     with psycopg.connect(pg) as conn:
         w.add_household(conn, HOUSEHOLD, env="eval")
         admin = w.add_person(conn, HOUSEHOLD, "admin")
@@ -152,9 +162,20 @@ def _sign_in(world: World, kc: FakeKeycloak, client: TestClient, agents: list[st
     return client.get("/me/callback", params={"code": "c0", "state": state}, follow_redirects=False)
 
 
+def _session_id(person: w.Person) -> str:
+    return f"session-{person.user_id}"
+
+
 def _session_cookie(person: w.Person, household_id: str = HOUSEHOLD) -> dict[str, str]:
-    value = me._sign("me-session", {"u": str(person.user_id), "h": household_id})
+    value = me._sign(
+        "me-session", {"u": str(person.user_id), "h": household_id, "i": _session_id(person)}
+    )
     return {me.SESSION_COOKIE: value}
+
+
+def _csrf(person: w.Person, form: str, household_id: str = HOUSEHOLD) -> str:
+    """The CSRF token the page gives this person for `form` (experience §8)."""
+    return me.csrf_token(me.Session(person.user_id, household_id, _session_id(person)), form)
 
 
 @db
@@ -385,7 +406,11 @@ def test_revoke_permissions(world: World, kc: FakeKeycloak) -> None:
     def revoke(person: w.Person, agent_id: str, household_id: str = HOUSEHOLD) -> int:
         client = _client(world.pg)
         client.cookies.update(_session_cookie(person, household_id))
-        return client.post(f"/me/agents/{agent_id}/revoke", follow_redirects=False).status_code
+        return client.post(
+            f"/me/agents/{agent_id}/revoke",
+            data={"csrf": _csrf(person, "revoke", household_id)},
+            follow_redirects=False,
+        ).status_code
 
     def status(grant_id: uuid.UUID) -> tuple[str, Any, Any]:
         [row] = aw.query(world.pg, "SELECT * FROM agent_grants WHERE grant_id = %s", grant_id)
@@ -429,6 +454,8 @@ def test_band_admin_only(world: World, kc: FakeKeycloak) -> None:
     admin, member = _client(world.pg), _client(world.pg)
     admin.cookies.update(_session_cookie(world.admin))
     member.cookies.update(_session_cookie(world.member))
+    admin.headers[me.CSRF_HEADER] = _csrf(world.admin, "band")
+    member.headers[me.CSRF_HEADER] = _csrf(world.member, "band")
 
     assert _client(world.pg).get("/me/household/band").status_code == 401
     assert member.get("/me/household/band").json() == {
