@@ -4,10 +4,10 @@ Context, besides base.html's:
   agents [{agent_id, label, until, can_revoke, csrf}]   until: the consent's end date as
          text, or none (no consent); revoking posts to /me/agents/<agent_id>/revoke -#}
 {% extends "base.html" %}
-{% from "base.html" import csrf_field %}
+{% from "base.html" import csrf_field, state_logo %}
 {% block title %}Your agents{% endblock %}
 {% block content %}
-<section class="card">
+<section class="card{% if not agents %} state{% endif %}">
   {% if agents %}
   <ul class="rows">
     {% for agent in agents %}
@@ -20,7 +20,7 @@ Context, besides base.html's:
         {% if agent.until and agent.can_revoke %}
         <form class="inline" method="post" action="/me/agents/{{ agent.agent_id | urlencode }}/revoke">
           {{ csrf_field(agent.csrf) }}
-          <button type="submit">Revoke</button>
+          <button class="destructive" type="submit">Revoke</button>
         </form>
         {% endif %}
       </div>
@@ -28,6 +28,7 @@ Context, besides base.html's:
     {% endfor %}
   </ul>
   {% else %}
+  {{ state_logo() }}
   <p class="muted">No agents.</p>
   {% endif %}
 </section>

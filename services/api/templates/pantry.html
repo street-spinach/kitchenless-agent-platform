@@ -7,17 +7,17 @@ Context, besides base.html's:
   can_correct bool                                   the viewer is an adult
 A correction posts `kind` ("verify" or "out") to /me/pantry/<name>. -#}
 {% extends "base.html" %}
-{% from "base.html" import csrf_field %}
+{% from "base.html" import csrf_field, state_logo %}
 {% block title %}Pantry{% endblock %}
 {% block content %}
 {% if not enabled %}
-<p class="card">Pantry tracking isn't on for your household yet.</p>
+<section class="card state">{{ state_logo() }}<p>Pantry tracking isn't on for your household yet.</p></section>
 {% else %}
-{% for state, heading in [("at_home", "At home"), ("unsure", "Not sure"), ("out", "Out")] %}
+{% for state, heading, pill in [("at_home", "At home", "pill-ok"), ("unsure", "Not sure", "pill-attention"), ("out", "Out", "pill-refused")] %}
 {% set group = items | selectattr("state", "equalto", state) | list %}
 {% if group %}
 <section class="card">
-  <h2{% if state == "out" %} class="state-out"{% endif %}>{{ heading }}</h2>
+  <h2 class="pill {{ pill }}">{{ heading }}</h2>
   <ul class="rows">
     {% for item in group %}
     <li>
@@ -30,7 +30,7 @@ A correction posts `kind` ("verify" or "out") to /me/pantry/<name>. -#}
         <form class="inline" method="post" action="/me/pantry/{{ item.name | urlencode }}">
           {{ csrf_field(item.csrf) }}
           <button type="submit" name="kind" value="verify">Still have it</button>
-          <button type="submit" name="kind" value="out">Ran out</button>
+          <button class="destructive" type="submit" name="kind" value="out">Ran out</button>
         </form>
         {% endif %}
       </div>
@@ -40,6 +40,6 @@ A correction posts `kind` ("verify" or "out") to /me/pantry/<name>. -#}
 </section>
 {% endif %}
 {% endfor %}
-{% if not items %}<p class="card muted">Nothing tracked yet.</p>{% endif %}
+{% if not items %}<section class="card state">{{ state_logo() }}<p class="muted">Nothing tracked yet.</p></section>{% endif %}
 {% endif %}
 {% endblock %}

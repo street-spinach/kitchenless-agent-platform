@@ -13,17 +13,18 @@ Context, besides base.html's:
 The switch posts `on` (present when ticked) to /me/household/take-turns; a reaction posts
 `value` (1 or -1) to /me/meals/<order_id>/reaction. -#}
 {% extends "base.html" %}
-{% from "base.html" import csrf_field %}
+{% from "base.html" import csrf_field, state_logo %}
 {% block title %}Household{% endblock %}
 {% block content %}
 {% if household_wide %}
-<section class="card">
+<section class="card{% if order %} hero{% else %} state{% endif %}">
   <h2>This week</h2>
   {% if order %}
   <p><strong>{{ order.summary }}</strong></p>
   <p class="muted">{{ order.state }}</p>
   {% if order.explanation %}<p>{{ order.explanation }}</p>{% endif %}
   {% else %}
+  {{ state_logo() }}
   <p class="muted">No order yet this week.</p>
   {% endif %}
 </section>
@@ -58,7 +59,7 @@ The switch posts `on` (present when ticked) to /me/household/take-turns; a react
   <p>{% if take_turns.on %}Take turns is on.{% else %}Take turns is off.{% endif %}</p>
 </section>
 
-<section class="card">
+<section class="card{% if not meals %} state{% endif %}">
   <h2>Recent meals</h2>
   {% if meals %}
   <ul class="rows">
@@ -80,6 +81,7 @@ The switch posts `on` (present when ticked) to /me/household/take-turns; a react
   </ul>
   {% if meals and not meals[0].totals %}<p class="muted">Totals show in households with 3 or more adults.</p>{% endif %}
   {% else %}
+  {{ state_logo() }}
   <p class="muted">No delivered meals yet.</p>
   {% endif %}
 </section>
