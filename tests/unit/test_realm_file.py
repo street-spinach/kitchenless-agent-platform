@@ -9,6 +9,7 @@ from uuid import UUID
 import yaml
 
 from services.common import ids
+from services.identity.grants import CLASS_SCOPES
 
 REPO = Path(__file__).resolve().parents[2]
 REALM = REPO / "services/identity/realm/kitchenless.json"
@@ -19,14 +20,10 @@ CALLBACK = "https://${DOMAIN}/me/callback"
 OWNER_REDIRECT = "https://${DOMAIN}/owner/auth"
 OWNER_ORIGIN = "https://${DOMAIN}"
 AUDIENCE_MAPPER = "oidc-audience-mapper"
-CONSUMER_SCOPES = {"constraints:read", "pantry:read", "meals:plan"}
-HOUSEHOLD_SCOPES = {
-    "constraints:read",
-    "pantry:read",
-    "pantry:write",
-    "orders:place",
-    "approvals:request",
-}
+# The class scopes the code requests (grants.CLASS_SCOPES): every one must be a default
+# scope of its clients, or Keycloak leaves it out of the token and the tool is refused.
+CONSUMER_SCOPES = set(CLASS_SCOPES["consumer"])
+HOUSEHOLD_SCOPES = set(CLASS_SCOPES["household"])
 # The only values that may hold a secret, and the placeholder each must be.
 SECRET_KEYS = {"secret", "value", "jwt.credential.certificate", "client_secret", "password"}
 PLACEHOLDER = re.compile(r"^\$\{[A-Z][A-Z0-9_]*\}$")
