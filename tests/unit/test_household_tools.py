@@ -534,6 +534,65 @@ def test_get_household_allergens_union(
     assert (fga.agent_object(AGENT), "acts_for", f"household:{HOUSEHOLD}") in _auth
 
 
+def _join_code(pg: str, code: str, allergies: list[str], diets: list[str], days: int = 7) -> None:
+    _exec(
+        pg,
+        "INSERT INTO join_codes (code, household_id, phone_e164, display_name, pending,"
+        " created_by, expires_at)"
+        " VALUES (%s, %s, '+15550100777', 'Sam', %s, %s, now() + make_interval(days => %s))",
+        code,
+        HOUSEHOLD,
+        Jsonb({"allergies": allergies, "diets": diets}),
+        USER,
+        days,
+    )
+
+
+def _member_allergens(pg: str, monkeypatch: pytest.MonkeyPatch) -> dict[str, list[str]]:
+    async def read() -> dict[str, list[str]]:
+        async with db.get_pool().connection() as conn:
+            return await household._member_allergens(conn, HOUSEHOLD)
+
+    return _with_pool(pg, monkeypatch, read)
+
+
+def test_open_join_code_allergens_merged(pg: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    run_id = _seed(pg)
+    _constraint(pg, USER, "allergy", "milk")
+    _join_code(pg, "K7Q2M3XD", ["peanuts"], ["vegetarian"])
+    _join_code(pg, "AAAAAAAA", ["fish"], [], days=-1)  # expired: no longer merged
+
+    result = _with_pool(pg, monkeypatch, lambda: household.get_household_allergens(_ctx(run_id)))
+    constraints = _with_pool(
+        pg, monkeypatch, lambda: household.get_constraints(_ctx(run_id), user_id=USER)
+    )
+
+    assert result == {"allergens": ["milk", "peanuts"]}
+    assert _member_allergens(pg, monkeypatch) == {
+        str(USER): ["milk"],
+        "join:K7Q2M3XD": ["peanuts"],
+    }
+    assert {
+        "user_id": "join:K7Q2M3XD",
+        "allergies": ["peanuts"],
+        "diets": ["vegetarian"],
+    } in constraints["members"]
+    assert len(constraints["members"]) == 2
+
+
+def test_used_code_not_merged_twice(pg: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    run_id = _seed(pg)
+    _add_member(pg, OTHER_USER, "Sam")
+    _join_code(pg, "K7Q2M3XD", ["peanuts"], [])
+    _constraint(pg, OTHER_USER, "allergy", "peanuts", "join")
+    _exec(pg, "UPDATE join_codes SET used_at = now(), used_by = %s", OTHER_USER)
+
+    result = _with_pool(pg, monkeypatch, lambda: household.get_household_allergens(_ctx(run_id)))
+
+    assert result == {"allergens": ["peanuts"]}
+    assert _member_allergens(pg, monkeypatch) == {str(OTHER_USER): ["peanuts"]}
+
+
 def test_get_household_rules_default(pg: str, monkeypatch: pytest.MonkeyPatch) -> None:
     run_id = _seed(pg)
 

@@ -113,6 +113,7 @@ TOOL_SCOPES: Mapping[str, ToolScope] = {
     "apply_setup": _service("system"),
     # Experience EX-A11 (EX-I39): the `/me/pantry` correction, checks in `limits`.
     "record_pantry_check": _service("system"),
+    "complete_join": _service("system"),
 }
 
 

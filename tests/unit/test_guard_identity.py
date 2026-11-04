@@ -85,6 +85,9 @@ def test_tool_scope_table() -> None:
     assert not _refused("record_pantry_check", _claims("system:api", "service"))
     assert _refused("record_pantry_check", _claims("system:runs", "service"))
     assert _refused("record_pantry_check", _claims(HOUSEHOLD_AGENT, "people", all_scopes))
+    # Experience EX-A11 (EX-I31): only `svc.api` completes a join.
+    assert not _refused("complete_join", _claims("system:api", "service"))
+    assert _refused("complete_join", _claims(HOUSEHOLD_AGENT, "people", all_scopes))
 
 
 def test_system_rows_admit_only_svc_api() -> None:
@@ -114,6 +117,7 @@ def test_scope_table_matches_design() -> None:
         "propose_setup": ("delegated", {"consumer"}, "constraints:write"),
         "apply_setup": ("service", {"system"}, None),
         "record_pantry_check": ("service", {"system"}, None),
+        "complete_join": ("service", {"system"}, None),
     }
     actual = {
         tool: (row.caller, set(row.agent_classes), row.scope)
