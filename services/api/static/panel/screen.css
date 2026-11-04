@@ -1,0 +1,129 @@
+/* The presenter view /panel/screen (showcase.md §7). Dark brand layout for a 1920x1080
+   projector, readable at 3 m: nothing below 18 px. Tokens come from /me/static/brand.css. */
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body.screen {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  font: 20px/1.4 var(--brand-font);
+  color: var(--brand-white);
+  background: var(--brand-green-900);
+  overflow: hidden;
+}
+
+.screen-header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 20px 32px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+}
+.screen-header .logo { width: 40px; height: 40px; }
+.screen-header .wordmark { font-weight: 700; font-size: 24px; }
+.screen-header h1 { margin: 0 0 0 16px; font-size: 32px; font-weight: 700; flex: 1; }
+.screen-header h1::before {
+  content: "";
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  margin-right: 12px;
+  border-radius: 999px;
+  background: var(--brand-lime);
+  vertical-align: middle;
+}
+.pill {
+  padding: 4px 16px;
+  border-radius: 999px;
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--brand-green-900);
+  background: var(--brand-lime);
+}
+.timer { font-size: 28px; font-variant-numeric: tabular-nums; min-width: 5ch; text-align: right; }
+
+.columns {
+  flex: 1;
+  display: flex;
+  gap: 20px;
+  padding: 20px 32px;
+  overflow-x: auto;
+  min-height: 0;
+}
+.column {
+  flex: 1 1 0;
+  min-width: 300px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.column-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+  font-size: 22px;
+  font-weight: 700;
+}
+.column-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 999px;
+  font-size: 18px;
+  color: var(--brand-green-900);
+  background: var(--brand-lime);
+}
+.column-cards {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.card {
+  padding: 14px 18px;
+  border-radius: var(--brand-radius-control);
+  color: var(--brand-ink);
+  background: var(--brand-white);
+  box-shadow: var(--brand-shadow);
+  font-size: 18px;
+  animation: slide-in 200ms ease-out;
+}
+.card .label {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--brand-green-700);
+}
+.card .summary { display: block; font-size: 20px; color: var(--brand-ink); }
+.card .meta { display: block; margin-top: 4px; font-size: 18px; color: var(--brand-muted); }
+.card.decision { background: var(--brand-green-50); }
+.card.decision.model .label { color: var(--brand-green-900); }
+.card.check .label::before { content: "\2713  "; color: var(--brand-green-500); }
+.card.check.stop .label { color: var(--brand-orange); }
+.card.check.stop .label::before { content: "\25A0  "; color: var(--brand-orange); }
+.card.approval { border-left: 6px solid var(--brand-orange); }
+
+@keyframes slide-in {
+  from { opacity: 0; transform: translateY(-12px); }
+  to { opacity: 1; transform: none; }
+}
+
+.waiting { margin: 0; padding: 0 32px; font-size: 24px; color: var(--brand-lime); }
+.waiting[hidden] { display: none; }
+
+.totals {
+  display: flex;
+  gap: 40px;
+  padding: 16px 32px;
+  font-size: 22px;
+  color: rgba(255, 255, 255, 0.8);
+  background: rgba(0, 0, 0, 0.25);
+}
+.totals strong { color: var(--brand-lime); font-variant-numeric: tabular-nums; margin-left: 8px; }

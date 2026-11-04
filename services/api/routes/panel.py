@@ -34,9 +34,15 @@
 *   `GET /panel/experience?household=` (experience §12, EX-I22): decisions asked per adult
     this week and last, the guard metrics, pending held items and the configured Meta
     templates, as JSON or (for an HTML client) a three-line page. No actions.
+*   `GET /panel/screen` (showcase §7, SC-A4): the presenter view, one page with
+    `/panel/static/screen.js` and `screen.css` and the CSP `default-src 'self'` (no inline
+    script). `GET /panel/screen/feed?after=&run_id=` returns the run's message, decision,
+    check and approval rows from `after` (default: the run's start), at most 200, with
+    display names and summaries only, plus the run's totals.
 """
 
 import html
+import re
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -47,7 +53,8 @@ from psycopg import AsyncConnection, errors
 from psycopg.rows import dict_row
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
-from starlette.routing import Route
+from starlette.routing import Mount, Route
+from starlette.staticfiles import StaticFiles
 
 from services.api.whatsapp import templates
 from services.common import ids, outbox
@@ -67,6 +74,8 @@ __all__ = [
     "LIVE_LIMIT",
     "LIVE_LIMIT_MAX",
     "NO_EVAL_RUNS",
+    "SCREEN_CSP",
+    "SCREEN_LIMIT",
     "STUB_HEADING",
     "routes",
 ]
@@ -861,7 +870,249 @@ async def revoke_grant(request: Request) -> Response:
     return JSONResponse({"revoked": True})
 
 
+# --- presenter view (showcase §7, SC-A4) -----------------------------------------------------
+
+SCREEN_CSP = "default-src 'self'"
+SCREEN_LIMIT = 200
+_API_DIR = Path(__file__).resolve().parents[1]
+_SCREEN_HTML = _API_DIR / "templates" / "screen.html"
+_PANEL_STATIC = _API_DIR / "static" / "panel"
+
+# Display names (§7): the projector is public, so no agent shows a person's name. A business
+# shows its organization's name; a people channel shows the run's household name, which the
+# operator chose.
+_CLASS_NAMES = {
+    "household": "Household agent",
+    "consumer": "Personal agent",
+    "grocery": "Store",
+    "restaurant": "Restaurant",
+    "delivery": "Courier",
+    "external": "External agent",
+}
+# Columns: household first, then sellers, then the courier (§7); people and system last.
+_CLASS_ORDER = {
+    "household": 0,
+    "grocery": 1,
+    "restaurant": 1,
+    "delivery": 2,
+    "consumer": 3,
+    "channel": 4,
+    "external": 5,
+}
+_APPROVAL_STATUS = {"pending": "requested"}
+# A decision's choice is shown only when it is an agent (by display name), a code, or a
+# short list of codes; free text and objects are never shown.
+_CODE = re.compile(r"[a-z0-9_.:-]{1,40}")
+
+_SCREEN_RUN_SQL = """
+SELECT r.run_id, r.kind, r.status, r.started_at, r.ended_at, h.name AS household_name
+FROM runs r LEFT JOIN households h ON h.household_id = r.household_id
+WHERE %(run_id)s::uuid IS NULL OR r.run_id = %(run_id)s
+ORDER BY r.started_at DESC, r.run_id DESC
+LIMIT 1
+"""
+
+# The feed's rows: messages, decisions, approvals and the guard's `tool_result` rows. Only
+# `run_guarded` writes the identity fields (identity-authz §14), so `act_agent_id` marks a
+# guard row; `traced` tools are not checks.
+_SCREEN_KINDS = (
+    "(t.kind IN ('message', 'decision', 'approval')"
+    " OR (t.kind = 'tool_result' AND t.payload ? 'act_agent_id'))"
+)
+
+_SCREEN_ROWS_SQL = f"""
+SELECT t.seq, t.ts, t.agent_id, t.kind, t.model, t.latency_ms,
+       t.payload->>'from' AS from_agent, t.payload->>'to' AS to_agent,
+       t.payload->>'type' AS type, t.payload->>'summary' AS summary,
+       t.payload->>'node' AS node, t.payload->'choice' AS choice,
+       t.payload->>'source' AS source,
+       t.payload->>'tool' AS tool, t.payload->>'refused' AS refused,
+       t.payload->>'reason' AS reason, t.payload->>'status' AS status
+FROM agent_traces t
+WHERE t.run_id = %(run_id)s AND t.ts >= %(after)s AND {_SCREEN_KINDS}
+ORDER BY t.ts, t.seq
+LIMIT %(limit)s
+"""
+
+_SCREEN_AGENTS_SQL = f"""
+SELECT DISTINCT v.agent_id, c.class, g.name AS org_name
+FROM agent_traces t
+CROSS JOIN LATERAL (VALUES (t.agent_id), (t.payload->>'from'), (t.payload->>'to'))
+  AS v(agent_id)
+LEFT JOIN agent_cards c ON c.agent_id = v.agent_id
+LEFT JOIN organizations g ON c.owner_ref = 'org:' || g.org_id
+WHERE t.run_id = %(run_id)s AND v.agent_id IS NOT NULL AND {_SCREEN_KINDS}
+"""
+
+_SCREEN_TOTALS_SQL = """
+SELECT count(DISTINCT agent_id) AS agents,
+       count(*) FILTER (WHERE kind = 'message') AS messages,
+       count(*) FILTER (WHERE kind = 'decision' AND coalesce(payload->>'source',
+         CASE WHEN model IS NULL THEN 'rule_default' ELSE 'model' END) = 'model')
+         AS model_calls,
+       coalesce(sum(coalesce(tokens_in, 0) + coalesce(tokens_out, 0)), 0) AS tokens,
+       coalesce(extract(epoch FROM max(ts) - min(ts)), 0) AS elapsed_s
+FROM agent_traces WHERE run_id = %(run_id)s
+"""
+
+
+def _agent_name(row: dict[str, Any], household_name: str | None) -> str:
+    cls = row["class"]
+    if cls in ("grocery", "restaurant", "delivery") and row["org_name"]:
+        return str(row["org_name"])
+    if cls == "channel":
+        return household_name or "Household"
+    if cls in _CLASS_NAMES:
+        return _CLASS_NAMES[cls]
+    return "System" if str(row["agent_id"]).startswith("system:") else "Agent"
+
+
+def _screen_agents(rows: list[dict[str, Any]], household_name: str | None) -> list[dict[str, Any]]:
+    """The run's agents in column order, each with its display name."""
+    agents = [
+        {"id": r["agent_id"], "class": r["class"], "name": _agent_name(r, household_name)}
+        for r in rows
+    ]
+    return sorted(agents, key=lambda a: (_CLASS_ORDER.get(a["class"], 6), a["name"], a["id"]))
+
+
+def _choice_label(choice: Any, names: dict[str, str]) -> str | None:
+    if isinstance(choice, str):
+        if choice in names:
+            return names[choice]
+        return choice if _CODE.fullmatch(choice) else None
+    if isinstance(choice, int) and not isinstance(choice, bool):
+        return str(choice)
+    if isinstance(choice, list) and 0 < len(choice) <= 3:
+        labels = [_choice_label(c, names) for c in choice if isinstance(c, str)]
+        if len(labels) == len(choice) and all(labels):
+            return ", ".join(str(label) for label in labels)
+    return None
+
+
+def _screen_row(row: dict[str, Any], names: dict[str, str]) -> dict[str, Any]:
+    """One feed row: display names and codes only, never a body, rationale or free text."""
+    agent = row["agent_id"]
+    common = {"seq": row["seq"], "ts": _iso(row["ts"]), "agent_id": agent}
+    name = names.get(agent, "Agent")
+    if row["kind"] == "message":
+        return {
+            **common,
+            "kind": "message",
+            "from_id": row["from_agent"],
+            "to_id": row["to_agent"],
+            "from": names.get(row["from_agent"], "Agent"),
+            "to": names.get(row["to_agent"], "Agent"),
+            "type": row["type"],
+            "summary": row["summary"],
+        }
+    if row["kind"] == "decision":
+        source = row["source"] or ("rule_default" if row["model"] is None else "model")
+        return {
+            **common,
+            "kind": "decision",
+            "agent": name,
+            "node": row["node"],
+            "source": source,
+            "choice": _choice_label(row["choice"], names),
+            "model": row["model"],
+            "latency_ms": row["latency_ms"],
+        }
+    if row["kind"] == "approval":
+        status = row["status"]
+        return {
+            **common,
+            "kind": "approval",
+            "agent": name,
+            "status": _APPROVAL_STATUS.get(status, status),
+        }
+    refused = row["refused"] == "true"
+    return {
+        **common,
+        "kind": "check",
+        "agent": name,
+        "tool": row["tool"],
+        "result": (row["reason"] or "refused") if refused else "ok",
+    }
+
+
+def _after(raw: str | None) -> datetime | None:
+    parsed = datetime.fromisoformat(raw) if raw else None
+    if parsed is not None and parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+async def screen(request: Request) -> Response:
+    """`GET /panel/screen`: the presenter view page. Its script and stylesheet are files."""
+    response = HTMLResponse(_SCREEN_HTML.read_text(encoding="utf-8"))
+    response.headers["Content-Security-Policy"] = SCREEN_CSP
+    return response
+
+
+async def screen_feed(request: Request) -> JSONResponse:
+    """`?after=&run_id=`: the newest run's (or `run_id`'s) rows from `after`, oldest first,
+    at most `SCREEN_LIMIT`, plus its agents and totals. `next` is the `after` of the next
+    poll; rows at that instant come again, and the page skips seqs it has shown."""
+    raw_run = request.query_params.get("run_id")
+    run_id = _uuid(raw_run) if raw_run else None
+    if raw_run and run_id is None:
+        return _error(400, "run_id must be a uuid")
+    try:
+        after = _after(request.query_params.get("after"))
+    except ValueError:
+        return _error(400, "after must be an ISO 8601 time")
+    async with (
+        request.app.state.connect() as conn,
+        unscoped(conn, "panel").cursor(row_factory=dict_row) as cur,
+    ):
+        await cur.execute(_SCREEN_RUN_SQL, {"run_id": run_id})
+        run = await cur.fetchone()
+        if run is None:
+            if run_id is not None:
+                return _error(404, "unknown run")
+            return JSONResponse({"run": None, "agents": [], "rows": [], "totals": None})
+        args = {
+            "run_id": run["run_id"],
+            "after": after or run["started_at"],
+            "limit": SCREEN_LIMIT,
+        }
+        await cur.execute(_SCREEN_ROWS_SQL, args)
+        rows = await cur.fetchall()
+        await cur.execute(_SCREEN_AGENTS_SQL, args)
+        agents = _screen_agents(await cur.fetchall(), run["household_name"])
+        await cur.execute(_SCREEN_TOTALS_SQL, args)
+        totals = await cur.fetchone()
+    names = {a["id"]: a["name"] for a in agents}
+    assert totals is not None
+    return JSONResponse(
+        {
+            "run": {
+                "run_id": str(run["run_id"]),
+                "kind": run["kind"],
+                "status": run["status"],
+                "started_at": _iso(run["started_at"]),
+                "ended_at": _iso(run["ended_at"]),
+            },
+            "now": datetime.now(UTC).isoformat(),
+            "next": _iso(rows[-1]["ts"] if rows else args["after"]),
+            "agents": agents,
+            "rows": [_screen_row(r, names) for r in rows],
+            "totals": {
+                "agents": int(totals["agents"]),
+                "messages": int(totals["messages"]),
+                "model_calls": int(totals["model_calls"]),
+                "tokens": int(totals["tokens"]),
+                "elapsed_s": round(float(totals["elapsed_s"]), 1),
+            },
+        }
+    )
+
+
 routes = [
+    Route("/panel/screen", screen, methods=["GET"]),
+    Route("/panel/screen/feed", screen_feed, methods=["GET"]),
+    Mount("/panel/static", app=StaticFiles(directory=str(_PANEL_STATIC)), name="panel_static"),
     Route("/panel/reset", reset, methods=["POST"]),
     Route("/panel/events", events, methods=["POST"]),
     Route("/panel/modes/{vendor}", set_mode, methods=["PUT"]),
