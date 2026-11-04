@@ -2,6 +2,7 @@
   "realm": "kitchenless",
   "enabled": true,
   "sslRequired": "external",
+  "loginTheme": "kitchenless",
   "registrationAllowed": false,
   "accessTokenLifespan": 300,
   "offlineSessionIdleTimeout": 2592000,
@@ -648,7 +649,17 @@
       "attributes": {
         "include.in.token.scope": "true",
         "display.on.consent.screen": "true",
-        "consent.screen.text": "Read your allergies, diets and household budget"
+        "consent.screen.text": "Read your household's allergies, diets and dislikes"
+      }
+    },
+    {
+      "name": "constraints:write",
+      "description": "Kitchenless agent scope: constraints:write",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true",
+        "consent.screen.text": "Save allergies, diets and dislikes you tell it"
       }
     },
     {
@@ -658,7 +669,7 @@
       "attributes": {
         "include.in.token.scope": "true",
         "display.on.consent.screen": "true",
-        "consent.screen.text": "Read your household pantry"
+        "consent.screen.text": "See what's at home"
       }
     },
     {
@@ -678,7 +689,7 @@
       "attributes": {
         "include.in.token.scope": "true",
         "display.on.consent.screen": "true",
-        "consent.screen.text": "Update your household pantry"
+        "consent.screen.text": "Record what's at home or run out"
       }
     },
     {
@@ -688,7 +699,7 @@
       "attributes": {
         "include.in.token.scope": "true",
         "display.on.consent.screen": "true",
-        "consent.screen.text": "Place food orders within your household's budget"
+        "consent.screen.text": "Place orders within your budget and approval rules"
       }
     },
     {
@@ -698,7 +709,7 @@
       "attributes": {
         "include.in.token.scope": "true",
         "display.on.consent.screen": "true",
-        "consent.screen.text": "Ask your household's approver to approve an order"
+        "consent.screen.text": "Ask your approver before spending above the band"
       }
     }
   ],
