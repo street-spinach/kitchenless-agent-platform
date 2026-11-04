@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { ScrollView, StyleSheet, Text, View } from "react-native";
 
 import { api, type Notice, type Rules, type Summary } from "../../src/api";
+import { when } from "../../src/when";
 import {
   Banner,
   Card,
@@ -22,6 +23,10 @@ import {
 export const DISCOUNT_CHOICES = [0, 2, 4, 5, 10, 15, 20];
 
 type Data = { rules: Rules; summary: Summary; notices: Notice[] };
+
+// What the discount does, in one line under the card (#434).
+export const DISCOUNT_HELP =
+  "When a buyer asks for a lower price, your agent can go down by up to this much. Never more.";
 
 export function discountText(pct: number | null): string {
   return pct === null ? "Most discount you'll give: not set" : `Most discount you'll give: ${pct}%`;
@@ -80,6 +85,7 @@ export default function Home() {
         tone="hero"
       >
         <Text style={[type.body, styles.heroText]}>{discountText(pct)}</Text>
+        <Text style={[type.caption, styles.heroText]}>{DISCOUNT_HELP} Tap to change.</Text>
       </Card>
       <Card title="Today">
         <View style={styles.stats}>
@@ -90,12 +96,12 @@ export default function Home() {
       </Card>
       <Card title="Notices">
         {data.notices.length === 0 ? (
-          <Empty testID="notices-empty" text="No notices yet." />
+          <Empty testID="notices-empty" text="Nothing needs your attention." />
         ) : (
           data.notices.map((n) => (
             <ListRow
               key={`${n.kind}-${n.at}`}
-              subtitle={new Date(n.at).toLocaleString()}
+              subtitle={when(n.at)}
               title={n.text}
             />
           ))

@@ -4,6 +4,7 @@ import { ScrollView, StyleSheet, Text } from "react-native";
 
 import { api, type Connection } from "../../src/api";
 import { signOut } from "../../src/auth";
+import { when } from "../../src/when";
 import { Card, Empty, ErrorState, ListRow, Skeleton, spacing, type } from "../../src/ui";
 
 const VENDORS: Record<string, string> = {
@@ -16,12 +17,12 @@ const VENDORS: Record<string, string> = {
 };
 
 export function vendorName(vendor: string): string {
-  return VENDORS[vendor] ?? vendor;
+  return VENDORS[vendor] ?? "Your store";
 }
 
-// `mock` is shown as "simulated" (§11 Account).
+// `mock` is shown as "simulated" (§11 Account), in plain words (#434).
 export function modeName(mode: string): string {
-  return mode === "real" ? "real" : "simulated";
+  return mode === "real" ? "Live: real orders" : "Practice: simulated orders";
 }
 
 export function leave() {
@@ -55,16 +56,16 @@ export default function Account() {
   let status;
   if (failed) status = <ErrorState onRetry={load} testID="account-error" />;
   else if (data === undefined) status = <Skeleton testID="account-loading" />;
-  else if (data === null) status = <Empty testID="account-empty" text="No store connected." />;
+  else if (data === null) status = <Empty testID="account-empty" text="No store connected yet." />;
   else
     status = (
       <Card title="Connection">
         <ListRow testID="connection-vendor" title="Store" trailing={vendorName(data.vendor)} />
-        <ListRow testID="connection-mode" title="Mode" trailing={modeName(data.mode)} />
+        <ListRow testID="connection-mode" title="Orders" trailing={modeName(data.mode)} />
         <ListRow
           testID="connection-set-at"
-          title="Mode set"
-          trailing={data.set_at ? new Date(data.set_at).toLocaleString() : "Not set from the panel"}
+          title="Last changed"
+          trailing={data.set_at ? when(data.set_at) : "Never"}
         />
       </Card>
     );

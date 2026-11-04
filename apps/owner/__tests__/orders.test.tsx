@@ -70,7 +70,8 @@ test("shows reference, state, amount and the seller's rationale", async () => {
   const tree = await render(<Orders />);
   await flush();
   expect(has(tree, "order-AB12CD34")).toBe(true);
-  expect(text(tree)).toContain("AB12CD34 · Placed");
+  expect(text(tree)).toContain("Order · Placed");
+  expect(text(tree)).toContain("Ref AB12CD34");
   expect(text(tree)).toContain("$42.50");
   expect(text(tree)).toContain("Fresh today and in stock.");
 });
@@ -118,7 +119,7 @@ test("loading, empty and error states", async () => {
 
 test("labels and money", () => {
   expect(stateLabel("open")).toBe("Offer sent");
-  expect(stateLabel("something_new")).toBe("something new");
+  expect(stateLabel("something_new")).toBe("In progress");
   expect(money(4250, "USD")).toBe("$42.50");
   expect(money(null, "USD")).toBe("");
 });
