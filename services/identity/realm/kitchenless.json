@@ -821,6 +821,7 @@
         "email",
         "service_account",
         "constraints:read",
+        "constraints:write",
         "pantry:read",
         "meals:plan"
       ],
@@ -873,6 +874,7 @@
         "email",
         "service_account",
         "constraints:read",
+        "constraints:write",
         "pantry:read",
         "meals:plan"
       ],
@@ -925,6 +927,7 @@
         "email",
         "service_account",
         "constraints:read",
+        "constraints:write",
         "pantry:read",
         "meals:plan"
       ],
@@ -1031,6 +1034,7 @@
         "email",
         "service_account",
         "constraints:read",
+        "constraints:write",
         "pantry:read",
         "meals:plan"
       ],
@@ -1083,6 +1087,7 @@
         "email",
         "service_account",
         "constraints:read",
+        "constraints:write",
         "pantry:read",
         "meals:plan"
       ],
@@ -1135,6 +1140,7 @@
         "email",
         "service_account",
         "constraints:read",
+        "constraints:write",
         "pantry:read",
         "meals:plan"
       ],
