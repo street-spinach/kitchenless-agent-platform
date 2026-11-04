@@ -8,7 +8,6 @@ run registers new people through `services/identity/onboarding.py`.
 
 import asyncio
 import html
-import json
 import re
 import secrets
 import urllib.parse as up
@@ -16,6 +15,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+import jwt
 import psycopg
 import requests
 import urllib3
@@ -23,7 +23,7 @@ from psycopg.rows import dict_row
 
 from services.common import ids
 from services.common.config import get_settings
-from services.identity import fga, grants, links, onboarding
+from services.identity import fga, grants, links, onboarding, token_source
 
 # Caddy's internal CA signs https://localhost (as in tests/smoke/test_health.py).
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -122,10 +122,20 @@ def _consent(url: str) -> tuple[requests.Session, requests.Response, int]:
     return browser, resp, screens
 
 
-def _sample_claims(done: requests.Response) -> dict[str, Any]:
-    shown = re.search(r"<pre>(.*?)</pre>", done.text, re.S)
-    assert shown, "the done page shows no sample token"
-    return json.loads(html.unescape(shown.group(1)))
+def _sample_claims(done: requests.Response, agent_id: str, user_id: uuid.UUID) -> dict[str, Any]:
+    """The claims of the token the new grant gives `agent_id` for `user_id`, from
+    `TokenSource.sample_token`, the call the done page used to show (#436). The page itself
+    now shows plain words only."""
+    assert "can now act for you" in done.text
+    assert "<pre>" not in done.text, "the done page shows a token"
+    [row] = _rows(
+        "SELECT h.env FROM households h JOIN household_members m USING (household_id)"
+        " WHERE m.user_id = %s",
+        user_id,
+    )
+    source = token_source.get_source(row["env"])
+    sample = _run(lambda conn: source.sample_token(conn, agent_id, user_id))
+    return jwt.decode(sample, options={"verify_signature": False})
 
 
 def _grants(user_id: uuid.UUID) -> list[dict[str, Any]]:
@@ -167,8 +177,8 @@ def test_admin_consents_two_agents() -> None:
         assert r["refresh_ciphertext"]
         assert r["lifetime"].days == grants.GRANT_DAYS
     assert [a["agent_id"] for a in _consent_audits(asha)] == sorted([household, consumer])
-    # The done page: `sub` = Asha, `act.client_id` = the first agent (demo moment 1).
-    claims = _sample_claims(done)
+    # The first agent's token: `sub` = Asha, `act.client_id` = that agent (demo moment 1).
+    claims = _sample_claims(done, household, asha)
     assert claims["sub"] == _keycloak_sub(asha)
     assert claims["act"]["client_id"] == ids.keycloak_client_id(household)
     # A second use shows "This link has expired" and grants nothing more.
@@ -190,7 +200,7 @@ def test_child_consent_by_guardian() -> None:
     [grant] = _grants(mia)
     assert (grant["agent_id"], grant["status"], grant["consented_by"]) == (agent, "active", asha)
     # The link signed in as Mia: the grant's tokens carry `sub` = Mia (I-D15).
-    claims = _sample_claims(done)
+    claims = _sample_claims(done, agent, mia)
     assert claims["sub"] == _keycloak_sub(mia)
     assert claims["act"]["client_id"] == ids.keycloak_client_id(agent)
     # The audit row names Asha as the person who consented.
