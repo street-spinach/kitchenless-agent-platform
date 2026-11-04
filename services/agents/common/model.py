@@ -84,10 +84,11 @@ _DEFAULT_TEMPLATE = "Chosen by the business rules."
 def business_endpoint(s: Any) -> tuple[str | None, str | None]:
     """`(base_url, api_key)` for the business profile (#392).
 
-    Muse Glimmer is open-weight and not served by the Meta Model API, so it may run on its
-    own host. When `MODEL_BUSINESS_BASE_URL` is set, its own key goes with it, even if
-    empty (a self-hosted server), so the primary key never reaches another host. When it
-    is empty, the business profile uses `MODEL_BASE_URL` and `MODEL_API_KEY` as before.
+    The business model (Muse Spark Open on Baseten; Glimmer is not on the Meta Model API)
+    may run on its own host. When `MODEL_BUSINESS_BASE_URL` is set, its own key goes with
+    it, even if empty (a self-hosted server), so the primary key never reaches another
+    host. When it is empty, the business profile uses `MODEL_BASE_URL` and `MODEL_API_KEY`
+    as before.
     """
     if s.model_business_base_url:
         return s.model_business_base_url, s.model_business_api_key

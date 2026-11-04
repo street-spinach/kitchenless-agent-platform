@@ -95,7 +95,7 @@ class Settings:
     model_fallback_name: str | None = _var({"agents", "testrunner"})
     model_fallback_api_key: str | None = _var({"agents", "testrunner"})
     run_token_ceiling: int | None = _var({"agents", "testrunner"})
-    model_business_name: str = _var({"agents", "testrunner"}, "Muse Glimmer")
+    model_business_name: str = _var({"agents", "testrunner"}, "meta-models/muse-spark-open")
     model_business_timeout_seconds: int = _var({"agents", "testrunner"}, 5)
     # Empty: the business profile uses model_base_url and model_api_key (#392).
     model_business_base_url: str | None = _var({"agents", "testrunner"})

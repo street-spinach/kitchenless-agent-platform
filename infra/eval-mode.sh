@@ -20,7 +20,7 @@ POLL_SECONDS="${EVAL_MODE_POLL_SECONDS:-2}"
 ENV_FILE=infra/.env
 COMPOSE=("$DOCKER" compose -f infra/docker-compose.yml --env-file "$ENV_FILE")
 # The compose file's default when `.env` has no MODEL_BUSINESS_NAME line.
-DEFAULT_BUSINESS_NAME="Muse Glimmer"
+DEFAULT_BUSINESS_NAME="meta-models/muse-spark-open"
 
 usage() {
   echo "usage: infra/eval-mode.sh real [business-model-name] | restore" >&2
