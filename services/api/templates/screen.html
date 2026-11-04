@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live: agents at work</title>
+<link rel="stylesheet" href="/me/static/brand.css">
+<link rel="stylesheet" href="/panel/static/screen.css">
+<script src="/panel/static/screen.js" defer></script>
+</head>
+<body class="screen">
+<header class="screen-header">
+  <img class="logo" src="/me/static/brand/spinach-icon.png" alt="" width="40" height="40">
+  <span class="wordmark">Kitchenless</span>
+  <h1>Live: agents at work</h1>
+  <span id="run-kind" class="pill" hidden></span>
+  <span id="elapsed" class="timer">0:00</span>
+</header>
+<main id="columns" class="columns" aria-live="polite"></main>
+<p id="waiting" class="waiting">Waiting for a run to start.</p>
+<footer class="totals" aria-label="Totals">
+  <span>Agents <strong id="t-agents">0</strong></span>
+  <span>Messages <strong id="t-messages">0</strong></span>
+  <span>Model calls <strong id="t-model">0</strong></span>
+  <span>Tokens <strong id="t-tokens">0</strong></span>
+  <span>Elapsed <strong id="t-elapsed">0:00</strong></span>
+</footer>
+</body>
+</html>

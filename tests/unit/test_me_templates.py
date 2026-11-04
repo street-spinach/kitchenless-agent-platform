@@ -107,7 +107,9 @@ def _render(templates: Jinja2Templates, page: str, **extra: Any) -> str:
 
 
 def test_every_template_renders(templates: Jinja2Templates) -> None:
-    assert sorted(p.stem for p in TEMPLATES.glob("*.html")) == sorted(("base", *PAGES))
+    # `screen.html` is the panel's presenter view (showcase §7), not a /me page: it has no
+    # /me frame and is tested in test_panel_screen.py.
+    assert sorted(p.stem for p in TEMPLATES.glob("*.html")) == sorted(("base", "screen", *PAGES))
     for page in PAGES:
         out = _render(templates, page)
         assert out.startswith("<!doctype html>"), page
