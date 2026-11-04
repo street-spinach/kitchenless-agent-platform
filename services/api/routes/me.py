@@ -22,6 +22,11 @@ Pages render from `services/api/templates/` with `/me/static/me.css`.
     budget, take-turns (the switch for the approver), the last delivered dinners with
     reactions, and the allergies and diets the viewer may see. Every read goes through
     `scope.scoped` and `visibility.can_see`; a child sees only their own row.
+*   `GET /me/pantry`: on households where `pantry.is_enabled(households.env)`, each
+    vocabulary item as At home, Not sure or Out with its "last checked" age, for adults (a
+    child sees no household-wide row, §4); otherwise the "isn't on" line. `POST
+    /me/pantry/{pantry_item}` with `kind` (`verify` or `out`) starts the `/me` run and calls
+    `record_pantry_check` for the signed-in person (EX-I40).
 *   `GET /me/history` lists the person's audit rows and approvals, and spending per week
     (per order: an admin every order, others the orders they started).
 *   `GET /me/household/band` returns the band (a page for `Accept: text/html`, else JSON);
@@ -58,13 +63,20 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 from starlette.templating import Jinja2Templates
 
-from services.common import ids
+from services.common import ids, pantry, runs
 from services.common.config import get_settings
+from services.common.mcp_client import AdapterUnavailable, ToolRefused, call_tool_as
 from services.common.money import Money
 from services.common.money import format as money_format
 from services.common.orders import PLACED_OR_LATER
+from services.common.run_context import RunContext
 from services.identity import audit, grants, keycloak_admin, links, token_source
-from services.identity.errors import DependencyUnavailable, IdentityError, LinkInvalid
+from services.identity.errors import (
+    DependencyUnavailable,
+    GrantError,
+    IdentityError,
+    LinkInvalid,
+)
 from services.safety import scope, visibility
 
 __all__ = [
@@ -102,9 +114,25 @@ FORM_TAKE_TURNS = "take_turns"
 FORM_REACTION = "reaction"
 FORM_PANTRY = "pantry"
 
+# A `/me` POST's run and tool (§3, §8).
+API_AGENT = "system:api"
+HOUSEHOLD_SERVER = "household"
+RECORD_PANTRY_CHECK = "record_pantry_check"
+PANTRY_CHECK_KINDS = ("verify", "out")
+
 # §8 page copy.
 SESSION_EXPIRED = "This page timed out. Write *my page* in WhatsApp for a new link."
+ACCESS_UNAVAILABLE = "We couldn't check your access just now. Try again in a minute."
 FORM_EXPIRED = "This page is out of date. Go back, reload it and try again."
+NOT_SAVED = "We couldn't save that. Try again in a minute."
+RENEW_NEEDED = "Your household agent's consent needs renewing before this can be saved."
+# A tool's refusal as a page: heading, message, status. Any other refusal is `_REFUSED`.
+_REFUSED = ("Not saved", "We couldn't save that.", 403)
+_REFUSED_PAGES = {
+    "not_adult": ("Not allowed", "Only an adult can change this.", 403),
+    "pantry_off": ("Not allowed", "Pantry tracking isn't on for your household yet.", 403),
+    "unknown_pantry_item": ("Not found", "We don't track that item.", 404),
+}
 LOCALE = "en"
 MEALS_SHOWN = 7
 SPENDING_WEEKS = 8
@@ -694,6 +722,128 @@ async def household_page(request: Request) -> Response:
     return _render(request, "household.html", context)
 
 
+# --- `/me` POSTs that call a tool ------------------------------------------------------
+
+
+async def _tool_run(
+    request: Request, session: Session, tool: str, args: dict[str, Any]
+) -> Response | None:
+    """A `/me` POST's run (§3): a new household `chat` run for the session person, committed
+    before `tool` is called as `system:api`, then ended by `api`. None when the tool ran,
+    else the page to show. A refusal ends the run `completed` with its reason, as ingest's
+    taps do; an outage ends it `error`."""
+    try:
+        async with _connect(request) as conn:
+            run_id = await runs.start(
+                conn,
+                household_id=session.household_id,
+                kind="chat",
+                trigger={"user_id": session.user_id, "source": "me"},
+            )
+    except GrantError:  # no run: nothing happened (identity-authz I-D25)
+        return _error("Not saved", RENEW_NEEDED, 403)
+    ctx = RunContext(run_id=run_id, agent_id=API_AGENT, conversation_id=None)
+    status, reason, page = "completed", tool, None
+    try:
+        await call_tool_as(HOUSEHOLD_SERVER, tool, args, ctx=ctx)
+    except ToolRefused as refused:
+        reason = refused.reason
+        page = _error(*_REFUSED_PAGES.get(reason, _REFUSED))
+    except GrantError as refused:
+        reason, page = refused.reason, _error("Not saved", RENEW_NEEDED, 403)
+    except IdentityError as refused:
+        reason, page = refused.reason, _error(*_REFUSED)
+    except DependencyUnavailable as down:
+        status, reason = "error", down.reason
+        page = _error("Try again soon", ACCESS_UNAVAILABLE, 503)
+    except AdapterUnavailable as down:
+        status, reason = "error", down.reason
+        page = _error("Not saved", NOT_SAVED, 503)
+    async with _connect(request) as conn:
+        await runs.finish(conn, run_id, API_AGENT, status, reason)
+    return page
+
+
+# --- pantry ---------------------------------------------------------------------------
+
+
+def _checked(age_hours: float) -> str:
+    """The "last checked" age, in whole days."""
+    days = int(age_hours // 24)
+    if days <= 0:
+        return "today"
+    return "yesterday" if days == 1 else f"{days} days ago"
+
+
+async def _pantry_items(q: scope.Scoped, session: Session, as_of: datetime) -> list[dict[str, Any]]:
+    """Each vocabulary item from `pantry.estimate` over the household's latest events. An
+    item with no event is Not sure, never checked."""
+    vocab = pantry.load_vocabulary()
+    rows = await q.fetch(
+        "SELECT DISTINCT ON (pantry_item) pantry_item, event_id, kind, ts FROM pantry_events"
+        " WHERE household_id = %(household)s AND pantry_item IS NOT NULL"
+        " ORDER BY pantry_item, event_id DESC"
+    )
+    latest = {
+        item: {"pantry_item": item, "event_id": event_id, "kind": kind, "ts": ts}
+        for item, event_id, kind, ts in rows
+    }
+    token = csrf_token(session, FORM_PANTRY)
+    items = []
+    for name in vocab.names:
+        state, checked = "unsure", None
+        if name in latest:
+            est = pantry.estimate(latest[name], vocab.window_days[name], as_of)
+            state = "at_home" if est.trusted else "unsure" if est.present else "out"
+            checked = _checked(est.age_hours)
+        items.append({"name": name, "state": state, "checked": checked, "csrf": token})
+    return items
+
+
+async def pantry_page(request: Request) -> Response:
+    """`GET /me/pantry` (§8, EX-I40). A child sees no household-wide row (§4), so no items."""
+    session = _session(request)
+    if session is None:
+        return _signed_out()
+    async with _connect(request) as conn:
+        viewer = await _viewer(conn, session)
+        if viewer is None:
+            return _signed_out()
+        q = scope.scoped(conn, scope.from_session(session))
+        context = await _frame(q, session, "pantry")
+        rows = await q.fetch("SELECT env, now() FROM households WHERE household_id = %(household)s")
+        env, as_of = rows[0]
+        adult = visibility.can_see(viewer, "pantry", None)
+        enabled = pantry.is_enabled(env)
+        context["enabled"] = enabled
+        context["can_correct"] = adult
+        context["items"] = await _pantry_items(q, session, as_of) if enabled and adult else []
+    return _render(request, "pantry.html", context)
+
+
+async def pantry_check(request: Request) -> Response:
+    """`POST /me/pantry/{pantry_item}` (§8, EX-I40): "Still have it" or "Ran out"."""
+    session = _session(request)
+    if session is None:
+        return _signed_out()
+    if not csrf_ok(session, FORM_PANTRY, await _posted_token(request)):
+        return _csrf_refused()
+    kind = (await request.form()).get("kind")
+    if kind not in PANTRY_CHECK_KINDS:
+        return _error("Not saved", "Go back, reload the page and try again.", 400)
+    async with _connect(request) as conn:
+        viewer = await _viewer(conn, session)
+    if viewer is None:
+        return _signed_out()
+    args = {
+        "pantry_item": request.path_params["pantry_item"],
+        "kind": kind,
+        "user_id": str(session.user_id),
+    }
+    refused = await _tool_run(request, session, RECORD_PANTRY_CHECK, args)
+    return refused or RedirectResponse("/me/pantry", status_code=303)
+
+
 # --- agents ---------------------------------------------------------------------------
 
 
@@ -984,6 +1134,8 @@ routes = [
     Route("/me/callback", callback, methods=["GET"]),
     Route("/me/consent/done", consent_done, methods=["GET"]),
     Route("/me/household", household_page, methods=["GET"]),
+    Route("/me/pantry", pantry_page, methods=["GET"]),
+    Route("/me/pantry/{pantry_item}", pantry_check, methods=["POST"]),
     Route("/me/agents", agents, methods=["GET"]),
     Route("/me/agents/{agent_id}/revoke", revoke, methods=["POST"]),
     Route("/me/history", history, methods=["GET"]),
