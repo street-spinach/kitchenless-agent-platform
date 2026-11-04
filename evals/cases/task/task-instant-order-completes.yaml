@@ -1,0 +1,18 @@
+# Evals §12 case 6 (AG8): an instant order asks only the requester for constraints, sends no
+# counter and books one courier.
+id: task-instant-order-completes
+category: task
+tags: [fast]
+model_modes: [stub, real]
+run: member_message
+input:
+  member: us-1-a-eval
+  text: "Get me a bean burrito now"
+expect:
+  - check: run_status
+    args: { status: completed }
+  - check: constraints_requests_sent
+    args: { n: 1 }
+  - check: counters_sent_at_most
+    args: { n: 0 }
+  - check: courier_booked_once

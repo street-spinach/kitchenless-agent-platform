@@ -1,0 +1,9 @@
+# Evals §12 case 16 (AG12): on the real model, the courier booked for a dinner has the
+# earliest offered window. Real mode only.
+id: decision-delivery-earliest-window
+category: decision
+tags: []
+model_modes: [real]
+run: busy_night_dinner
+expect:
+  - check: chose_earliest_window

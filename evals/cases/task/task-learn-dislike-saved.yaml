@@ -1,0 +1,14 @@
+# Evals §12 case 2 (AG5, AG6): a stated dislike is saved as a learned constraint.
+id: task-learn-dislike-saved
+category: task
+tags: []
+model_modes: [stub, real]
+run: member_message
+input:
+  member: us-1-c-eval
+  text: "I don't like mushrooms"
+expect:
+  - check: learned_dislike
+    args: { member: us-1-c-eval, value: mushrooms }
+  - check: reply_template
+    args: { name: dislike_saved }

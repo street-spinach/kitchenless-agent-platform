@@ -1,0 +1,9 @@
+# Evals §12 case 10 (AG4; replaces architecture's case, E-A5): the `choose_offer` explanation
+# stays within the limits of `check_rationale` and names the chosen seller.
+id: explanation-store-choice
+category: explanation
+tags: []
+model_modes: [stub, real]
+run: weekly_grocery_order
+expect:
+  - check: explanation_within_limits

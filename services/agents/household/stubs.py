@@ -43,7 +43,8 @@ LISTS: Mapping[str, list[dict[str, Any]]] = {
         {"item": "bananas", "qty": 1, "unit": "each"},
         {"item": "rice", "qty": 1, "unit": "each"},
     ],
-    "dinner": [{"item": "dinner for the household", "qty": 1, "unit": "each"}],
+    # `MOCK-DIN-CHICKEN-RICE` by its menu name: a seller's search must find it (evals §12).
+    "dinner": [{"item": "Grilled chicken and rice bowl", "qty": 1, "unit": "each"}],
 }
 
 
