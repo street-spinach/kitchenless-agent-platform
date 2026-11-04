@@ -1,0 +1,112 @@
+{#- /me/orders/{ref} (showcase.md §4). All text is built by services/api/story.py.
+
+Context, besides base.html's:
+  story       story.Story: summary, sellers, turns, checks, couriers, behind, spending_hidden
+  state_text  the order's state in words
+Amounts are none when the viewer may not see this order's spending (experience §4). -#}
+{% extends "base.html" %}
+{% from "base.html" import state_logo %}
+{% block title %}Order story{% endblock %}
+{% block content %}
+{% set s = story.summary %}
+<section class="card hero">
+  <h2>{{ s.title }}{% if s.seller %} from {{ s.seller }}{% endif %}</h2>
+  <p class="pill pill-{{ s.state_pill }}">{{ state_text }}</p>
+  {% if s.total %}<p><strong>{{ s.total }}</strong>{% if s.budget %} of {{ s.budget }} this week{% endif %}</p>{% endif %}
+  {% if s.bar_max %}<progress class="budget" value="{{ s.bar_value }}" max="{{ s.bar_max }}" aria-label="Share of this week's budget"></progress>{% endif %}
+  {% if s.window %}<p class="muted">{{ s.window }}</p>{% endif %}
+</section>
+{% if story.spending_hidden %}
+<p class="muted">Amounts and approvals show to the person who started this order.</p>
+{% endif %}
+
+<section class="card{% if not story.sellers %} state{% endif %}">
+  <h2>Who we asked</h2>
+  {% if story.sellers %}
+  <ul class="rows">
+    {% for seller in story.sellers %}
+    <li>
+      <div class="row">
+        <div>
+          <strong>{{ seller.name }}</strong>
+          {% if seller.first_offer %}<div class="muted">Offered {{ seller.first_offer }}{% if seller.final_offer != seller.first_offer %}, final {{ seller.final_offer }}{% endif %}</div>{% endif %}
+          {% if seller.unavailable %}<div><span class="pill pill-attention">Couldn't supply {{ seller.unavailable }}</span></div>{% endif %}
+        </div>
+        <span class="pill pill-{{ seller.outcome_pill }}">{{ seller.outcome }}</span>
+      </div>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  {{ state_logo() }}
+  <p class="muted">No sellers asked yet.</p>
+  {% endif %}
+</section>
+
+<section class="card{% if not story.turns %} state{% endif %}">
+  <h2>Negotiation</h2>
+  {% if story.turns %}
+  <ol class="timeline">
+    {% for turn in story.turns %}
+    <li class="dot-{{ turn.dot }}">
+      <strong>{{ turn.who }}</strong> {{ turn.action }}{% if turn.amount %} · {{ turn.amount }}{% endif %}
+      {% if turn.rationale %}<div class="muted">{{ turn.rationale }}</div>{% endif %}
+    </li>
+    {% endfor %}
+  </ol>
+  {% else %}
+  {{ state_logo() }}
+  <p class="muted">No offers yet.</p>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>Checks in code</h2>
+  <ul class="rows">
+    {% for check in story.checks %}
+    <li>
+      <div class="row">
+        <div>
+          <strong>{{ check.name }}</strong>
+          <div class="muted">{{ check.detail }}</div>
+        </div>
+        <span class="pill pill-{{ check.result_pill }}">{{ check.result }}</span>
+      </div>
+    </li>
+    {% endfor %}
+  </ul>
+</section>
+
+<section class="card{% if not story.couriers %} state{% endif %}">
+  <h2>Delivery</h2>
+  {% if story.couriers %}
+  <ul class="rows">
+    {% for courier in story.couriers %}
+    <li>
+      <div class="row">
+        <div>
+          <strong>{{ courier.name }}</strong>
+          <div class="muted">{% if courier.fee %}{{ courier.fee }}{% endif %}{% if courier.fee and courier.window %} · {% endif %}{% if courier.window %}{{ courier.window }}{% endif %}</div>
+        </div>
+        {% if courier.chosen %}<span class="pill pill-ok">Chosen</span>{% endif %}
+      </div>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  {{ state_logo() }}
+  <p class="muted">No courier quotes yet.</p>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>Behind the scenes</h2>
+  <ol class="timeline">
+    <li class="dot-ok">{{ story.behind.agents }} agents took part</li>
+    <li class="dot-ok">{{ story.behind.messages }} messages exchanged</li>
+    <li class="dot-ok">{{ story.behind.model_decisions }} decisions used the model, {{ story.behind.rule_decisions }} the rule default</li>
+    <li class="dot-ok">{{ story.behind.tokens }} tokens</li>
+    <li class="dot-ok">{{ story.behind.elapsed }} from start to finish</li>
+  </ol>
+</section>
+{% endblock %}

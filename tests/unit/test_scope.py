@@ -47,6 +47,8 @@ ALLOWLIST: dict[str, str] = {
     "services/mocks/control.py": "unscoped:control.reset",
     # Every household query through `scope.scoped` with the session's scope (I24).
     "services/api/routes/me.py": SCOPED,
+    # The order story, built for a `/me` page (showcase §4).
+    "services/api/story.py": SCOPED,
     # The eval runner reads one run's rows by run_id (agent-protocol P38), eval only.
     "evals/run.py": "unscoped:evals.run",
     # I39 step 12: the last callers moved off the "not moved" list. Shared helpers and

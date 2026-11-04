@@ -9,11 +9,12 @@ from starlette.applications import Starlette
 from starlette.templating import Jinja2Templates
 from starlette.testclient import TestClient
 
+from services.api import story
 from services.api.routes import me
 
 TEMPLATES = Path("services/api/templates")
 CSS = Path("services/api/static/me.css")
-PAGES = ("household", "pantry", "history", "agents", "band", "error")
+PAGES = ("household", "pantry", "history", "agents", "band", "error", "story")
 
 BASE: dict[str, Any] = {
     "person": {"name": "Maya"},
@@ -21,6 +22,27 @@ BASE: dict[str, Any] = {
     "tab": "household",
 }
 CONTEXTS: dict[str, dict[str, Any]] = {
+    "story": {
+        "story": story.Story(
+            summary=story.Summary(
+                title="Groceries",
+                seller="Store B",
+                state="placed",
+                state_pill="ok",
+                window="Thu 5 Nov 6:00 pm-7:00 pm",
+                total="$84.20",
+                budget="$150.00",
+                bar_value=8420,
+                bar_max=15000,
+            ),
+            sellers=[story.SellerRow("Store B", "$90.00", "$84.20", 1, "Won", "ok")],
+            turns=[story.Turn("Store B", "offered", "$90.00", "Best price.", "ok")],
+            checks=[story.Check("Allergens", "peanuts", "Passed", "ok")],
+            couriers=[story.CourierQuote("Swift", "$5.00", "Thu 5 Nov", True)],
+            behind=story.Behind(4, 12, 2, 3, 900, "14 s"),
+        ),
+        "state_text": "Ordered",
+    },
     "household": {
         "household_wide": True,
         "people": [{"name": "Maya", "allergies": ["tree nuts"], "diets": ["vegetarian"]}],
