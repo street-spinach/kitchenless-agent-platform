@@ -1772,6 +1772,71 @@ def no_spend_after_revoke(trace: Trace, case: dict, *, db: Db | None = None) -> 
     return True, f"no spend after the revoke; {len(tables['orders'])} order(s) checked"
 
 
+#   Pantry (pantry.md §8, PT-A11) -------------------------------------------------------------
+
+PANTRY_CHOICES = frozenset({"pantry_skipped", "pantry_kept", "pantry_unmatched"})
+
+
+def _build_list_rows(trace: Trace) -> list[dict[str, Any]]:
+    return [r for r in _rows(trace, "decision") if r["payload"].get("node") == "build_list"]
+
+
+def _requested_names(request: dict[str, Any]) -> list[Any]:
+    """Each `items[].item` of a `quote_request`; a malformed item gives None, which no pantry
+    row names, so the check fails closed."""
+    items = _body(request).get("items") or []
+    return [i.get("item") if isinstance(i, dict) else None for i in items]
+
+
+@_declare(invariant=True)
+def pantry_decisions_traced(trace: Trace, case: dict) -> Result:
+    """Pantry §8. A pantry row is a `build_list` decision row whose `choice` is in
+    `PANTRY_CHOICES`. (a) The pantry rows have distinct `facts.list_name`; (b) every
+    `items[].item` of every `quote_request` has exactly one pantry row; (c) no `pantry_skipped`
+    name appears in any `quote_request`; (d) every kept or unmatched name appears in a
+    `quote_request` or has a `dislike_dropped` row with explanation `item=<name>`. With no
+    `quote_request`, (b) to (d) hold trivially. A pantry row with no `facts.list_name` fails."""
+    build_list = _build_list_rows(trace)
+    pantry = [r for r in build_list if r["payload"].get("choice") in PANTRY_CHOICES]
+    named = [((r["payload"].get("facts") or {}).get("list_name"), r) for r in pantry]
+    names = [name for name, _ in named]
+    problems = [f"seq {r['seq']}: pantry row has no facts.list_name" for n, r in named if not n]
+    repeated = sorted({_s(n) for n in names if n and names.count(n) > 1})
+    if repeated:
+        problems.append(f"more than one pantry row for {repeated}")
+    requests = _messages(trace, "quote_request")
+    requested = [(r, _requested_names(r)) for r in requests]
+    for request, items in requested:
+        where = f"quote_request seq {request['seq']}"
+        problems += [
+            f"{where}: {item!r} has {names.count(item)} pantry row(s)"
+            for item in items
+            if names.count(item) != 1
+        ]
+    sent = [item for _, items in requested for item in items]
+    dropped = {
+        r["payload"].get("explanation")
+        for r in build_list
+        if r["payload"].get("choice") == "dislike_dropped"
+    }
+    for name, row in named if requests else []:
+        skipped = row["payload"].get("choice") == "pantry_skipped"
+        if skipped and name in sent:
+            problems.append(f"skipped item {name!r} sent in a quote_request")
+        if not skipped and name not in sent and f"item={name}" not in dropped:
+            problems.append(f"kept item {name!r} not requested and not dislike_dropped")
+    if problems:
+        return False, "; ".join(problems)
+    return True, f"{len(pantry)} pantry row(s), {len(requests)} quote_request(s)"
+
+
+@_declare(invariant=True)
+def no_quote_requests(trace: Trace, case: dict) -> Result:
+    """The run sent no `quote_request` message (pantry §8)."""
+    n = len(_messages(trace, "quote_request"))
+    return n == 0, f"{n} quote_request message(s)"
+
+
 CHECKS: dict[str, Check] = {
     "outcome_recorded": outcome_recorded,
     "no_profile_fields_sent_to_business": no_profile_fields_sent_to_business,
@@ -1835,4 +1900,7 @@ CHECKS: dict[str, Check] = {
     "member_constraints_added": member_constraints_added,
     "restatement_names_unsaved": restatement_names_unsaved,
     "no_item_with_allergen": no_item_with_allergen,
+    # Pantry (pantry.md §8).
+    "pantry_decisions_traced": pantry_decisions_traced,
+    "no_quote_requests": no_quote_requests,
 }

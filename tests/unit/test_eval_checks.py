@@ -651,3 +651,108 @@ def test_no_spend_after_revoke_needs_unplaced_orders_failed() -> None:
 )
 def test_no_spend_after_revoke_fails_closed(db: dict[str, Any] | None) -> None:
     assert not no_spend_after_revoke([], {}, db=db)[0]
+
+
+# --- pantry checks (pantry.md §8) -------------------------------------------------------------
+
+
+def build_list_row(seq: int, choice: str, explanation: str, **payload: Any) -> dict[str, Any]:
+    body = {"node": "build_list", "choice": choice, "explanation": explanation, **payload}
+    return {"seq": seq, "kind": "decision", "payload": body, "agent_id": HH}
+
+
+def pantry_row(seq: int, choice: str, name: str) -> dict[str, Any]:
+    return build_list_row(seq, choice, f"item={name}", facts={"list_name": name})
+
+
+def requested(seq: int, *names: str, to: str = SELLER) -> dict[str, Any]:
+    return msg(seq, "quote_request", {"items": [{"item": n, "qty": 1} for n in names]}, to=to)
+
+
+PANTRY_ROWS = [
+    build_list_row(1, "stub", ""),  # the model's own build_list row is not a pantry row
+    pantry_row(2, "pantry_skipped", "milk"),
+    pantry_row(3, "pantry_kept", "rice"),
+    pantry_row(4, "pantry_unmatched", "kale"),
+]
+
+
+@pytest.mark.parametrize("name", ["pantry_decisions_traced", "no_quote_requests"])
+def test_pantry_checks_registered_invariant(name: str) -> None:
+    assert CHECKS[name].invariant is True  # type: ignore[attr-defined]
+
+
+def test_pantry_decisions_traced_passes() -> None:
+    trace = [*PANTRY_ROWS, requested(5, "rice", "kale"), requested(6, "rice", "kale", to="g:b")]
+    passed, detail = checks.pantry_decisions_traced(trace, {})
+    assert passed and "3 pantry row(s), 2 quote_request(s)" in detail
+
+
+def test_pantry_decisions_traced_dislike_dropped_kept_item_passes() -> None:
+    dropped = build_list_row(5, "dislike_dropped", "item=kale")
+    assert checks.pantry_decisions_traced([*PANTRY_ROWS, dropped, requested(6, "rice")], {})[0]
+
+
+def test_pantry_decisions_traced_no_quote_request_holds_trivially() -> None:
+    assert checks.pantry_decisions_traced(PANTRY_ROWS, {})[0]
+    assert checks.pantry_decisions_traced([], {})[0]
+
+
+def test_pantry_decisions_traced_rule_a_runs_without_a_quote_request() -> None:
+    passed, detail = checks.pantry_decisions_traced(
+        [*PANTRY_ROWS, pantry_row(5, "pantry_kept", "milk")], {}
+    )
+    assert not passed and "more than one pantry row for ['milk']" in detail
+
+
+def test_pantry_decisions_traced_needs_a_list_name() -> None:
+    no_facts = build_list_row(1, "pantry_kept", "item=rice")
+    passed, detail = checks.pantry_decisions_traced([no_facts], {})
+    assert not passed and "seq 1" in detail and "no facts.list_name" in detail
+
+
+@pytest.mark.parametrize(
+    ("extra", "problem"),
+    [
+        ([requested(5, "rice", "kale", "bread")], "'bread' has 0 pantry row(s)"),
+        ([msg(5, "quote_request", {"items": ["rice", "kale"]})], "None has 0 pantry row(s)"),
+        ([requested(5, "rice", "kale", "milk")], "skipped item 'milk' sent"),
+        ([requested(5, "rice", "kale"), requested(6, "milk", to="g:b")], "skipped item 'milk'"),
+        ([requested(5, "rice")], "kept item 'kale' not requested"),
+        (
+            [requested(5, "rice"), build_list_row(6, "dislike_kept", "item=kale dislikes=kale")],
+            "kept item 'kale' not requested",
+        ),
+        (
+            [requested(5, "rice"), build_list_row(6, "dislike_dropped", "item=rice")],
+            "kept item 'kale' not requested",
+        ),
+    ],
+    ids=[
+        "no-row",
+        "malformed-item",
+        "skipped-sent",
+        "skipped-sent-to-one-seller",
+        "kept-missing",
+        "dislike-kept-is-not-dropped",
+        "dropped-row-names-another-item",
+    ],
+)
+def test_pantry_decisions_traced_fails(extra: list[dict[str, Any]], problem: str) -> None:
+    passed, detail = checks.pantry_decisions_traced([*PANTRY_ROWS, *extra], {})
+    assert not passed and problem in detail
+
+
+def test_pantry_rows_of_other_nodes_do_not_count() -> None:
+    other = pantry_row(1, "pantry_kept", "rice")
+    other["payload"]["node"] = "choose_offer"
+    passed, detail = checks.pantry_decisions_traced([other, requested(2, "rice")], {})
+    assert not passed and "'rice' has 0 pantry row(s)" in detail
+
+
+def test_no_quote_requests() -> None:
+    courier = msg(2, "delivery_quote_request", {}, to=COURIER)
+    assert checks.no_quote_requests([reply(1, "nothing_needed"), courier], {})[0]
+    assert checks.no_quote_requests([], {})[0]
+    passed, detail = checks.no_quote_requests([requested(3, "rice")], {})
+    assert not passed and "1 quote_request" in detail
