@@ -526,6 +526,19 @@ def _start_run(scenario: str) -> Callable[[dict[str, Any]], uuid.UUID]:
     return start
 
 
+def start_member_message(case: dict[str, Any]) -> uuid.UUID:
+    """`POST /runs` with the case's `input`, from that member (evals E-A6)."""
+    body: dict[str, Any] = {
+        "scenario": MEMBER_MESSAGE,
+        "household_id": case.get("household", HOUSEHOLD),
+        "member": case["input"]["member"],
+        "text": case["input"]["text"],
+    }
+    if case.get("overrides"):
+        body["overrides"] = case["overrides"]
+    return uuid.UUID(post_json("/runs", body)["run_id"])
+
+
 def start_pair(case: dict[str, Any]) -> uuid.UUID:
     """`POST /runs` for two eval households. The checks read the first household's run."""
     body: dict[str, Any] = {
@@ -654,6 +667,7 @@ SCENARIOS: dict[str, Callable[[dict[str, Any]], uuid.UUID]] = {
     "weekly_grocery_order": _start_run("weekly_grocery_order"),
     PAIR: start_pair,
     "busy_night_dinner": _start_run("busy_night_dinner"),
+    MEMBER_MESSAGE: start_member_message,
     A2A_DEMO: start_a2a,
 }
 

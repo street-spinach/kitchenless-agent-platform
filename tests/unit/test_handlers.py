@@ -89,7 +89,9 @@ class FakeStore:
 
 
 class World:
-    def __init__(self, answers: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self, answers: dict[str, Any] | None = None, overrides: dict[str, Any] | None = None
+    ) -> None:
         self.run_id = uuid.uuid4()
         self.order_id = uuid.uuid4()
         self.traces = mf.FakeTraces()
@@ -98,7 +100,7 @@ class World:
         self.store = FakeStore()
         self.handler = SellerHandler(
             "grocery",
-            model=sf.chooser(self.stubs, self.traces),
+            model=sf.chooser(self.stubs, self.traces, overrides),
             traces=self.traces,
             store=self.store,
             call_tool=self.seller,
@@ -269,6 +271,28 @@ def test_counter_allowed_only_while_round_is_zero() -> None:
     assert offer.body["total_minor"] == buyer  # the default: agree
     assert offer.body["round"] == 2 and offer.body["final"] is True
     assert w.store.quotes[q.quote_id].status == "countered"
+
+
+def test_stub_counter_reject_sends_reject_at_a_price_it_would_agree() -> None:
+    w = World(overrides={"STUB_COUNTER_REJECT": True})
+    q = w.quote()
+    result = w.counter(q, _floor(q) + 10)  # the rule default here is `agree`
+    [decision] = _decisions(w, "respond_to_counter")
+    assert decision["model_pick"] == {"action": "reject"}
+    assert (decision["source"], decision["reason"]) == ("model", None)
+    [reject] = result.messages
+    assert reject.type == "reject" and reject.body["reason"] == "price"
+    stored = w.store.quotes[q.quote_id]
+    assert (stored.status, stored.closed_by) == ("rejected", "seller")
+
+
+def test_stub_counter_reject_leaves_other_choices_alone() -> None:
+    w = World(overrides={"STUB_COUNTER_REJECT": True})
+    w.seller.stock[MILK] = 0
+    [offer] = w.step("quote_request", sf.request_body(w.order_id, [("whole milk", 2)])).messages
+    assert offer.type == "offer"
+    [decision] = _decisions(w, "rank_substitutes")
+    assert decision["reason"] is None
 
 
 def test_accept_not_allowed_below_floor_total() -> None:
