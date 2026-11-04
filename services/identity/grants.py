@@ -14,6 +14,8 @@
     per-client consent revoke (a failure writes `keycloak_revoke_failed` and is not
     retried), then the revoke notice `consent_revoked` with a Renew button and
     `ref = {grant, <grant_id>}` (experience §6, EX-I19).
+*   `renew_body` is the renew text `consent_renewal` of a run that ended on a grant reason
+    (§12; experience §6, EX-I19).
 *   `mark_refused` handles Keycloak's `invalid_grant` (§12 failures).
 *   `client_assertion` is the `private_key_jwt` assertion for the token endpoint.
 """
@@ -53,6 +55,7 @@ __all__ = [
     "encrypt",
     "load_active",
     "mark_refused",
+    "renew_body",
     "revoke",
 ]
 
@@ -61,6 +64,8 @@ log = logging.getLogger(__name__)
 GRANT_DAYS = 30
 NONCE_BYTES = 12
 ASSERTION_SECONDS = 60
+# `revoke_reason` of a grant Keycloak refused: nobody revoked it, so no notice was sent.
+KEYCLOAK_REFUSED = "keycloak_invalid_grant"
 
 # §6 scopes per agent class, with the agents amendment's `constraints:write` (#186).
 CLASS_SCOPES: dict[str, tuple[str, ...]] = {
@@ -281,10 +286,16 @@ async def load_active(conn: AsyncConnection, agent_id: str, user_id: UUID | None
 
 
 async def revoke(
-    conn: AsyncConnection, grant_id: UUID, revoked_by: UUID | None, revoke_reason: str
+    conn: AsyncConnection,
+    grant_id: UUID,
+    revoked_by: UUID | None,
+    revoke_reason: str,
+    *,
+    via: str | None = None,
 ) -> bool:
     """§11 step 1: mark the grant `revoked` and write `consent_revoked`, in one
-    transaction. Returns whether an active grant was revoked."""
+    transaction. `via` goes in the audit row's `detail` (`panel`, §11). Returns whether an
+    active grant was revoked."""
     async with conn.transaction():
         cur = await unscoped(conn, "grants").execute(
             "UPDATE agent_grants SET status = 'revoked', revoked_at = now(), revoked_by = %s,"
@@ -304,7 +315,7 @@ async def revoke(
             agent_id=agent_id,
             household_id=household_id,
             grant_id=grant_id,
-            detail={"reason": revoke_reason},
+            detail={"reason": revoke_reason} | ({"via": via} if via else {}),
         )
     return True
 
@@ -428,6 +439,37 @@ async def _revoke_notice(conn: AsyncConnection, grant_id: UUID) -> None:
         await runs.finish(conn, run_id, NOTICE_FROM, "completed", "grant_revoked")
 
 
+# A run's agent's latest grant, for the renew text. `grant_missing` has none.
+_RENEW_GRANT_SQL = """
+SELECT g.grant_id, g.status, g.revoke_reason,
+       CASE WHEN m.role = 'child' THEN g.consented_by ELSE g.user_id END
+FROM agent_grants g
+LEFT JOIN household_members m ON m.household_id = g.household_id AND m.user_id = g.user_id
+WHERE g.agent_id = %s
+ORDER BY g.created_at DESC LIMIT 1
+"""
+
+
+async def renew_body(conn: AsyncConnection, agent_id: str, requester: Any) -> dict[str, Any] | None:
+    """The `whatsapp_out` body of the renew text, to the grant holder (for a child, the
+    guardian who consented; with no grant, `requester`). `None` when `revoke` was called by
+    a person or the panel: `after_revoke`'s notice already carries the Renew button."""
+    cur = await unscoped(conn, "grants").execute(_RENEW_GRANT_SQL, (agent_id,))
+    row = await cur.fetchone()
+    body: dict[str, Any] = {
+        "user_id": str(requester),
+        "template": "consent_renewal",
+        "params": {},
+        "buttons": [RENEW_BUTTON],
+    }
+    if row is None:
+        return body
+    grant_id, status, revoke_reason, holder = row
+    if status == "revoked" and revoke_reason != KEYCLOAK_REFUSED:
+        return None
+    return body | {"user_id": str(holder), "ref": {"kind": "grant", "id": str(grant_id)}}
+
+
 async def mark_refused(conn: AsyncConnection, grant_id: UUID) -> None:
     """Keycloak refused the grant (`invalid_grant`): `expired` past its expiry (writes
     `grant_expired`), otherwise `revoked` with `keycloak_invalid_grant`."""
@@ -443,7 +485,7 @@ async def mark_refused(conn: AsyncConnection, grant_id: UUID) -> None:
         if row["past_expiry"]:
             await _expire(conn, row)
         else:
-            await revoke(conn, grant_id, None, "keycloak_invalid_grant")
+            await revoke(conn, grant_id, None, KEYCLOAK_REFUSED)
 
 
 def client_assertion(client_id: str) -> str:

@@ -242,6 +242,7 @@ class HouseholdState(TypedDict, total=False):
     approver_user_id: str | None  # who the pending approval asks (`request_approval`)
     accepts: int  # `accept` messages decided so far
     accept_delay_rounds: int  # the run override `STUB_ACCEPT_DELAY_ROUNDS`
+    negotiate_hold_seconds: int  # the run override `STUB_NEGOTIATE_HOLD_SECONDS`
     offer_ttl_seconds: int
     # The order's shortfall (agent-protocol §10): id, seller, lines, picks, status, the
     # members it was relayed to, the refused lines and the amended order.
@@ -250,7 +251,8 @@ class HouseholdState(TypedDict, total=False):
     scope: str  # "household" (default) or "solo"
     take_turns: bool  # `get_household_rules`, snapshotted by `start_order`
     turn_index: int
-    household_allergens: list[str]  # every member's allergens, for a solo order
+    household_allergens: list[str]  # every member's allergens, from Postgres
+    household_diets: list[str]  # every member's diets, from Postgres (not on a solo order)
     turn_holder: str | None  # the user id whose dislikes come first this run
     counter: dict[str, Any] | None  # {seller, from_minor, to_minor} of our one counter
     explanation: str | None  # the latest explanation sentence (choose_offer)
@@ -674,6 +676,12 @@ def build_graph(
         if seconds > 0:
             await sleep(seconds)
 
+    async def negotiate_hold(state: HouseholdState) -> None:
+        """`STUB_NEGOTIATE_HOLD_SECONDS` (identity-authz I35): stub mode only."""
+        seconds = int(state.get("negotiate_hold_seconds") or 0)
+        if model.mode == "stub" and seconds > 0:
+            await sleep(seconds)
+
     async def ignore(state: HouseholdState) -> dict[str, Any]:
         reason = {"offer": "late_offer"}.get(state["message_type"], "ignored")
         await trace_decision(state, "ignore", reason)
@@ -710,6 +718,17 @@ def build_graph(
                 raise ValueError(f"the requester has no consumer agent in {state['household_id']}")
             found = await tool(state, "get_household_allergens", {})
             update["household_allergens"] = sorted(str(a) for a in found.get("allergens") or [])
+        else:
+            # Every member's allergies and diets are read here, not asked for: a member whose
+            # consumer agent has no grant answers with nothing (identity-authz I-CUJ 11).
+            found = await tool(state, "get_constraints", {"user_id": min(members.values())})
+            rows = found.get("members") or []
+            update["household_allergens"] = sorted(
+                {str(a) for row in rows for a in row.get("allergies") or []}
+            )
+            update["household_diets"] = sorted(
+                {str(d) for row in rows for d in row.get("diets") or []}
+            )
         out = list(state.get("outgoing") or [])
         for agent_id, user_id in sorted(members.items()):
             body = {"order_id": state["order_id"], "user_id": user_id}
@@ -749,13 +768,17 @@ def build_graph(
         members = dict(state.get("members") or {})
         solo = (state.get("scope") or HOUSEHOLD_SCOPE) == SOLO_SCOPE
         codes = list(constraints.values())
-        # Every member's allergens; a solo order adds the household's (agents §6).
-        household = {"allergens": list(state.get("household_allergens") or [])}
+        # What the members answered, plus every member's allergens (agents §6) and, unless
+        # solo, diets (identity-authz I-CUJ 11).
+        household = {
+            "allergens": list(state.get("household_allergens") or []),
+            "diets": list(state.get("household_diets") or []),
+        }
         # Dislike values only, never tied to a member.
         system = BUILD_LIST_PROMPT.format(
             kind=state["kind"],
             people=1 if solo else (len(members) or 1),
-            diets=_codes(codes, "diets"),
+            diets=_codes([*codes, household], "diets"),
             allergens=_codes([*codes, household], "allergens"),
             dislikes=_codes(codes, "dislikes"),
             pantry_names=", ".join(sorted(vocab.names)) if vocab is not None else NO_CODES,
@@ -879,8 +902,8 @@ def build_graph(
         for codes in (state.get("constraints") or {}).values():
             allergens.update(codes["allergens"])
             diets.update(codes["diets"])
-        # `household_allergens` is set only for a solo order (agents §6).
         allergens.update(state.get("household_allergens") or [])
+        diets.update(state.get("household_diets") or [])
         now = clock()
         start, end = WINDOW_START, WINDOW_END
         if (state.get("scope") or HOUSEHOLD_SCOPE) == SOLO_SCOPE:
@@ -932,6 +955,7 @@ def build_graph(
                 {"order_id": state["order_id"], "expected": "quoting", "new": "negotiating"},
             )
             update["phase"] = NEGOTIATING
+            await negotiate_hold(state)
         offers = valid_offers(state, clock())
         if not offers:
             return {**update, "decision": "no_offers"}
@@ -1691,6 +1715,7 @@ class HouseholdGraph:
                 approver_user_id=None,
                 accepts=0,
                 accept_delay_rounds=_int(run.overrides.get("STUB_ACCEPT_DELAY_ROUNDS"), 0),
+                negotiate_hold_seconds=_int(run.overrides.get("STUB_NEGOTIATE_HOLD_SECONDS"), 0),
                 offer_ttl_seconds=_int(
                     run.overrides.get("OFFER_TTL_SECONDS"), self._offer_ttl_seconds
                 ),

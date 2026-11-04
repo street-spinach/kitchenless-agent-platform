@@ -49,6 +49,8 @@ class FakeSeller:
     stock: dict[str, int] = field(default_factory=lambda: {k: v[3] for k, v in CATALOG.items()})
     calls: list[dict[str, Any]] = field(default_factory=list)
     refuse_place: str | None = None
+    # Raised by `place_order`, as `call_tool_as` raises a `grant_*` refusal.
+    place_error: Exception | None = None
     # The `amend_order` result to return, or the reason to refuse it with.
     amend_result: dict[str, Any] | None = None
     refuse_amend: str | None = None
@@ -87,6 +89,8 @@ class FakeSeller:
                 )
             return {"currency": "USD", "lines": lines}
         if tool == "place_order":
+            if self.place_error:
+                raise self.place_error
             if self.refuse_place:
                 raise ToolRefused(self.refuse_place)
             return {

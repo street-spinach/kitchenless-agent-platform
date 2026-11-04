@@ -5,8 +5,10 @@
 *   `quote(items)`: price and availability for each requested `{sku, qty}`.
 *   `place_order(order_id, quote_id, items_hash, delivery_agent_id)` *guarded*: relation
     `agent member_of org`; limits: the order is `authorized` with this seller and the same
-    `items_hash`, and `limits.check_coverage(<delivery_agent_id card>, households.zone_id)`
-    passes; key `idempotency_key(order_id, "place_order", <seller>)`. Its state change
+    `items_hash`, `limits.check_household_grant` passes (identity-authz I-D22, not for a
+    replay of a placed order, which finishes) and
+    `limits.check_coverage(<delivery_agent_id card>, households.zone_id)` passes; key
+    `idempotency_key(order_id, "place_order", <seller>)`. Its state change
     sets `placed`, `delivery_agent_id` and `external_order_id` together.
 *   `amend_order(order_id, shortfall_id, picks)` *guarded* (agent-protocol §10
     "Amending", P26): relation `agent member_of org`; limits: the order is this seller's
@@ -223,6 +225,8 @@ class SellerTools:
                 raise GuardRefused(INVALID_STATE)
             if order["items_hash"] != items_hash:
                 raise GuardRefused(ITEMS_CHANGED)
+            if not replay:
+                await limits.check_household_grant(conn, order["household_id"])
             try:
                 courier = await directory.card(conn, delivery_agent_id)
             except directory.UnknownAgent:

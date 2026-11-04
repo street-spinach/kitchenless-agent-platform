@@ -96,6 +96,8 @@ def _seed(pg: str) -> uuid.UUID:
                 (SELLER, item["sku"], STOCK),
             )
         _clients(conn)
+        # `place_order` needs the household agent's active grant (identity-authz I-D22).
+        w.grant_household(conn, HOUSEHOLD)
         run_id = uuid.uuid4()
         conn.execute(
             "INSERT INTO runs (run_id, household_id, kind, trigger, modes)"
@@ -246,3 +248,16 @@ def test_place_order_refuses_another_sellers_order(
     assert e.value.reason == seller.AUTHZ_DENIED
     [order] = _query(pg, "SELECT state FROM orders WHERE order_id = %s", order_id)
     assert order["state"] == "authorized"
+
+
+def test_replay_of_a_placed_order_finishes_after_revoke(
+    pg: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Identity-authz §11: placed orders finish, so the seller's retry gets its result."""
+    run_id = _seed(pg)
+    order_id = _authorized_order(pg, run_id, SELLER)
+    result = _place(pg, monkeypatch, run_id, order_id)
+    with psycopg.connect(pg) as conn:
+        conn.execute("UPDATE agent_grants SET status = 'revoked'")
+    assert _place(pg, monkeypatch, run_id, order_id) == result
+    assert len(_query(pg, "SELECT * FROM mock_orders")) == 1

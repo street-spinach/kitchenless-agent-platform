@@ -17,9 +17,10 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
-from services.common import db, ids
+from services.common import db, ids, orders
 from services.common.money import Money
 from services.identity import fga
+from services.mcp.grocery import server as grocery
 from services.mcp.household import server as household
 from services.mcp.meta import CallContext
 from services.safety import limits
@@ -295,3 +296,86 @@ def test_no_budget_spend_fails_closed_request_still_records_band(
     _request_approval(pg, monkeypatch, run_id, order_id, 12_000)
     [approval] = _query(pg, "SELECT status, limits FROM approvals WHERE order_id = %s", order_id)
     assert (approval["status"], approval["limits"]) == ("pending", ["band"])
+
+
+def _authorized(pg: str, run_id: uuid.UUID) -> uuid.UUID:
+    """An `authorized` order of `SELLER`, whose card and client can call `place_order`."""
+    order_id = _order(pg, run_id)
+    _exec(
+        pg,
+        "UPDATE orders SET state = 'authorized', seller_agent_id = %s, items_hash = %s"
+        " WHERE order_id = %s",
+        SELLER,
+        orders.items_hash([]),
+        order_id,
+    )
+    _exec(pg, "UPDATE agent_cards SET vendor = 'mock' WHERE agent_id = %s", SELLER)
+    _exec(pg, "UPDATE agent_cards SET owner_ref = 'org:mock' WHERE agent_id = %s", SELLER)
+    _exec(
+        pg,
+        "INSERT INTO agent_clients (agent_id, client_id, kind) VALUES (%s, %s, 'service')",
+        SELLER,
+        ids.keycloak_client_id(SELLER),
+    )
+    return order_id
+
+
+def _seller_place(
+    pg: str, monkeypatch: pytest.MonkeyPatch, run_id: uuid.UUID, order_id: uuid.UUID
+) -> dict[str, Any]:
+    ctx = CallContext(
+        run_id=run_id,
+        agent_id=SELLER,
+        conversation_id=None,
+        attempt=1,
+        token=w.service_token(SELLER),
+        env="live",
+        modes={},
+        on_behalf_of="org:mock",
+    )
+    return _with_pool(
+        pg,
+        monkeypatch,
+        lambda: grocery.place_order(
+            ctx,
+            order_id=order_id,
+            quote_id=ids.quote_id(order_id),
+            items_hash=orders.items_hash([]),
+            delivery_agent_id="delivery:none",
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "UPDATE agent_grants SET status = 'revoked'",
+        "UPDATE agent_grants SET status = 'expired'",
+        "UPDATE agent_grants SET expires_at = now() - interval '1 minute'",
+        "DELETE FROM agent_grants",
+    ],
+)
+def test_place_order_refused_after_household_revoke(
+    pg: str, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    """I-D22: on a service token, only this limit stops an order already authorized."""
+    run_id = _seed(pg, band=None, budget=20000)
+    order_id = _authorized(pg, run_id)
+    _exec(pg, change)
+    with pytest.raises(GuardRefused) as refused:
+        _seller_place(pg, monkeypatch, run_id, order_id)
+    assert refused.value.reason == "grant_revoked"
+    [order] = _query(pg, "SELECT state FROM orders WHERE order_id = %s", order_id)
+    assert order["state"] == "authorized"
+    assert _query(pg, "SELECT 1 FROM mock_orders") == []
+    [row] = _query(pg, "SELECT payload FROM agent_traces WHERE kind = 'tool_result'")
+    assert (row["payload"]["refused"], row["payload"]["reason"]) == (True, "grant_revoked")
+
+
+def test_active_household_grant_passes_the_limit(pg: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The refusal above is the grant's: with it active, the next limit (the courier) runs."""
+    run_id = _seed(pg, band=None, budget=20000)
+    order_id = _authorized(pg, run_id)
+    with pytest.raises(GuardRefused) as refused:
+        _seller_place(pg, monkeypatch, run_id, order_id)
+    assert refused.value.reason == "invalid_courier"

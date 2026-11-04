@@ -206,7 +206,10 @@ async def run_guarded(
             ctx.authz_form = authz_form
             # Step 3: the limits.
             if limits is not None:
-                await limits(conn)
+                try:
+                    await limits(conn)
+                except IdentityError as e:
+                    raise GuardRefused(e.reason) from None
             # Step 4: the idempotency key.
             claimed: idempotency.New | idempotency.Done | idempotency.Conflict
             claimed = idempotency.New()

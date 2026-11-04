@@ -78,6 +78,7 @@ from services.common.protocol.a2a import (
     TASK_STATE_WORKING,
 )
 from services.common.trace import TraceStore
+from services.identity import grants
 from services.mocks.control import SETUP_KEYS
 from services.safety.scope import Unscoped, unscoped
 
@@ -117,11 +118,14 @@ STUB_OVERRIDES = frozenset(
         "STUB_OUT_OF_BOUNDS",
         "STUB_DUPLICATE_MESSAGE",
         "STUB_ACCEPT_DELAY_ROUNDS",
+        "STUB_NEGOTIATE_HOLD_SECONDS",
         "STUB_SHORTFALL_UNSAFE_SUBSTITUTE",
         "STUB_COUNTER_REJECT",
     }
 )
 MEMBER_MESSAGE = "member_message"
+# `revoke_reason` of the `revoke` runner step (identity-authz I35).
+REVOKE_REASON = "eval"
 
 EVAL_ENV = "eval"
 # evals.md §4: the default eval household, and the pair's default households.
@@ -301,6 +305,19 @@ def _validate_setup(case: dict[str, Any], source: str) -> None:
             raise CaseError(f"{source}: setup key {name!r} must be {key.type.__name__}")
 
 
+def _validate_revoke(case: dict[str, Any], source: str) -> None:
+    """`revoke: {agent_id, at_state}` (identity-authz I35)."""
+    if "revoke" not in case:
+        return
+    spec = case["revoke"]
+    if not isinstance(spec, dict) or set(spec) != {"agent_id", "at_state"}:
+        raise CaseError(f"{source}: revoke must have exactly agent_id and at_state")
+    if not (isinstance(spec["agent_id"], str) and spec["agent_id"]):
+        raise CaseError(f"{source}: revoke agent_id must be an agent id")
+    if spec["at_state"] not in orders.STATES:
+        raise CaseError(f"{source}: revoke at_state must be an order state")
+
+
 def _validate_a2a(case: dict[str, Any], source: str) -> None:
     """`a2a_steps` (agent-protocol P38): `{op: send, type, message?, error?, total_percent?}`,
     `{op: get}` or `{op: cancel}`, opening with the `quote_request` that starts the run."""
@@ -364,6 +381,7 @@ def validate_case(case: Any, source: str, categories: set[str]) -> dict[str, Any
         raise CaseError(f"{source}: unknown scenario {case['run']!r}")
     _validate_modes(case, source)
     _validate_setup(case, source)
+    _validate_revoke(case, source)
     _validate_a2a(case, source)
     _validate_expect(case, source)
     return case
@@ -640,7 +658,7 @@ SCENARIOS: dict[str, Callable[[dict[str, Any]], uuid.UUID]] = {
 }
 
 
-# --- runner steps while the run is open (approve_as, inject, shortfall, a2a_steps) -----------
+# --- runner steps while the run is open (approve_as, inject, shortfall, a2a_steps, revoke) ---
 
 # A step is polled with the run's current trace until it returns True (done).
 Step = Callable[[list[dict[str, Any]]], bool]
@@ -860,6 +878,38 @@ def inject_step(dsn: str, run_id: uuid.UUID, spec: dict[str, Any]) -> Step:
     return step
 
 
+_ACTIVE_GRANTS_SQL = "SELECT grant_id FROM agent_grants WHERE agent_id = %s AND status = 'active'"
+
+
+def revoke_grants(dsn: str, agent_id: str) -> int:
+    """`grants.revoke` every active grant of `agent_id`; returns how many were revoked."""
+
+    async def go() -> int:
+        async with await psycopg.AsyncConnection.connect(dsn) as conn:
+            cur = await unscoped(conn, "evals.run").execute(_ACTIVE_GRANTS_SQL, (agent_id,))
+            found = [row[0] for row in await cur.fetchall()]
+            done = [await grants.revoke(conn, g, None, REVOKE_REASON) for g in found]
+            await conn.commit()
+            return sum(done)
+
+    return asyncio.run(go())
+
+
+def revoke_step(dsn: str, run_id: uuid.UUID, spec: dict[str, Any]) -> Step:
+    """`revoke: {agent_id, at_state}`: when the run's order is in `at_state`, revoke that
+    agent's grant (identity-authz I35)."""
+
+    def step(trace: list[dict[str, Any]]) -> bool:
+        order = run_order(dsn, run_id)
+        if order is None or order["state"] != spec["at_state"]:
+            return False
+        if revoke_grants(dsn, spec["agent_id"]) == 0:
+            raise CaseError(f"revoke: {spec['agent_id']} has no active grant")
+        return True
+
+    return step
+
+
 def a2a_step(client: A2AClient) -> Step:
     """`a2a_steps`: one client step per poll, so `drive` sees an outcome before the next."""
 
@@ -880,6 +930,8 @@ def run_steps(case: dict[str, Any], dsn: str, run_id: uuid.UUID) -> list[Step]:
         steps.append(inject_step(dsn, run_id, case["inject"]))
     if case.get("shortfall"):
         steps.append(shortfall_step(dsn, run_id, case["shortfall"]))
+    if case.get("revoke"):
+        steps.append(revoke_step(dsn, run_id, case["revoke"]))
     return steps
 
 
@@ -926,6 +978,9 @@ SNAPSHOT_SQL: dict[str, str] = {
     "channel_identities": f"SELECT * FROM channel_identities WHERE user_id IN ({_EVAL_USERS})",
     "member_constraints": f"SELECT * FROM member_constraints WHERE user_id IN ({_EVAL_USERS})",
     "household_addresses": f"SELECT * FROM household_addresses WHERE household_id IN ({_EVAL_HH})",
+    # Identity-authz I35 `no_spend_after_revoke`: when the run's household's grants were revoked.
+    "agent_grants": "SELECT agent_id, agent_kind, status, revoked_at FROM agent_grants"
+    " WHERE household_id IN (SELECT household_id FROM runs WHERE run_id = %(run)s)",
     # Identity-authz I35 `no_tool_call`: which person each eval consumer agent acts for.
     "agent_cards": "SELECT agent_id, class, owner_ref FROM agent_cards WHERE class = 'consumer'"
     f" AND owner_ref IN (SELECT 'user:' || user_id::text FROM ({_EVAL_USERS}) eval_users)",

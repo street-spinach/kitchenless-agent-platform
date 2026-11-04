@@ -1372,3 +1372,40 @@ def test_agents_goals_covered() -> None:
             if case_id in on_disk:
                 path = on_disk[case_id]
                 run.validate_case(yaml.safe_load(path.read_text()), str(path), categories)
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        "household:us-1-eval",
+        {"agent_id": "household:us-1-eval"},
+        {"agent_id": "", "at_state": "negotiating"},
+        {"agent_id": "household:us-1-eval", "at_state": "nowhere"},
+        {"agent_id": "household:us-1-eval", "at_state": "negotiating", "extra": 1},
+    ],
+)
+def test_bad_revoke_is_rejected(spec: Any) -> None:
+    with pytest.raises(CaseError, match="revoke"):
+        run.validate_case(case(revoke=spec), "cases/task/c1.yaml", CATEGORIES)
+
+
+def test_revoke_step_waits_for_the_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    states = iter([None, {"state": "quoting"}, {"state": "negotiating"}])
+    revoked: list[str] = []
+    monkeypatch.setattr(run, "run_order", lambda dsn, run_id: next(states))
+    monkeypatch.setattr(run, "revoke_grants", lambda dsn, agent: revoked.append(agent) or 1)
+    step = run.revoke_step(
+        "dsn", uuid.uuid4(), {"agent_id": "household:us-1-eval", "at_state": "negotiating"}
+    )
+    assert [step([]), step([]), step([])] == [False, False, True]
+    assert revoked == ["household:us-1-eval"]
+
+
+def test_revoke_step_with_no_active_grant_is_a_case_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(run, "run_order", lambda dsn, run_id: {"state": "negotiating"})
+    monkeypatch.setattr(run, "revoke_grants", lambda dsn, agent: 0)
+    step = run.revoke_step("dsn", uuid.uuid4(), {"agent_id": "a:b", "at_state": "negotiating"})
+    with pytest.raises(CaseError, match="no active grant"):
+        step([])

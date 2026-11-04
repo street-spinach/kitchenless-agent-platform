@@ -103,6 +103,8 @@ class FakeHousehold:
         self.allergens: list[str] = []
         # What `get_pantry` returns (pantry §4): rice is at home and trusted.
         self.pantry: dict[str, Any] = pantry_result(estimate("rice"))
+        # What the `household` form of `get_constraints` returns under `members`.
+        self.members: list[dict[str, Any]] = []
 
     def of(self, tool: str) -> list[dict[str, Any]]:
         return [c for c in self.calls if c["tool"] == tool]
@@ -119,6 +121,9 @@ class FakeHousehold:
             return dict(self.rules)
         if tool == "get_household_allergens":
             return {"allergens": list(self.allergens)}
+        if tool == "get_constraints":
+            # The `household` form (identity-authz §8 step 2): every member's safety rows.
+            return {"household_id": "us-1", "members": json.loads(json.dumps(self.members))}
         if tool == "get_pantry":
             return json.loads(json.dumps(self.pantry))
         if tool == "set_order_state":
@@ -889,6 +894,14 @@ def test_no_accept_delay_without_the_override() -> None:
     w = World()
     w.accepted()
     assert w.slept == []
+
+
+def test_stub_negotiate_hold_waits_once_after_entering_negotiating() -> None:
+    w = World(overrides={"STUB_NEGOTIATE_HOLD_SECONDS": 3})
+    w.accepted()
+    assert w.slept == [3]
+    moves = [c["args"]["new"] for c in w.household.of("set_order_state")]
+    assert "negotiating" in moves
 
 
 def test_host_registers_the_household_handler() -> None:

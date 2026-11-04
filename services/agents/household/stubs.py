@@ -15,6 +15,10 @@ data the prompt is built from) and returns a fixed `ModelResult`:
 `STUB_ACCEPT_DELAY_ROUNDS: n` (agent-protocol P21). Before each of the run's first `n`
 accepts, the graph waits `OFFER_TTL_SECONDS + 1` seconds in stub mode, so those offers
 expire.
+
+`STUB_NEGOTIATE_HOLD_SECONDS: n` is not a model step either: in stub mode the graph waits `n`
+seconds just after the order enters `negotiating`, which otherwise lasts milliseconds, so the
+eval runner's `revoke` step can act in that state (identity-authz I35).
 """
 
 import json

@@ -23,7 +23,9 @@ sender, architecture §9).
 
 The whole step is capped at 75 seconds. Any other failure returns the row to `pending` with
 `available_at = now() + 2^attempts` seconds; after 5 attempts the row is `failed` and the
-run is finished with `status=error, reason=poison_message`.
+run is finished with `status=error, reason=poison_message`. A `DependencyUnavailable`
+(identity-authz I28, I-A7) is such a failure: its reason goes in `last_error`, and after the
+last attempt it replaces `poison_message`.
 """
 
 import asyncio
@@ -46,6 +48,7 @@ from services.common import db, directory, ids, outbox
 from services.common.protocol import OutboundInvalid, ProtocolError, check
 from services.common.protocol.a2a import AgentMessageRow
 from services.common.trace import TraceStore
+from services.identity.errors import DependencyUnavailable
 
 __all__ = [
     "NOW",
@@ -262,7 +265,8 @@ class StepResult:
     """What a step commits in its one final transaction (architecture §4, A18).
 
     `finish` ends the run after the step's messages are sent, in the same transaction (a
-    `chat` run's reply, architecture item 28).
+    `chat` run's reply, architecture item 28). `decisions` are `decision` trace payloads of
+    the receiver, written in that transaction too.
     """
 
     messages: Sequence[Outgoing] = ()
@@ -271,6 +275,7 @@ class StepResult:
     quote_updates: Sequence[QuoteUpdate] = ()
     shortfall_updates: Sequence[ShortfallUpdate] = ()
     finish: RunFinish | None = None
+    decisions: Sequence[Mapping[str, Any]] = ()
 
 
 Handler = Callable[[Inbound], Awaitable[StepResult]]
@@ -528,6 +533,16 @@ class Consumer:
             )
         for t in r.timers:
             await _apply_timer(conn, t, row.run_id)
+        for payload in r.decisions:
+            await _TRACES.write(
+                row.run_id,
+                row.to_agent,
+                "decision",
+                dict(payload),
+                on_behalf_of=await _on_behalf_of(conn, row.to_agent),
+                conversation_id=row.conversation_id,
+                conn=conn,
+            )
         if r.finish is not None:
             if self.finish_run is None:
                 raise RuntimeError("the step finishes its run but no finish_run is configured")
@@ -629,7 +644,9 @@ class Consumer:
 
     async def _fail(self, row: AgentMessageRow, attempts: int, exc: BaseException) -> None:
         """Back off and retry, or after the last attempt mark `failed` and finish the run."""
-        error = f"{type(exc).__name__}: {exc}"[:500]
+        # An outage's reason is a §12 code; it ends the run in place of `poison_message`.
+        outage = exc.reason if isinstance(exc, DependencyUnavailable) else None
+        error = outage or f"{type(exc).__name__}: {exc}"[:500]
         log.warning("step failed for %s (attempt %s): %s", row.message_id, attempts, error)
         async with self.pool.connection() as conn:
             if attempts < MAX_ATTEMPTS:
@@ -645,7 +662,9 @@ class Consumer:
                 return
             try:
                 async with conn.transaction():
-                    await self.finish_run(conn, row.run_id, row.to_agent, "error", POISON_REASON)
+                    await self.finish_run(
+                        conn, row.run_id, row.to_agent, "error", outage or POISON_REASON
+                    )
             except Exception:
                 # The row stays failed; the run's run_timeout timer still ends the run.
                 log.exception("finish_run failed for poison message %s", row.message_id)

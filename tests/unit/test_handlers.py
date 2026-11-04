@@ -21,6 +21,7 @@ from services.agents.common.seller import (
 )
 from services.common import orders
 from services.common.consumer import StepResult, TimerCreate
+from services.identity.errors import GrantRevoked
 from tests.unit import model_fakes as mf
 from tests.unit import seller_fakes as sf
 
@@ -418,3 +419,38 @@ def test_seller_courier_round_uses_timer_not_wait() -> None:
         ("order_confirm", sf.HOUSEHOLD),
         ("delivery_request", "delivery:mock-us"),
     ]
+
+
+def test_place_order_grant_revoked_rejects_and_places_nothing() -> None:
+    """Identity-authz §11: the household is told, and its next guarded call ends the run."""
+    w = World()
+    w.seller.place_error = GrantRevoked()
+    q = w.quote()
+    accept = {
+        "order_id": str(q.order_id),
+        "quote_id": str(q.quote_id),
+        "items_hash": orders.items_hash(
+            [{"sku": MILK, "qty": 10, "unit_minor": sf.CATALOG[MILK][2]}]
+        ),
+        "total_minor": q.total_minor,
+    }
+    w.step("accept", accept, conversation_id=q.conversation_id)
+    w.store.courier_rows.append(
+        CourierQuote(
+            quote_id=uuid.uuid4(),
+            conversation_id=uuid.uuid4(),
+            seller_agent_id="delivery:mock-us",
+            total_minor=599,
+            currency="USD",
+            expires_at=NOW + timedelta(minutes=2),
+            status="open",
+            window=q.items["window"],
+        )
+    )
+    closed = w.step(
+        "quote_round_closed",
+        {"order_id": str(q.order_id), "round": "delivery"},
+        from_agent="system:sweeper",
+        conversation_id=None,
+    )
+    assert [(m.type, m.to_agent) for m in closed.messages] == [("reject", sf.HOUSEHOLD)]
