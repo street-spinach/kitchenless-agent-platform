@@ -100,6 +100,8 @@ class Settings:
     # Empty: the business profile uses model_base_url and model_api_key (#392).
     model_business_base_url: str | None = _var({"agents", "testrunner"})
     model_business_api_key: str | None = _var({"agents", "testrunner"})
+    # On: the business host needs no key (a self-hosted server), so real mode allows it empty.
+    model_business_self_hosted: bool = _var({"agents", "testrunner"}, False)
 
     # Identity (identity-authz §13 and I5).
     token_source: str | None = _id(APP)
@@ -220,10 +222,28 @@ class Settings:
         if missing:
             # Names only: never echo values, some are secrets.
             raise ConfigError(f"missing required settings for {service}: {', '.join(missing)}")
+        if service == "agents" and values["model_mode"] == "real":
+            _check_real_model(values)
         if values["issuer_url"] is None:
             path = "/tokens" if token_source == "token_service" else "/auth/realms/kitchenless"
             values["issuer_url"] = f"https://{values['domain']}{path}"
         return cls(**values)
+
+
+def _check_real_model(values: Mapping[str, Any]) -> None:
+    """Refuse `MODEL_MODE=real` on settings no model call could use (#444).
+
+    The primary URL, name and key are always needed. A set business URL also needs its own
+    key, as the primary key never goes there (#392), unless `MODEL_BUSINESS_SELF_HOSTED` is
+    on. An empty business URL means the primary host, so it needs nothing more.
+    """
+    needed = ["model_base_url", "model_name", "model_api_key"]
+    if values["model_business_base_url"] and not values["model_business_self_hosted"]:
+        needed.append("model_business_api_key")
+    empty = [name.upper() for name in needed if not (values[name] or "").strip()]
+    if empty:
+        # Names only: never echo values, some are secrets.
+        raise ConfigError(f"MODEL_MODE=real needs these settings: {', '.join(empty)}")
 
 
 def _parse(name: str, raw: str, hint: Any, encoding: str | None = None) -> Any:

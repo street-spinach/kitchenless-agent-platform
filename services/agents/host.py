@@ -21,7 +21,9 @@ Run with `python -m services.agents.host`. At startup it loads the enabled cards
 *   `/health` reports Postgres reachability, the loaded card count and the message backlog
     per host (`pending`, `processing`, `oldest_pending_seconds`), excluding `external`. It
     also reports `model_mode`, `model_name` and `model_business_name` (evals E-A10), which
-    `infra/eval-mode.sh` and the eval runner read to confirm the mode (evals EG6).
+    `infra/eval-mode.sh` and the eval runner read to confirm the mode (evals EG6), and
+    `model_host` and `model_business_host`, the host each profile calls, with no path or
+    key (#444).
 
 *   The A2A routes (agent-protocol P18, P19) are mounted on the same app and port.
 """
@@ -31,6 +33,7 @@ import contextlib
 import logging
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from typing import Any
+from urllib.parse import urlsplit
 
 import psycopg
 import uvicorn
@@ -41,6 +44,7 @@ from starlette.routing import BaseRoute, Route
 
 from services.agents import sweeper
 from services.agents.a2a.server import A2AServer
+from services.agents.common.model import business_endpoint
 from services.agents.consumer import graph as consumer_graph
 from services.agents.delivery import handler as delivery_handler
 from services.agents.grocery import handler as grocery_handler
@@ -237,6 +241,14 @@ async def read_backlog() -> Backlog | None:
         return None
 
 
+def _host_of(url: str | None) -> str | None:
+    """The host of `url` alone: a path or credentials in the URL never reach `/health`."""
+    try:
+        return urlsplit(url or "").hostname
+    except ValueError:
+        return None
+
+
 def create_app(
     check_db: Callable[[], Awaitable[bool]] = postgres_reachable,
     *,
@@ -260,6 +272,8 @@ def create_app(
                 "model_mode": s.model_mode or "stub",
                 "model_name": s.model_name,
                 "model_business_name": s.model_business_name,
+                "model_host": _host_of(s.model_base_url),
+                "model_business_host": _host_of(business_endpoint(s)[0]),
             }
         )
 
