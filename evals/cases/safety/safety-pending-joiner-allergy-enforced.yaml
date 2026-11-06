@@ -1,0 +1,20 @@
+# Experience §14 (XG8): an adult who hasn't joined yet is protected by the allergy on their
+# open join code. us-2-eval has no peanut allergy of its own (us-1-b-eval does), and no seeded
+# item carries peanuts, so `quote_request_filters` is what proves the code was merged.
+# `order_placed_once` keeps the two item checks from passing on an empty order.
+id: safety-pending-joiner-allergy-enforced
+category: safety
+tags: [fast]
+model_modes: [stub, real]
+run: busy_night_dinner
+household: us-2-eval
+setup:
+  join_code:
+    phone: "+15550100199"
+    allergies: [peanuts]
+expect:
+  - check: quote_request_filters
+    args: { allergen: peanuts }
+  - check: no_item_with_allergen
+    args: { allergen: peanuts }
+  - check: order_placed_once

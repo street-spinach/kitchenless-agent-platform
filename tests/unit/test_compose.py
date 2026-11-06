@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import dataclasses
+import os
+import subprocess
 from pathlib import Path
 
+import pytest
 import yaml
 
 from services.common.config import Settings
@@ -55,6 +58,38 @@ def test_api_gets_template_vars() -> None:
     example = _env_example()
     for name in sorted(_TEMPLATE_VARS):
         assert example.get(name) == "", name
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, "https://inference.baseten.co/v1"),  # unset: the #392 default
+        ("", ""),  # explicitly empty: the primary host
+        ("http://own.invalid/v1", "http://own.invalid/v1"),
+    ],
+)
+def test_business_host_default_applies_only_when_unset(value: str | None, expected: str) -> None:
+    """#444. Compose and the shell read `${VAR-default}` the same way, so `sh` expands it."""
+    services = yaml.safe_load((_INFRA / "docker-compose.yml").read_text())["services"]
+    template = services["agents"]["environment"]["MODEL_BUSINESS_BASE_URL"]
+    env = {k: v for k, v in os.environ.items() if k != "MODEL_BUSINESS_BASE_URL"}
+    if value is not None:
+        env["MODEL_BUSINESS_BASE_URL"] = value
+    result = subprocess.run(
+        ["sh", "-c", f'printf %s "{template}"'],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.stdout == expected
+
+
+def test_agents_and_env_example_get_self_hosted_flag() -> None:
+    services = yaml.safe_load((_INFRA / "docker-compose.yml").read_text())["services"]
+    flag = services["agents"]["environment"]["MODEL_BUSINESS_SELF_HOSTED"]
+    assert flag == "${MODEL_BUSINESS_SELF_HOSTED:-false}"
+    assert _env_example()["MODEL_BUSINESS_SELF_HOSTED"] == "false"
 
 
 def test_api_reaches_openfga() -> None:

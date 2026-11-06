@@ -15,7 +15,9 @@ sends the same message ids and changes nothing twice.
     diet and zone filters, then one `quote` call for prices and stock. A missing item gets
     substitute candidates from the same filtered search; one `choose(rank_substitutes)`
     call. The new quote saves `constraints` and `expires_at = now() + OFFER_TTL_SECONDS`,
-    and the `offer` copies that `expires_at`.
+    and the `offer` copies that `expires_at`. An `AdapterUnavailable` writes an `error`
+    trace and ends the step with no offer: the seller drops out of the round (§9).
+    `DependencyUnavailable` is not caught, so an identity or authz outage ends the run.
 *   `counter_offer`: the arrival table, then one `choose(respond_to_counter)`. "agree"
     and `counter` set `countered` with `round + 1` and reply `offer {final: true}` (A8);
     `reject` sets `rejected`, `closed_by = seller`. The floor includes the owner's
@@ -40,7 +42,8 @@ sends the same message ids and changes nothing twice.
     allergen and diet codes saved on the accepted quote, one `quote` call, and only
     candidates whose `qty × unit_minor` is at most the line's `line_total_minor`; one
     `choose(rank_substitutes)` call keeps up to 2 per line. A line with no candidate is
-    offered as drop only. Sends `shortfall_notice` with `reply_by = now() +
+    offered as drop only, and so is every line left when an `AdapterUnavailable` stops the
+    search (one `error` trace). Sends `shortfall_notice` with `reply_by = now() +
     SHORTFALL_REPLY_SECONDS` (the run override wins).
 *   `shortfall_decision`: one `amend_order` call, then `order_confirm` with the resulting
     lines; `state=failed, reason=nothing_to_deliver` when no line remains. A refused
@@ -84,7 +87,7 @@ from services.common.consumer import (
     TimerCreate,
 )
 from services.common.directory import AgentCard
-from services.common.mcp_client import ToolRefused
+from services.common.mcp_client import AdapterUnavailable, ToolRefused
 from services.common.run_context import RunContext
 from services.identity.errors import GrantError
 from services.safety.scope import unscoped
@@ -475,6 +478,23 @@ class SellerHandler:
         # `call_tool_as` obtains it.
         return await self.call_tool(self.area, name, args, ctx=self._ctx(step, conversation_id))
 
+    async def _unavailable(self, step: _Step, down: AdapterUnavailable) -> None:
+        """The §9 `error` row for an adapter that stayed down after `call_tool`'s 2 tries."""
+        row = step.msg.row
+        await self.traces.write(
+            row.run_id,
+            step.card.agent_id,
+            "error",
+            {
+                "where": "handler",
+                "reason": down.reason,
+                "attempt": step.msg.attempts,
+                "ref_message_id": str(row.message_id),
+            },
+            on_behalf_of=step.card.owner_ref,
+            conversation_id=row.conversation_id,
+        )
+
     async def _decision(self, step: _Step, node: str, choice: str) -> None:
         await self.traces.write(
             step.msg.row.run_id,
@@ -537,6 +557,14 @@ class SellerHandler:
     # quote_request ------------------------------------------------------------------------
 
     async def _quote_request(self, step: _Step) -> None:
+        try:
+            await self._offer(step)
+        except AdapterUnavailable as down:
+            # §9: this seller drops out of the round; the step ends with no offer. Every
+            # tool call comes before the first `step` change, so nothing is half done.
+            await self._unavailable(step, down)
+
+    async def _offer(self, step: _Step) -> None:
         body = step.msg.body
         row = step.msg.row
         if row.conversation_id is None:
@@ -988,19 +1016,35 @@ class SellerHandler:
         notice: list[dict[str, Any]] = []
         candidates: dict[str, list[str]] = {}
         found_by_sku: dict[str, dict[str, Any]] = {}
+        adapter_down = False
         for row in missing:
             line = int(row["line"])
             qty = int(Decimal(str(row["qty"])))
             line_total = qty * int(row["unit_minor"])
             item = str(requested.get(line) or row["name"])
             query = _substitute_query(item) or item
-            found = await self._tool(step, "search_items", {"query": query, "filters": filters})
-            hits = [h for h in found.get("items") or [] if str(h["sku"]) not in by_sku]
-            priced = await self._price(
-                step, [_Want(qty)], [hits[:MAX_SUBSTITUTES]], currency=quote.currency
-            )
-            # The total can never rise: a substitute costs at most the line it replaces.
-            keep = [p for p in priced[0] if p["available"] and qty * p["unit_minor"] <= line_total]
+            keep: list[dict[str, Any]] = []
+            if not adapter_down:
+                try:
+                    found = await self._tool(
+                        step, "search_items", {"query": query, "filters": filters}
+                    )
+                    hits = [h for h in found.get("items") or [] if str(h["sku"]) not in by_sku]
+                    priced = await self._price(
+                        step, [_Want(qty)], [hits[:MAX_SUBSTITUTES]], currency=quote.currency
+                    )
+                except AdapterUnavailable as down:
+                    # §9: unavailable for this run, so the remaining lines aren't searched.
+                    # The family still hears of the shortfall, with these lines drop only.
+                    adapter_down = True
+                    await self._unavailable(step, down)
+                else:
+                    # The total can never rise: a substitute costs at most the line it replaces.
+                    keep = [
+                        p
+                        for p in priced[0]
+                        if p["available"] and qty * p["unit_minor"] <= line_total
+                    ]
             candidates[str(line)] = [str(p["sku"]) for p in keep]
             for p in keep:
                 found_by_sku[str(p["sku"])] = p

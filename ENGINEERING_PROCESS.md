@@ -1127,6 +1127,8 @@ fi
 
 A reopened issue goes back to `ready` and keeps its attempt label, so the loop gets one more try at most before `needs-human`.
 
+The listing above is the first version; `scripts/ci/report_deploy.sh` is the source of truth. Since #447 it reopens an issue only when `deploy.sh` logged a verification failure and that commit is the only one since the last green deploy. A green deploy clears `deploy-failed` from the issues it contains.
+
 ### `.github/workflows/nightly-evals.yml`
 
 ````yaml

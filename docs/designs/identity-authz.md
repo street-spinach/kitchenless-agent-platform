@@ -1519,12 +1519,22 @@ a CLAUDE.md critical path and waits for human review. The changes to approved de
 | 6. Realm file (critical) | I19, I27 (seed ids) | 1 | The realm imports into a scratch stack; `test_realm_file_shape` passes. It needs only the spike, so it may land before step 5. |
 | 7. Keycloak upgrade (critical, owner-run) | I15, I16b, I17, I42 | 6; architecture items 58 and 62 | Smoke, `test_keycloak_admin_not_public`, G6 rerun |
 | 8. Consent and sign-in pages | I21, I22, I24, I39 (`reserved.py`, `main.py` for `me`); I25 is not built (§12a) | 5; 7; architecture item 38 | `test_links`, `test_keycloak_admin` and `test_me_routes` pass |
+| 8a. Keycloak token source (critical) | I3 (`KeycloakSource(delegate=True)`) | 5; 7; 8 | `test_token_source.py` passes against a fake token endpoint; on a local stack with `TOKEN_SOURCE=keycloak`, a run's token from a stored grant is accepted by `mcp` |
 | 9. Onboarding and WhatsApp texts | I23, I26, I27 (`/panel/reset`), I39 (`control.py`), I43, I35 (`add_child`, `no_tool_call`, `safety-child-agent-never-spends`) | 8; architecture item 39 | `test_onboarding.py`, `test_ingest_identity.py` pass; I-CUJ 1 and 10 pass in `make scenario-identity`; `safety-child-agent-never-spends` passes |
-| 10. Live tokens (owner-run, no code) | — | 8 | The owner sets `TOKEN_SOURCE` in the VM's `infra/.env`; I-CUJ 2 passes on the VM |
+| 10. Live tokens (owner-run, no code) | — | 8a | The owner sets `TOKEN_SOURCE` in the VM's `infra/.env`; I-CUJ 2 passes on the VM |
 | 11. Revoke | I20 (`check_household_grant`), I28, I29, I39 (`{grocery,restaurant}/server.py`) | 5; architecture item 39 | I-CUJ 3; `safety-revoked-agent-no-spend` |
 | 12. Bands and approvals | I20 (`check_approval_needed`), I27 (band), I30, I31, I39 (seed data, allowlisted callers) | 5; architecture items 29 and 43 | I-CUJ 5; `safety-over-band-needs-approval`; the scope-scan allowlist holds only `unscoped(conn, reason)` entries |
 | 13. Owner rules | I27 (owner rule), I32, I33, I39 (`main.py` for `app`) | 5; 7; Q6 answered; architecture build step 7 | I-CUJ 7; `test_owner_rule_raises_floor` |
 | CLAUDE.md (critical, separate small PR) | I36 | 5 | The three rules are in CLAUDE.md |
+
+*Amended 2026-11-06 (Keycloak token source, #438):* I3 was delivered in step 5 with
+`MockSource` only, and no step listed `KeycloakSource`, so step 10 had nothing to switch on.
+Step 8a builds it, as I3 and §12a define it: `keycloak` only, because `keycloak_azp` and
+`token_service` are not built (§12a) and `get_source` keeps failing closed for them. Three
+details I3 left open: `service_token` is a `client_credentials` call with the same
+`private_key_jwt` assertion (`system:api` is client `svc.api`), token endpoint calls time out
+after 5 s (the §12a failure table), and a 400 other than `invalid_grant` is
+`IdentityUnavailable`, because it says nothing about the grant.
 
 I35 (eval checks and cases) is delivered across steps: each check lands with the first
 eval case that uses it, and each case lands in the step named in the eval table. A

@@ -209,6 +209,8 @@ def test_health_reports_card_count_and_backlog_unreadable() -> None:
         "model_mode": "stub",  # an unset MODEL_MODE is stub
         "model_name": "muse-spark",
         "model_business_name": "Muse Glimmer",
+        "model_host": "primary.invalid",
+        "model_business_host": "primary.invalid",  # an empty business URL uses the primary
         "token_source": "mock",  # an unset TOKEN_SOURCE is mock
     }
 
@@ -226,6 +228,45 @@ def test_health_reports_token_source(source: str) -> None:
     settings = model_fakes.settings(token_source=source)
     app = host.create_app(check_db, settings=settings, get_backlog=no_backlog)
     assert TestClient(app).get("/health").json()["token_source"] == source
+
+
+def test_health_reports_hosts_only() -> None:
+    """#444: a wrong host shows on `/health`, with no path, port, credentials or key."""
+
+    async def check_db() -> bool:
+        return True
+
+    async def no_backlog() -> None:
+        return None
+
+    settings = model_fakes.settings(
+        model_base_url="https://user:s3cret@api.primary.invalid:8443/v1?key=s3cret",
+        model_api_key="s3cret",
+        model_business_base_url="https://biz.invalid/v1/path",
+        model_business_api_key="s3cret",
+    )
+    app = host.create_app(check_db, settings=settings, get_backlog=no_backlog)
+    response = TestClient(app).get("/health")
+    body = response.json()
+    assert (body["model_host"], body["model_business_host"]) == (
+        "api.primary.invalid",
+        "biz.invalid",
+    )
+    assert "s3cret" not in response.text and "/v1" not in response.text
+
+
+@pytest.mark.parametrize("url", [None, "", "http://[bad"])
+def test_health_host_is_null_without_a_usable_url(url: str | None) -> None:
+    async def check_db() -> bool:
+        return True
+
+    async def no_backlog() -> None:
+        return None
+
+    settings = model_fakes.settings(model_base_url=url)
+    app = host.create_app(check_db, settings=settings, get_backlog=no_backlog)
+    body = TestClient(app).get("/health").json()
+    assert (body["model_host"], body["model_business_host"]) == (None, None)
 
 
 def test_health_reports_real_model_mode_and_names() -> None:

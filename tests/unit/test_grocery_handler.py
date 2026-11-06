@@ -19,7 +19,9 @@ from psycopg_pool import AsyncConnectionPool
 from services.agents.common.seller import PgSellerStore, SellerHandler
 from services.common import consumer as c
 from services.common import ids, orders, runs
+from services.common.mcp_client import AdapterUnavailable
 from services.common.trace import TraceStore
+from services.identity import errors
 from tests.unit import model_fakes as mf
 from tests.unit import seller_fakes as sf
 
@@ -554,6 +556,56 @@ def test_quote_request_saves_constraints(pg: str) -> None:
     }
 
 
+def _error_rows(w: World) -> list[dict[str, Any]]:
+    rows = w.query(
+        "SELECT payload FROM agent_traces WHERE run_id = %s AND kind = 'error'", (w.run_id,)
+    )
+    return [r["payload"] for r in rows]
+
+
+@pytest.mark.parametrize("tool", ["search_items", "quote"])
+def test_quote_request_adapter_down_drops_out_of_the_round(pg: str, tool: str) -> None:
+    # Architecture §9: this seller is unavailable for the run; the run itself carries on.
+    w = World(pg)
+    w.seller.down[tool] = AdapterUnavailable("adapter_5xx")
+    mid = w.request()
+
+    row = w.message(mid)
+    assert (row["status"], row["attempts"], row["last_error"]) == ("processed", 1, None)
+    assert w.sent("offer", cause=mid) == []
+    assert w.query("SELECT 1 FROM quotes WHERE order_id = %s", (w.order_id,)) == []
+    [error] = _error_rows(w)
+    assert error == {
+        "where": "handler",
+        "reason": "adapter_5xx",
+        "attempt": 1,
+        "ref_message_id": str(mid),
+    }
+    [run] = w.query("SELECT status FROM runs WHERE run_id = %s", (w.run_id,))
+    assert run["status"] == "running"
+
+
+@pytest.mark.parametrize(
+    ("outage", "reason"),
+    [
+        (errors.IdentityUnavailable(), "identity_unavailable"),
+        (errors.AuthzUnavailable(), "authz_unavailable"),
+    ],
+)
+def test_quote_request_dependency_outage_is_not_caught(
+    pg: str, outage: Exception, reason: str
+) -> None:
+    # `call_tool_as` maps these first; the consumer's retries end the run with this reason.
+    w = World(pg)
+    w.seller.down["search_items"] = outage
+    mid = w.request()
+
+    row = w.message(mid)
+    assert (row["status"], row["last_error"]) == ("pending", reason)
+    assert w.sent("offer", cause=mid) == []
+    assert _error_rows(w) == []
+
+
 def test_a2a_rejected_quote_finishes_run_cancelled(pg: str) -> None:
     w = World(pg, kind="a2a_demo")
     w.request()
@@ -656,6 +708,37 @@ def test_shortfall_substitute_offered_within_line_total(pg: str) -> None:
         assert sub["qty"] * sub["unit_minor"] <= line["line_total_minor"]
     reply_by = datetime.fromisoformat(notice["body"]["reply_by"])
     assert before + timedelta(seconds=3) <= reply_by <= datetime.now(UTC) + timedelta(seconds=3)
+
+
+@pytest.mark.parametrize("tool", ["search_items", "quote"])
+def test_shortfall_adapter_down_offers_drop_only(pg: str, tool: str) -> None:
+    # Both lines would have a search; the first failure ends the searching for this step.
+    w = World(pg)
+    _courier_booked(w, [("reduced fat milk", 2), ("large eggs", 1)], [])
+    searches = len(w.seller.of("search_items"))
+    w.seller.down[tool] = AdapterUnavailable("adapter_5xx")
+    mid = _detect(w, [MILK_2PCT, EGGS])
+
+    assert w.message(mid)["status"] == "processed"
+    [notice] = w.sent("shortfall_notice", cause=mid)
+    assert [line["sku"] for line in notice["body"]["lines"]] == [MILK_2PCT, EGGS]
+    assert [line["substitutes"] for line in notice["body"]["lines"]] == [[], []]
+    assert len(w.seller.of("search_items")) == searches + 1
+    [error] = _error_rows(w)
+    assert (error["where"], error["reason"]) == ("handler", "adapter_5xx")
+    assert error["ref_message_id"] == str(mid)
+
+
+def test_shortfall_identity_outage_is_not_caught(pg: str) -> None:
+    w = World(pg)
+    _courier_booked(w, [("reduced fat milk", 2)], [])
+    w.seller.down["search_items"] = errors.IdentityUnavailable()
+    mid = _detect(w, [MILK_2PCT])
+
+    row = w.message(mid)
+    assert (row["status"], row["last_error"]) == ("pending", "identity_unavailable")
+    assert w.sent("shortfall_notice", cause=mid) == []
+    assert _error_rows(w) == []
 
 
 def _closed_shortfall(w: World, picks: dict[str, str]) -> uuid.UUID:
