@@ -15,7 +15,7 @@ from starlette.testclient import TestClient
 
 from services.agents import host
 from services.agents.a2a.server import A2AServer
-from services.common import directory, runs
+from services.common import config, directory, runs
 from services.common.consumer import Inbound, StepResult
 from services.common.directory import AgentCard
 from services.common.protocol.a2a import AgentMessageRow
@@ -209,7 +209,23 @@ def test_health_reports_card_count_and_backlog_unreadable() -> None:
         "model_mode": "stub",  # an unset MODEL_MODE is stub
         "model_name": "muse-spark",
         "model_business_name": "Muse Glimmer",
+        "token_source": "mock",  # an unset TOKEN_SOURCE is mock
     }
+
+
+@pytest.mark.parametrize("source", sorted(config.TOKEN_SOURCES))
+def test_health_reports_token_source(source: str) -> None:
+    """#445: `/health` names the active token source, as it does the model mode."""
+
+    async def check_db() -> bool:
+        return True
+
+    async def no_backlog() -> None:
+        return None
+
+    settings = model_fakes.settings(token_source=source)
+    app = host.create_app(check_db, settings=settings, get_backlog=no_backlog)
+    assert TestClient(app).get("/health").json()["token_source"] == source
 
 
 def test_health_reports_real_model_mode_and_names() -> None:

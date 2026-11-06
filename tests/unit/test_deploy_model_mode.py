@@ -14,12 +14,30 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 SCRIPT = REPO / "infra/deploy.sh"
 
-FAKE = r"""#!/usr/bin/env bash
-cat >/dev/null 2>&1 </dev/null
+SHEBANG = "#!/usr/bin/env bash\n"
+LOG_CALL = r"""cat >/dev/null 2>&1 </dev/null
 printf '%s %s|MODEL_MODE=%s\n' "$(basename "$0")" "$*" "${MODEL_MODE-<unset>}" >> "$STATE/calls.log"
 """
+FAKE = SHEBANG + LOG_CALL
 FAKE_MAKE = FAKE + 'case "$1" in scenario) exit "${FAKE_SCENARIO_RC:-0}";; esac\n'
-FAKE_EVAL_MODE = FAKE + 'exit "${FAKE_RESTORE_RC:-0}"\n'
+FAKE_EVAL_MODE = FAKE + 'touch "$STATE/restored"\nexit "${FAKE_RESTORE_RC:-0}"\n'
+# `compose exec agents` answers `/health` and isn't logged: it changes nothing. The mode is
+# stub until eval-mode.sh has restored, so the deploy log shows when the read happened.
+FAKE_DOCKER = (
+    SHEBANG
+    + r"""case " $* " in
+  *" exec "*)
+    [ "${FAKE_HEALTH_RC:-0}" = 0 ] || exit "$FAKE_HEALTH_RC"
+    mode=stub
+    [ -e "$STATE/restored" ] && mode=real
+    printf '{"status":"ok","model_mode": "%s","token_source":"%s"}' \
+      "$mode" "${FAKE_TOKEN_SOURCE:-mock}"
+    exit 0
+    ;;
+esac
+"""
+    + LOG_CALL
+)
 
 
 def _script(path: Path, body: str) -> None:
@@ -31,7 +49,7 @@ def _script(path: Path, body: str) -> None:
 def app(tmp_path: Path) -> Path:
     (tmp_path / "bin").mkdir()
     (tmp_path / "infra").mkdir()
-    _script(tmp_path / "bin/docker", FAKE)
+    _script(tmp_path / "bin/docker", FAKE_DOCKER)
     _script(tmp_path / "bin/make", FAKE_MAKE)
     _script(tmp_path / "infra/eval-mode.sh", FAKE_EVAL_MODE)
     return tmp_path
@@ -50,8 +68,14 @@ def deploy(app: Path, env_mode: str | None, **env: str) -> tuple[int, list[str]]
     done = subprocess.run(
         ["bash", str(SCRIPT), "abc123"], env=environ, capture_output=True, text=True, timeout=30
     )
+    (app / "deploy.log").write_text(done.stdout)
     log = app / "calls.log"
     return done.returncode, log.read_text().splitlines() if log.exists() else []
+
+
+def active_modes(app: Path) -> list[str]:
+    lines = (app / "deploy.log").read_text().splitlines()
+    return [line for line in lines if line.startswith("Active modes:")]
 
 
 def test_real_env_restored_after_verified_deploy(app: Path) -> None:
@@ -82,6 +106,27 @@ def test_failed_restore_back_to_stub(app: Path) -> None:
     assert calls[-2].startswith("eval-mode.sh restore|")
     assert " up " in calls[-1] and "agents" in calls[-1]
     assert calls[-1].endswith("MODEL_MODE=stub")
+    assert active_modes(app) == []
+
+
+def test_verified_deploy_logs_active_modes(app: Path) -> None:
+    """#445: the line comes from `/health` after the restore, so it shows real, not stub."""
+    code, _ = deploy(app, "real", FAKE_TOKEN_SOURCE="keycloak")
+    assert code == 0
+    assert active_modes(app) == ["Active modes: model_mode=real token_source=keycloak"]
+
+
+def test_stub_deploy_logs_active_modes(app: Path) -> None:
+    code, _ = deploy(app, "stub")
+    assert code == 0
+    assert active_modes(app) == ["Active modes: model_mode=stub token_source=mock"]
+
+
+def test_unreadable_health_does_not_fail_verified_deploy(app: Path) -> None:
+    code, _ = deploy(app, "stub", FAKE_HEALTH_RC="1")
+    assert code == 0
+    assert (app / ".last_green").read_text().strip() == "abc123"
+    assert active_modes(app) == ["Active modes: model_mode=unknown token_source=unknown"]
 
 
 FAKE_COMPOSE = r"""#!/usr/bin/env bash
@@ -125,3 +170,4 @@ def test_failed_verification_stays_stub(app: Path) -> None:
     assert code == 1
     assert not (app / ".last_green").exists()
     assert not any(c.startswith("eval-mode.sh") for c in calls)
+    assert active_modes(app) == []

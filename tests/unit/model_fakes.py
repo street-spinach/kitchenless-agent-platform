@@ -24,6 +24,7 @@ def settings(**overrides: Any) -> SimpleNamespace:
         "model_business_timeout_seconds": 5,
         "model_business_base_url": None,
         "model_business_api_key": None,
+        "token_source": None,
     }
     values.update(overrides)
     return SimpleNamespace(**values)

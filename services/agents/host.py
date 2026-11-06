@@ -260,6 +260,8 @@ def create_app(
                 "model_mode": s.model_mode or "stub",
                 "model_name": s.model_name,
                 "model_business_name": s.model_business_name,
+                # The name only. An unset TOKEN_SOURCE is mock (identity-authz `TokenSource`).
+                "token_source": s.token_source or "mock",
             }
         )
 

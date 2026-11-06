@@ -38,6 +38,7 @@ def test_agents_health_reports_postgres(reachable: bool) -> None:
             "model_mode": "stub",
             "model_name": "muse-spark",
             "model_business_name": "Muse Glimmer",
+            "token_source": "mock",
         },
     )
 

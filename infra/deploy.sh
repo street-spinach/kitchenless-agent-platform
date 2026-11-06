@@ -61,6 +61,23 @@ prune_app_images() {
     done || true
 }
 
+# A string field of a `/health` body, or `unknown`: health_field <name> <json>.
+health_field() {
+  local value
+  value=$(printf '%s' "$2" | sed -nE "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"([^\"]*)\".*/\1/p")
+  echo "${value:-unknown}"
+}
+
+# Print the modes `agents` reports on `/health`, not what infra/.env says (#445). Names only,
+# never the whole body. Like the image cleanup, a failed read never fails a verified deploy.
+report_active_modes() {
+  local body
+  body=$("${COMPOSE[@]}" exec -T agents python -c \
+    "import sys,urllib.request; sys.stdout.write(urllib.request.urlopen('http://127.0.0.1:8003/health', timeout=3).read().decode())" \
+    2>/dev/null) || body=""
+  echo "Active modes: model_mode=$(health_field model_mode "$body") token_source=$(health_field token_source "$body")"
+}
+
 echo "Deploying $SHA (last green: ${LAST_GREEN:-none})"
 # Steps 4 and 5. `up --wait` is part of verification: an unhealthy service must roll back,
 # not exit under set -e. `make seed` is an idempotent upsert; a seed failure rolls back (§9).
@@ -81,6 +98,7 @@ if up_all && make seed && make smoke && make scenario; then
     fi
     echo "agents restored in real mode from infra/.env."
   fi
+  report_active_modes
   exit 0
 fi
 
