@@ -16,27 +16,35 @@ Tokens are cached in memory per `(run_id, agent_id)` and obtained again when les
 `MockSource` signs the claims a Keycloak delegated token carries (`iss`, `aud`, `sub`,
 `act`, `azp`, `scope`, `exp`) with `MOCK_SIGNING_KEY`, and still requires an active grant
 row, so revoke works in mock mode too. `get_source` picks the run's source: `mock` for an
-eval household, otherwise `TOKEN_SOURCE` (I-D24). `KeycloakSource` lands in build step 8;
-until then a live source fails closed with `IdentityUnavailable`.
+eval household, otherwise `TOKEN_SOURCE` (I-D24).
+
+`KeycloakSource` (build step 8a) is the live source: it refreshes the grant's stored offline
+token, then exchanges it with the agent's own token as the actor, so the result has the
+person as `sub` and the agent as `act` (I3). `keycloak_azp` and `token_service` are not built
+(§12a), so choosing one fails closed with `IdentityUnavailable`.
 """
 
 import time
 from collections.abc import Callable
-from typing import Protocol
+from typing import Any, Protocol
 from uuid import UUID
 
+import httpx
 import jwt
 from psycopg import AsyncConnection
 
 from services.common import ids, modes
+from services.common.config import get_settings
 from services.identity import claims as c
 from services.identity import grants, tokens
-from services.identity.errors import GrantMissing, IdentityUnavailable
+from services.identity.errors import GrantMissing, GrantRevoked, IdentityUnavailable
 
 __all__ = [
+    "KEYCLOAK",
     "MOCK",
     "REFRESH_BEFORE_SECONDS",
     "TOKEN_SECONDS",
+    "KeycloakSource",
     "MockSource",
     "TokenSource",
     "get_source",
@@ -45,10 +53,16 @@ __all__ = [
 ]
 
 MOCK = "mock"
+KEYCLOAK = "keycloak"
 TOKEN_SECONDS = 300
 REFRESH_BEFORE_SECONDS = 60
 MOCK_KID = "mock"
 API_CLIENT = "svc.api"  # the client of `tokens.API_AGENT` (identity-authz §3)
+KEYCLOAK_TIMEOUT_SECONDS = 5.0  # §12a failure table
+ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange"
+ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token"
+INVALID_GRANT = "invalid_grant"
 
 Clock = Callable[[], float]
 
@@ -92,6 +106,11 @@ def sign_mock(payload: dict[str, object]) -> str:
     return jwt.encode(
         payload, tokens.mock_private_key(), algorithm=tokens.ALGORITHM, headers={"kid": MOCK_KID}
     )
+
+
+def _client_id(agent_id: str) -> str:
+    # `system:api` is client `svc.api` (identity-authz §3), not `system.api`.
+    return API_CLIENT if agent_id == tokens.API_AGENT else c.agent_id_to_client_id(agent_id)
 
 
 def _service_sub(client_id: str) -> str:
@@ -171,10 +190,7 @@ class MockSource:
         hit = self._cached(key)
         if hit is not None:
             return hit
-        # `system:api` is client `svc.api` (identity-authz §3), not `system.api`.
-        client_id = (
-            API_CLIENT if agent_id == tokens.API_AGENT else c.agent_id_to_client_id(agent_id)
-        )
+        client_id = _client_id(agent_id)
         payload = mock_claims(
             sub=_service_sub(client_id), client_id=client_id, delegated=False, now=self._clock()
         )
@@ -197,6 +213,137 @@ class MockSource:
         return sign_mock(payload)
 
 
+class _GrantRefused(Exception):
+    """The token endpoint answered 400 `invalid_grant`."""
+
+
+class KeycloakSource:
+    """Delegated tokens by token exchange (§12 `keycloak`, I3, §12a)."""
+
+    name = KEYCLOAK
+
+    def __init__(
+        self,
+        clock: Clock = time.time,
+        transport: httpx.AsyncBaseTransport | None = None,
+        token_url: str | None = None,
+    ) -> None:
+        self._clock = clock
+        self._transport = transport
+        self._token_url = token_url
+        self._cache: dict[tuple[UUID | None, str], tuple[str, float]] = {}
+
+    def _url(self) -> str:
+        if self._token_url:
+            return self._token_url
+        keycloak_url = get_settings().keycloak_url
+        if not keycloak_url:
+            raise IdentityUnavailable("KEYCLOAK_URL is not set")
+        return f"{keycloak_url.rstrip('/')}/realms/kitchenless/protocol/openid-connect/token"
+
+    async def _post(self, client_id: str, form: dict[str, str]) -> dict[str, Any]:
+        """One token endpoint call as `client_id`. Never logs or raises a token."""
+        data = form | {
+            "client_id": client_id,
+            "client_assertion_type": ASSERTION_TYPE,
+            "client_assertion": grants.client_assertion(client_id),
+        }
+        try:
+            async with httpx.AsyncClient(
+                transport=self._transport, timeout=KEYCLOAK_TIMEOUT_SECONDS
+            ) as client:
+                resp = await client.post(self._url(), data=data)
+        except httpx.HTTPError as exc:
+            raise IdentityUnavailable(f"token endpoint: {type(exc).__name__}") from None
+        if resp.status_code == 200:
+            try:
+                body = resp.json()
+                if isinstance(body["access_token"], str):
+                    return dict(body)
+            except (ValueError, KeyError, TypeError):
+                pass
+            raise IdentityUnavailable("token endpoint: malformed answer")
+        if resp.status_code == 400 and _error_code(resp) == INVALID_GRANT:
+            raise _GrantRefused
+        raise IdentityUnavailable(f"token endpoint answered {resp.status_code}")
+
+    def _cached(self, key: tuple[UUID | None, str]) -> str | None:
+        hit = self._cache.get(key)
+        if hit is not None and hit[1] - self._clock() >= REFRESH_BEFORE_SECONDS:
+            return hit[0]
+        return None
+
+    def _store(self, key: tuple[UUID | None, str], body: dict[str, Any]) -> str:
+        lifetime = body.get("expires_in")
+        if isinstance(lifetime, bool) or not isinstance(lifetime, int):
+            lifetime = TOKEN_SECONDS
+        token = str(body["access_token"])
+        self._cache[key] = (token, self._clock() + lifetime)
+        return token
+
+    def invalidate(self, run_id: UUID | None, agent_id: str) -> None:
+        self._cache.pop((run_id, agent_id), None)
+        self._cache.pop((None, agent_id), None)  # a people token's actor token
+
+    async def service_token(self, agent_id: str) -> str:
+        key = (None, agent_id)
+        hit = self._cached(key)
+        if hit is not None:
+            return hit
+        try:
+            body = await self._post(_client_id(agent_id), {"grant_type": "client_credentials"})
+        except _GrantRefused:
+            raise IdentityUnavailable("token endpoint refused the client") from None
+        return self._store(key, body)
+
+    async def _exchange(self, conn: AsyncConnection, grant: grants.Grant) -> dict[str, Any]:
+        """I3 steps 2 and 3: refresh the stored grant, then exchange it."""
+        client_id = c.agent_id_to_client_id(grant.agent_id)
+        try:
+            refreshed = await self._post(
+                client_id, {"grant_type": "refresh_token", "refresh_token": grants.decrypt(grant)}
+            )
+        except _GrantRefused:
+            await grants.mark_refused(conn, grant.grant_id)
+            await grants.load_active(conn, grant.agent_id, grant.user_id)  # the matching error
+            raise GrantRevoked(f"the grant of {grant.agent_id} is revoked") from None
+        actor = await self.service_token(grant.agent_id)
+        try:
+            return await self._post(
+                client_id,
+                {
+                    "grant_type": EXCHANGE_GRANT,
+                    "subject_token": refreshed["access_token"],
+                    "subject_token_type": ACCESS_TOKEN_TYPE,
+                    "actor_token": actor,
+                    "actor_token_type": ACCESS_TOKEN_TYPE,
+                },
+            )
+        except _GrantRefused:
+            # The refresh just worked, so this says nothing about the stored grant.
+            raise IdentityUnavailable("token exchange refused") from None
+
+    async def people_token(self, conn: AsyncConnection, run_id: UUID, agent_id: str) -> str:
+        key = (run_id, agent_id)
+        hit = self._cached(key)
+        if hit is not None:
+            return hit
+        grant = await _holder(conn, agent_id)
+        return self._store(key, await self._exchange(conn, grant))
+
+    async def sample_token(self, conn: AsyncConnection, agent_id: str, user_id: UUID) -> str:
+        grant = await grants.load_active(conn, agent_id, user_id)
+        return str((await self._exchange(conn, grant))["access_token"])
+
+
+def _error_code(resp: httpx.Response) -> str | None:
+    try:
+        body = resp.json()
+    except ValueError:
+        return None
+    return body.get("error") if isinstance(body, dict) else None
+
+
 _SOURCES: dict[str, TokenSource] = {}
 
 
@@ -204,10 +351,10 @@ def get_source(env: str, recorded: str | None = None) -> TokenSource:
     """The token source of a run: the one `runs.start` recorded in `runs.modes`, else
     `mock` for an eval household and `TOKEN_SOURCE` otherwise (I-D24)."""
     name = recorded or modes.token_source(env)
-    if name != MOCK:
-        # KeycloakSource is built in identity-authz build step 8 (§12a); fail closed.
+    if name not in (MOCK, KEYCLOAK):
+        # `keycloak_azp` and `token_service` are not built (§12a); fail closed.
         raise IdentityUnavailable(f"token source {name} is not built")
     source = _SOURCES.get(name)
     if source is None:
-        source = _SOURCES[name] = MockSource()
+        source = _SOURCES[name] = MockSource() if name == MOCK else KeycloakSource()
     return source
