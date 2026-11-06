@@ -55,6 +55,8 @@ class FakeSeller:
     # The `amend_order` result to return, or the reason to refuse it with.
     amend_result: dict[str, Any] | None = None
     refuse_amend: str | None = None
+    # Raised by the named tool, as `call_tool_as` raises an outage after its own retry.
+    down: dict[str, Exception] = field(default_factory=dict)
 
     def of(self, tool: str) -> list[dict[str, Any]]:
         return [c for c in self.calls if c["tool"] == tool]
@@ -63,6 +65,8 @@ class FakeSeller:
         # No `token` argument: `call_tool_as` obtains it (identity-authz I6).
         assert server == "grocery"
         self.calls.append({"tool": tool, "args": args, "ctx": ctx})
+        if tool in self.down:
+            raise self.down[tool]
         if tool == "search_items":
             words = args["query"].lower().split()
             banned = set(args["filters"].get("allergen_codes") or [])
