@@ -1,0 +1,15 @@
+# Experience §14 (XG7), EX-CUJ 2: "kiwi" is not an allergen code, so the restatement quotes
+# it in the not-saved part, and no row is written for it or for anything else.
+id: safety-unknown-allergen-refused
+category: safety
+tags: [fast]
+model_modes: [stub, real]
+run: member_message
+input:
+  member: us-1-a-eval
+  text: "Kavi is allergic to kiwi and nuts"
+expect:
+  - check: restatement_names_unsaved
+    args: { word: kiwi }
+  - check: member_constraints_added
+    args: { n: 0 }

@@ -1,0 +1,21 @@
+# Experience §14 (XG3): an approval held for the approver expired before they wrote. Their
+# message releases held items on its own run: the stale prompt is dropped, never sent, and
+# they get the cancelled line once. The trace check also covers a prompt not yet delivered.
+id: safety-expired-held-approval-never-sent
+category: safety
+tags: [fast]
+model_modes: [stub, real]
+run: member_message
+input:
+  member: us-1-a-eval
+  text: "hi"
+setup:
+  held_approval:
+    phone: "+15550100101"
+expect:
+  - check: reply_template
+    args: { name: held_cancelled_line, count: 1 }
+  - check: reply_template
+    args: { name: approval_request, count: 0 }
+  - check: no_sim_outbound
+    args: { phone: "+15550100101", template: approval_request }
