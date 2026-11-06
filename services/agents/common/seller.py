@@ -120,6 +120,7 @@ COURIER_ROUND_SECONDS = 10
 MAX_SUBSTITUTES = 3
 # Substitutes per shortfall line: 2 plus "Skip it" fit WhatsApp's 3 buttons (§10).
 MAX_SHORTFALL_SUBSTITUTES = 2
+OFFER_TTL_OVERRIDE = "OFFER_TTL_SECONDS"
 SHORTFALL_REPLY_OVERRIDE = "SHORTFALL_REPLY_SECONDS"
 NOTHING_TO_DELIVER = "nothing_to_deliver"
 # The owner's maximum-discount rule (identity-authz §10, I33).
@@ -644,7 +645,7 @@ class SellerHandler:
             )
         total = sum(line["qty"] * line["unit_minor"] for line in lines if line["offered_sku"])
         quote_id = ids.quote_id(row.message_id)
-        expires_at = self.clock() + self.offer_ttl
+        expires_at = self.clock() + await self._offer_ttl(row.run_id)
         window = body.window.model_dump(mode="json")
         step.inserts.append(
             QuoteInsert(
@@ -726,6 +727,13 @@ class SellerHandler:
             "allowed": allowed.describe(),
         }
 
+    async def _offer_ttl(self, run_id: UUID) -> timedelta:
+        """This run's offer lifetime: the run override wins, as in `_reply_seconds`."""
+        override = (await self.store.overrides(run_id)).get(OFFER_TTL_OVERRIDE)
+        if isinstance(override, int) and not isinstance(override, bool) and override > 0:
+            return timedelta(seconds=override)
+        return self.offer_ttl
+
     # counter_offer ------------------------------------------------------------------------
 
     async def _counter_offer(self, step: _Step) -> None:
@@ -771,7 +779,7 @@ class SellerHandler:
         if total < floor:
             raise StepFailed("handler", "below_floor")  # unreachable: the allowed set says so
         new_round = quote.round + 1
-        expires_at = now + self.offer_ttl
+        expires_at = now + await self._offer_ttl(quote.run_id)
         step.updates.append(
             QuoteUpdate(
                 quote.quote_id,

@@ -33,10 +33,14 @@ MILK = "MOCK-MILK-WHOLE"
 class FakeStore:
     """`SellerStore` over dicts. `apply` keeps a step's quote changes, as a commit would."""
 
-    def __init__(self) -> None:
+    def __init__(self, run_overrides: dict[str, Any] | None = None) -> None:
         self.quotes: dict[uuid.UUID, StoredQuote] = {}
         self.courier_rows: list[CourierQuote] = []
         self.order_state = "authorized"
+        self.run_overrides = run_overrides or {}
+
+    async def overrides(self, run_id: uuid.UUID) -> dict[str, Any]:
+        return dict(self.run_overrides)
 
     async def quote(self, quote_id: uuid.UUID) -> StoredQuote | None:
         return self.quotes.get(quote_id)
@@ -97,7 +101,7 @@ class World:
         self.traces = mf.FakeTraces()
         self.stubs = sf.RecordingStubs(answers)
         self.seller = sf.FakeSeller()
-        self.store = FakeStore()
+        self.store = FakeStore(overrides)
         self.handler = SellerHandler(
             "grocery",
             model=sf.chooser(self.stubs, self.traces, overrides),
@@ -185,6 +189,34 @@ def test_counter_respects_margin_floor() -> None:
     [decision] = _decisions(w, "respond_to_counter")
     assert "agree" not in decision["allowed"]["actions"]
     assert decision["allowed"]["actions"]["counter"] == {"range": [floor, q.total_minor]}
+
+
+@pytest.mark.parametrize(
+    ("overrides", "seconds"),
+    [
+        (None, 600),  # the default
+        ({"OFFER_TTL_SECONDS": 2}, 2),  # the run override wins
+        ({"OFFER_TTL_SECONDS": 0}, 600),  # not a usable lifetime: the default stands
+        ({"OFFER_TTL_SECONDS": True}, 600),
+    ],
+)
+def test_run_override_sets_offer_lifetime(overrides: dict[str, Any] | None, seconds: int) -> None:
+    w = World(overrides=overrides)
+    expected = NOW + timedelta(seconds=seconds)
+
+    # The first offer.
+    body = sf.request_body(w.order_id, [("whole milk", 2)])
+    [offer] = w.step("quote_request", body).messages
+    assert datetime.fromisoformat(offer.body["expires_at"]) == expected
+    [stored] = w.store.quotes.values()
+    assert stored.expires_at == expected
+
+    # The offer after a counter.
+    q = w.quote()
+    [countered] = w.counter(q, q.total_minor * 90 // 100).messages
+    assert countered.type == "offer"
+    assert datetime.fromisoformat(countered.body["expires_at"]) == expected
+    assert w.store.quotes[q.quote_id].expires_at == expected
 
 
 def test_handler_keeps_no_state_between_households() -> None:
