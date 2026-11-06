@@ -274,6 +274,8 @@ def create_app(
                 "model_business_name": s.model_business_name,
                 "model_host": _host_of(s.model_base_url),
                 "model_business_host": _host_of(business_endpoint(s)[0]),
+                # The name only. An unset TOKEN_SOURCE is mock (identity-authz `TokenSource`).
+                "token_source": s.token_source or "mock",
             }
         )
 

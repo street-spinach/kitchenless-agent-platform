@@ -40,6 +40,7 @@ def test_agents_health_reports_postgres(reachable: bool) -> None:
             "model_business_name": "Muse Glimmer",
             "model_host": "primary.invalid",
             "model_business_host": "primary.invalid",
+            "token_source": "mock",
         },
     )
 
