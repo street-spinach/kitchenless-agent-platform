@@ -106,6 +106,76 @@ def test_defaulted_values_are_never_required() -> None:
     assert s.api_url == "http://api:8000"
 
 
+def _real_env(service: str = "agents", **overrides: str) -> dict[str, str]:
+    """A usable `MODEL_MODE=real` environment, as the demo deployment sets it (#444)."""
+    return {
+        **full_env(service),
+        "MODEL_MODE": "real",
+        "MODEL_BASE_URL": "https://primary.invalid/v1",
+        "MODEL_NAME": "people-model",
+        "MODEL_API_KEY": "primary-key",
+        "MODEL_BUSINESS_BASE_URL": "https://business.invalid/v1",
+        "MODEL_BUSINESS_API_KEY": "business-key",
+        **overrides,
+    }
+
+
+def test_real_mode_starts_on_usable_settings() -> None:
+    assert Settings.from_env(_real_env()).model_mode == "real"
+
+
+@pytest.mark.parametrize("name", ["MODEL_BASE_URL", "MODEL_NAME", "MODEL_API_KEY"])
+@pytest.mark.parametrize("value", ["", "  "])
+def test_real_mode_refuses_without_primary_setting(name: str, value: str) -> None:
+    with pytest.raises(ConfigError, match=name):
+        Settings.from_env(_real_env(**{name: value}))
+
+
+def test_real_mode_refuses_business_host_without_its_key() -> None:
+    with pytest.raises(ConfigError, match="MODEL_BUSINESS_API_KEY"):
+        Settings.from_env(_real_env(MODEL_BUSINESS_API_KEY=""))
+
+
+def test_real_mode_self_hosted_business_host_needs_no_key() -> None:
+    env = _real_env(MODEL_BUSINESS_API_KEY="", MODEL_BUSINESS_SELF_HOSTED="true")
+    assert Settings.from_env(env).model_business_self_hosted is True
+
+
+def test_self_hosted_does_not_excuse_the_primary_settings() -> None:
+    env = _real_env(MODEL_API_KEY="", MODEL_BUSINESS_SELF_HOSTED="true")
+    with pytest.raises(ConfigError, match="MODEL_API_KEY"):
+        Settings.from_env(env)
+
+
+def test_real_mode_empty_business_host_uses_the_primary_and_needs_no_own_key() -> None:
+    env = _real_env(MODEL_BUSINESS_BASE_URL="", MODEL_BUSINESS_API_KEY="")
+    assert Settings.from_env(env).model_business_base_url == ""
+
+
+def test_real_mode_refusal_names_settings_without_echoing_values() -> None:
+    env = _real_env(MODEL_NAME="", MODEL_API_KEY="s3cret-value", MODEL_BUSINESS_API_KEY="")
+    with pytest.raises(ConfigError) as err:
+        Settings.from_env(env)
+    assert "MODEL_NAME, MODEL_BUSINESS_API_KEY" in str(err.value)
+    assert "s3cret-value" not in str(err.value)
+
+
+def test_stub_mode_starts_with_every_model_setting_empty() -> None:
+    env = _real_env(
+        MODEL_MODE="stub",
+        MODEL_BASE_URL="",
+        MODEL_NAME="",
+        MODEL_API_KEY="",
+        MODEL_BUSINESS_API_KEY="",
+    )
+    assert Settings.from_env(env).model_mode == "stub"
+
+
+def test_real_mode_check_applies_to_agents_only() -> None:
+    env = _real_env("testrunner", MODEL_API_KEY="")
+    assert Settings.from_env(env).model_mode == "real"
+
+
 def test_protocol_settings_have_their_defaults() -> None:
     s = Settings.from_env(full_env("agents"))
     assert s.offer_ttl_seconds == 600

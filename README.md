@@ -74,6 +74,8 @@ Never commit a key. Keys go only in `infra/.env`, which git ignores.
 
    `MODEL_BUSINESS_NAME` is already `meta-models/muse-spark-open`, so you can leave it out.
 
+   With `MODEL_MODE=real`, `agents` won't start if any of these values is empty. The one exception is a self-hosted business model that needs no key: set `MODEL_BUSINESS_SELF_HOSTED=true` and leave `MODEL_BUSINESS_API_KEY` empty. If you leave out `MODEL_BUSINESS_BASE_URL`, the Baseten host is used. If you set it to empty, business agents use `MODEL_BASE_URL` and `MODEL_API_KEY`.
+
    Optional: if Meta's API is down or blocked, the consumer and household agents can use Spark Open on Baseten as a backup:
 
    ```
@@ -90,7 +92,7 @@ Never commit a key. Keys go only in `infra/.env`, which git ignores.
      python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8003/health').read().decode())"
    ```
 
-   You should see `"model_mode": "real"` and `"model_business_name": "meta-models/muse-spark-open"`.
+   You should see `"model_mode": "real"` and `"model_business_name": "meta-models/muse-spark-open"`. `model_host` and `model_business_host` show the host each kind of agent calls, for example `"model_business_host": "inference.baseten.co"`.
 
 4. To go back to fixed answers, set `MODEL_MODE=stub` in `infra/.env` and run `make up` again.
 
